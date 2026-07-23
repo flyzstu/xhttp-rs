@@ -12,8 +12,8 @@ cargo build --release
 ./target/release/xhttp run -c config.json
 ```
 
-The existing [server example](../ansible/server.json) is accepted directly. A
-minimal client configuration looks like:
+The repository's [interop server configuration](tests/interop-rust-server.json)
+is accepted directly. A minimal client configuration looks like:
 
 ```json
 {
@@ -38,6 +38,34 @@ minimal client configuration looks like:
     }
   }],
   "route": {"final": "proxy"}
+}
+```
+
+## Configuration examples
+
+- [DNS](examples/dns.json) demonstrates UDP, DNS over TLS, DNS over HTTPS,
+  local system resolution, per-domain server selection, bounded caching and
+  DNS hijacking.
+- [Rule-sets](examples/ruleset.json) demonstrates inline and local source
+  rule-sets. Its local source data is in
+  [ruleset-source.json](examples/ruleset-source.json).
+
+Validate either example from the repository root:
+
+```bash
+cargo run -- check -c examples/dns.json
+cargo run -- check -c examples/ruleset.json
+```
+
+Remote source JSON and binary SRS rule-sets use the same route structure:
+
+```json
+{
+  "type": "remote",
+  "tag": "remote-rules",
+  "format": "binary",
+  "url": "https://example.com/rules.srs",
+  "update_interval": "24h"
 }
 ```
 
@@ -97,6 +125,10 @@ Run the local DNS cache and transport benchmark with:
 ```bash
 cargo bench --bench dns
 ```
+
+## License
+
+Licensed under the [MIT License](LICENSE).
 
 ## Current boundaries
 

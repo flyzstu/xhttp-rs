@@ -1,0 +1,57 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "type": "inline",
+        "tag": "private-networks",
+        "rules": [
+          {
+            "ip_cidr": [
+              "10.0.0.0/8",
+              "172.16.0.0/12",
+              "192.168.0.0/16"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "local",
+        "tag": "blocked-domains",
+        "format": "source",
+        "path": "examples/ruleset-source.json"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "blocked-domains",
+        "outbound": "block"
+      },
+      {
+        "rule_set": "private-networks",
+        "action": "direct"
+      }
+    ],
+    "final": "direct"
+  }
+}

@@ -55,4 +55,5 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"

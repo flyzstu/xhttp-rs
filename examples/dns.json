@@ -1,0 +1,71 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "cloudflare-udp",
+        "server": "1.1.1.1",
+        "server_port": 53
+      },
+      {
+        "type": "tls",
+        "tag": "cloudflare-dot",
+        "server": "one.one.one.one",
+        "server_port": 853
+      },
+      {
+        "type": "https",
+        "tag": "cloudflare-doh",
+        "server": "https://cloudflare-dns.com",
+        "path": "/dns-query"
+      },
+      {
+        "type": "local",
+        "tag": "system"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": "internal.example",
+        "server": "system"
+      },
+      {
+        "domain_suffix": "example.org",
+        "server": "cloudflare-dot"
+      },
+      {
+        "domain_keyword": "privacy",
+        "server": "cloudflare-doh"
+      }
+    ],
+    "final": "cloudflare-udp",
+    "cache_capacity": 4096
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "network": "udp",
+        "port": 53,
+        "action": "hijack-dns"
+      }
+    ],
+    "final": "direct"
+  }
+}

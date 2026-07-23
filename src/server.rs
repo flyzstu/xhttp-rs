@@ -947,17 +947,8 @@ mod tests {
             let _ = tokio::io::copy(&mut read, &mut write).await;
         });
         let listen = free_addr().await;
-        let parsed =
-            crate::SingBoxConfig::from_json(include_str!("../../ansible/server.json")).unwrap();
-        let tls = parsed
-            .inbounds
-            .into_iter()
-            .find_map(|value| {
-                value
-                    .tls
-                    .filter(|tls| !tls.certificate.is_empty() && !tls.key.is_empty())
-            })
-            .unwrap();
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let transport = TransportConfig {
             mode: Mode::PacketUp,
             padding_min: 8,
@@ -971,8 +962,8 @@ mod tests {
             users: vec![],
             transport: transport.clone(),
             tls: Some(crate::config::ServerTlsConfig {
-                certificate: tls.certificate.join("\n"),
-                private_key: tls.key.join("\n"),
+                certificate: cert.pem(),
+                private_key: key_pair.serialize_pem(),
                 http3: true,
             }),
         })

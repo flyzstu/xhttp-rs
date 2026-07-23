@@ -634,7 +634,8 @@ mod tests {
     use super::*;
     #[test]
     fn parses_repository_singbox_config() {
-        let c = SingBoxConfig::from_json(include_str!("../../ansible/server.json")).unwrap();
+        let c =
+            SingBoxConfig::from_json(include_str!("../tests/interop-rust-server.json")).unwrap();
         let inbound = c
             .inbounds
             .iter()
