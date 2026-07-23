@@ -1,0 +1,55 @@
+[package]
+name = "xhttp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt"] }
+xhttp = { package = "xhttp-rs", path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "vless_destination"
+path = "fuzz_targets/vless_destination.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xudp_frame"
+path = "fuzz_targets/xudp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks_udp"
+path = "fuzz_targets/socks_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie"
+path = "fuzz_targets/cookie.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xhttp_metadata"
+path = "fuzz_targets/xhttp_metadata.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,12 @@
+{
+  "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 11080}],
+  "outbounds": [{
+    "type": "vless",
+    "tag": "xhttp-out",
+    "server": "127.0.0.1",
+    "server_port": 19080,
+    "uuid": "e07c0f3b-5ff4-4fd7-833b-df2f4cc90963",
+    "transport": {"type": "xhttp", "path": "/xhttp", "mode": "packet-up"}
+  }],
+  "route": {"final": "xhttp-out"}
+}

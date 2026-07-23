@@ -1,0 +1,8 @@
+{
+  "inbounds": [{"listen":"127.0.0.1","port":11082,"protocol":"socks","settings":{"auth":"noauth","udp":true}}],
+  "outbounds": [{
+    "protocol":"vless",
+    "settings":{"vnext":[{"address":"127.0.0.1","port":19080,"users":[{"id":"e07c0f3b-5ff4-4fd7-833b-df2f4cc90963","encryption":"none"}]}]},
+    "streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/xhttp","mode":"packet-up"}}
+  }]
+}

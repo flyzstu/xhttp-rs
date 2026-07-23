@@ -1,0 +1,58 @@
+[package]
+name = "xhttp-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "An interoperable XHTTP transport client and server"
+
+[features]
+fuzzing = []
+
+[lib]
+name = "xhttp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xhttp"
+path = "src/main.rs"
+
+[[bench]]
+name = "dns"
+harness = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+futures-util = "0.3"
+flate2 = "1"
+httlib-huffman = "0.3"
+ipnet = { version = "2", features = ["serde"] }
+libc = "0.2"
+rand = "0.9"
+regex = "1"
+rustls = "0.23"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2", "http3", "stream", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

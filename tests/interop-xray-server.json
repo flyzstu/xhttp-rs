@@ -1,0 +1,8 @@
+{
+  "inbounds": [{
+    "listen":"127.0.0.1","port":19082,"protocol":"vless",
+    "settings":{"clients":[{"id":"e07c0f3b-5ff4-4fd7-833b-df2f4cc90963"}],"decryption":"none"},
+    "streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/xhttp","mode":"packet-up"}}
+  }],
+  "outbounds": [{"protocol":"freedom","settings":{"finalRules":[{"action":"allow"}]}}]
+}
