@@ -1,0 +1,84 @@
+# xhttp client (mixed proxy) deployment.
+#
+# The client configuration (uuid, server, tls server_name, xhttp path, ...)
+# contains secrets and is intentionally NOT included here. Create it as a
+# Kubernetes Secret before applying this manifest:
+#
+#   kubectl create secret generic xhttp-client-config \
+#     --namespace xhttp \
+#     --from-file=config.json=./config.json
+#
+# Then apply this file:
+#
+#   kubectl apply -f k8s/client-deployment.yaml
+#
+# Update `image` below to the GHCR tag built for the commit you want to
+# deploy (see .github/workflows/build-image.yml), e.g.
+# ghcr.io/flyzstu/xhttp-rs:<short-sha>.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xhttp-client
+  namespace: xhttp
+  labels:
+    app: xhttp-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xhttp-client
+  template:
+    metadata:
+      labels:
+        app: xhttp-client
+    spec:
+      containers:
+        - name: xhttp-client
+          image: ghcr.io/flyzstu/xhttp-rs:<short-sha>
+          args: ["run", "-c", "/etc/xhttp/config.json"]
+          ports:
+            - name: mixed-proxy
+              containerPort: 1080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/xhttp
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            tcpSocket:
+              port: 1080
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 1080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+      volumes:
+        - name: config
+          secret:
+            secretName: xhttp-client-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xhttp-client
+  namespace: xhttp
+  labels:
+    app: xhttp-client
+spec:
+  selector:
+    app: xhttp-client
+  ports:
+    - name: mixed-proxy
+      port: 1080
+      targetPort: 1080
+      protocol: TCP
+  type: ClusterIP
