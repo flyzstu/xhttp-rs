@@ -1,10 +1,10 @@
 # xhttp client (mixed proxy) deployment.
 #
 # The client configuration (uuid, server, tls server_name, xhttp path, ...)
-# contains secrets and is intentionally NOT included here. Create it as a
-# Kubernetes Secret before applying this manifest:
+# contains sensitive values and is intentionally NOT included here. Create
+# it as a Kubernetes ConfigMap before applying this manifest:
 #
-#   kubectl create secret generic xhttp-client-config \
+#   kubectl create configmap xhttp-client-config \
 #     --namespace xhttp \
 #     --from-file=config.json=./config.json
 #
@@ -63,8 +63,8 @@ spec:
             periodSeconds: 30
       volumes:
         - name: config
-          secret:
-            secretName: xhttp-client-config
+          configMap:
+            name: xhttp-client-config
 ---
 apiVersion: v1
 kind: Service

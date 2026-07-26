@@ -1,0 +1,69 @@
+# Example ConfigMap for the xhttp client configuration.
+#
+# This file uses placeholder values only. Do NOT commit a version of this
+# file containing real uuid/server/path values, since this repository is
+# public.
+#
+# To deploy for real, generate your own ConfigMap from a local config.json
+# (kept out of git) and apply it directly, e.g.:
+#
+#   kubectl create configmap xhttp-client-config \
+#     --namespace xhttp \
+#     --from-file=config.json=./config.json \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# client-deployment.yaml expects the resulting ConfigMap to be named
+# xhttp-client-config in the xhttp namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: xhttp-client-config
+  namespace: xhttp
+data:
+  config.json: |
+    {
+      "log": {
+        "level": "info",
+        "timestamp": true
+      },
+      "inbounds": [
+        {
+          "type": "mixed",
+          "tag": "mixed-in",
+          "listen": "0.0.0.0",
+          "listen_port": 1080
+        }
+      ],
+      "outbounds": [
+        {
+          "type": "vless",
+          "tag": "proxy",
+          "server": "<server-address>",
+          "server_port": 443,
+          "uuid": "<uuid>",
+          "tls": {
+            "enabled": true,
+            "server_name": "<tls-server-name>"
+          },
+          "transport": {
+            "type": "xhttp",
+            "host": "<xhttp-host>",
+            "path": "<xhttp-path>",
+            "mode": "packet-up"
+          }
+        },
+        {
+          "type": "direct",
+          "tag": "direct"
+        }
+      ],
+      "route": {
+        "rules": [
+          {
+            "ip_cidr": ["192.168.0.0/24"],
+            "outbound": "direct"
+          }
+        ],
+        "final": "proxy"
+      }
+    }
