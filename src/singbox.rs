@@ -2,6 +2,35 @@
 //! Unknown fields are intentionally ignored so newer sing-box files remain readable.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+fn optional_u32_or_string<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Number(u32),
+        String(String),
+    }
+
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Number(value) => Ok(Some(value)),
+        Value::String(value) => {
+            let value = value.trim();
+            let parsed = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .map_or_else(|| value.parse(), |hex| u32::from_str_radix(hex, 16))
+                .map_err(serde::de::Error::custom)?;
+            Ok(Some(parsed))
+        }
+    }
+}
+
 fn one_or_many<'de, D, T>(d: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -279,6 +308,72 @@ pub struct Inbound {
     pub transport: Option<XHttpTransport>,
     pub tls: Option<TlsConfig>,
     pub padding_scheme: Vec<String>,
+
+    // TUN inbound fields.  The data-plane subset is validated by `tun::TunConfig`;
+    // keeping the unsupported control-plane fields here prevents them from being
+    // silently ignored by the otherwise forward-compatible parser.
+    pub interface_name: Option<String>,
+    pub netns: Option<String>,
+    pub mtu: Option<u16>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub address: Vec<ipnet::IpNet>,
+    pub dns_mode: Option<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub dns_address: Vec<std::net::IpAddr>,
+    pub stack: Option<String>,
+    pub auto_route: bool,
+    pub auto_redirect: bool,
+    #[serde(deserialize_with = "optional_u32_or_string")]
+    pub auto_redirect_input_mark: Option<u32>,
+    #[serde(deserialize_with = "optional_u32_or_string")]
+    pub auto_redirect_output_mark: Option<u32>,
+    #[serde(deserialize_with = "optional_u32_or_string")]
+    pub auto_redirect_reset_mark: Option<u32>,
+    pub auto_redirect_nfqueue: Option<u16>,
+    pub auto_redirect_iproute2_fallback_rule_index: Option<u32>,
+    pub exclude_mptcp: bool,
+    #[serde(deserialize_with = "one_or_many")]
+    pub loopback_address: Vec<std::net::IpAddr>,
+    pub strict_route: bool,
+    pub iproute2_table_index: Option<u32>,
+    pub iproute2_rule_index: Option<u32>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub route_address: Vec<ipnet::IpNet>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub route_address_set: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub route_exclude_address: Vec<ipnet::IpNet>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub route_exclude_address_set: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_interface: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub exclude_interface: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_uid: Vec<u32>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_uid_range: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub exclude_uid: Vec<u32>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub exclude_uid_range: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_package: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub exclude_package: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_android_user: Vec<i32>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub include_mac_address: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub exclude_mac_address: Vec<String>,
+    pub endpoint_independent_nat: bool,
+    pub udp_timeout: Option<String>,
+    pub udp_mapping: Option<String>,
+    pub udp_filtering: Option<String>,
+    pub udp_nat_max: Option<u32>,
+    pub platform: Option<serde_json::Value>,
+    pub gso: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -515,7 +610,7 @@ impl SingBoxConfig {
         let has_proxy_inbound = self.inbounds.iter().any(|inbound| {
             matches!(
                 inbound.r#type.as_str(),
-                "socks" | "http" | "mixed" | "anytls"
+                "socks" | "http" | "mixed" | "anytls" | "tun"
             )
         });
         for inbound in &self.inbounds {
@@ -609,6 +704,10 @@ impl SingBoxConfig {
                             bail!("AnyTLS ECH inbound requires key or key_path")
                         }
                     }
+                }
+                "tun" => {
+                    supported += 1;
+                    crate::tun::TunConfig::from_inbound(inbound)?;
                 }
                 _ => {}
             }

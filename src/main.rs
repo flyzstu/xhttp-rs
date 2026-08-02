@@ -104,6 +104,13 @@ fn load(path: &str) -> Result<SingBoxConfig> {
 async fn run(config: SingBoxConfig) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for inbound in config.inbounds {
+        if inbound.r#type == "tun" {
+            let outbounds = config.outbounds.clone();
+            let route = config.route.clone();
+            let dns = config.dns.clone();
+            tasks.spawn(async move { xhttp::tun::run(inbound, outbounds, route, dns).await });
+            continue;
+        }
         if matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();
@@ -158,10 +165,30 @@ async fn run(config: SingBoxConfig) -> Result<()> {
     if tasks.is_empty() {
         bail!("no supported inbound found")
     }
-    tokio::select! {result=tasks.join_next()=>if let Some(v)=result{v??},_ = tokio::signal::ctrl_c()=>{}}
+    tokio::select! {
+        result = tasks.join_next() => if let Some(value) = result { value?? },
+        result = shutdown_signal() => result?,
+    }
     tasks.abort_all();
     Ok(())
 }
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.context("wait for Ctrl-C")?,
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")
+}
+
 fn socket(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
