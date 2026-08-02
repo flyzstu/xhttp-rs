@@ -13,6 +13,11 @@ pub mod server;
 pub mod singbox;
 mod srs;
 pub mod tls;
+pub mod tun;
+#[cfg(target_os = "linux")]
+mod tun_redirect_linux;
+#[cfg(target_os = "linux")]
+mod tun_route_linux;
 pub mod vless;
 mod xmux;
 

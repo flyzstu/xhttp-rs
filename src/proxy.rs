@@ -38,10 +38,12 @@ enum Dialer {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct ProxyRuntime {
     dialers: Arc<HashMap<String, Dialer>>,
     router: Arc<Router>,
     resolver: Option<Arc<DnsResolver>>,
+    tun_output_mark: Option<u32>,
 }
 
 pub(crate) async fn build_runtime(
@@ -194,7 +196,18 @@ pub(crate) async fn build_runtime(
         dialers: Arc::new(dialers),
         router,
         resolver,
+        tun_output_mark: None,
     })
+}
+
+impl ProxyRuntime {
+    pub(crate) fn set_tun_output_mark(&mut self, mark: u32) {
+        self.tun_output_mark = Some(mark);
+    }
+
+    pub(crate) fn rule_set_ip_cidrs(&self, tags: &[String]) -> Result<Vec<ipnet::IpNet>> {
+        self.router.rule_set_ip_cidrs(tags)
+    }
 }
 
 pub(crate) async fn relay_anytls_tcp(
@@ -206,7 +219,7 @@ pub(crate) async fn relay_anytls_tcp(
     runtime: &ProxyRuntime,
 ) -> Result<()> {
     let destination = from_anytls_destination(&destination);
-    let (evaluation, initial) = evaluate_anytls_tcp_route(
+    let (evaluation, initial) = evaluate_stream_tcp_route(
         &mut stream,
         destination,
         RouteInput {
@@ -230,7 +243,7 @@ pub(crate) async fn relay_anytls_tcp(
             .as_deref()
             .context("DNS hijack requires a DNS configuration")?;
         stream.handshake_success().await?;
-        return relay_anytls_dns_tcp(&mut stream, initial, resolver).await;
+        return relay_dns_tcp_stream(&mut stream, initial, resolver).await;
     }
     let tag = match decision {
         RouteDecision::Outbound(tag) => tag,
@@ -290,6 +303,94 @@ pub(crate) async fn relay_anytls_tcp(
             stream.handshake_failure("connection blocked").await?;
             bail!("AnyTLS inbound connection blocked")
         }
+    }
+    Ok(())
+}
+
+pub(crate) async fn relay_tun_tcp(
+    mut stream: netstack_smoltcp::TcpStream,
+    source: SocketAddr,
+    destination: SocketAddr,
+    inbound: &str,
+    runtime: &ProxyRuntime,
+) -> Result<()> {
+    let destination = vless::Destination::Ip(destination.ip(), destination.port());
+    let (evaluation, initial) = evaluate_stream_tcp_route(
+        &mut stream,
+        destination,
+        RouteInput {
+            peer: source,
+            inbound,
+            router: &runtime.router,
+            resolver: runtime.resolver.as_deref(),
+            linux: &LinuxRouteMetadata::default(),
+            auth_user: None,
+        },
+    )
+    .await?;
+    let RouteEvaluation {
+        decision,
+        destination,
+        mut options,
+    } = evaluation;
+    if let Some(mark) = runtime.tun_output_mark {
+        options.routing_mark = Some(mark);
+    }
+    if decision == RouteDecision::HijackDns {
+        return relay_dns_tcp_stream(
+            &mut stream,
+            initial,
+            runtime
+                .resolver
+                .as_deref()
+                .context("DNS hijack requires a DNS configuration")?,
+        )
+        .await;
+    }
+    let tag = match decision {
+        RouteDecision::Outbound(tag) => tag,
+        RouteDecision::Reject => bail!("TUN TCP connection rejected by route"),
+        RouteDecision::HijackDns => unreachable!(),
+    };
+    match runtime
+        .dialers
+        .get(&tag)
+        .with_context(|| format!("unknown outbound: {tag}"))?
+    {
+        Dialer::Direct => {
+            let mut target = tokio::time::timeout(
+                options
+                    .connect_timeout
+                    .as_deref()
+                    .map(|value| parse_duration(Some(value)))
+                    .unwrap_or_else(|| std::time::Duration::from_secs(5)),
+                connect_direct(&destination, runtime.resolver.as_deref(), &options),
+            )
+            .await
+            .context("TUN target connect timeout")??;
+            if !initial.is_empty() {
+                write_first_packet(&mut target, &initial, &options).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::AnyTls { client } => {
+            let encoded = anytls::encode_address(&to_anytls_destination(&destination))?;
+            let mut target = client.create_stream(&encoded).await?;
+            if !initial.is_empty() {
+                target.write_all(&initial).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::Vless { client, user, .. } => {
+            let mut target = client.connect().await?;
+            vless::write_request(&mut target, user, &destination).await?;
+            vless::read_response(&mut target).await?;
+            if !initial.is_empty() {
+                target.write_all(&initial).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::Block => bail!("TUN TCP connection blocked by outbound"),
     }
     Ok(())
 }
@@ -495,6 +596,7 @@ pub async fn run_socks(
         dialers,
         router,
         resolver,
+        ..
     } = build_runtime(outbounds, route, dns).await?;
     let listen = socket(
         inbound.listen.as_deref().unwrap_or("127.0.0.1"),
@@ -540,10 +642,11 @@ fn start_rule_set_updater(router: Arc<Router>, config: RouteConfig, default_outb
     let update_interval = config
         .rule_set
         .iter()
-        .filter(|set| set.r#type == "remote")
+        .filter(|set| set.r#type == "remote" || set.update_interval.is_some())
         .map(|set| {
+            let minimum = if set.r#type == "remote" { 60 } else { 1 };
             parse_duration(set.update_interval.as_deref().or(Some("24h")))
-                .max(std::time::Duration::from_secs(60))
+                .max(std::time::Duration::from_secs(minimum))
         })
         .min();
     let Some(update_interval) = update_interval else {
@@ -969,11 +1072,14 @@ async fn evaluate_tcp_route(
     })
 }
 
-async fn evaluate_anytls_tcp_route(
-    stream: &mut anytls::AnyTlsStream,
+async fn evaluate_stream_tcp_route<S>(
+    stream: &mut S,
     destination: vless::Destination,
     input: RouteInput<'_>,
-) -> Result<(RouteEvaluation, Vec<u8>)> {
+) -> Result<(RouteEvaluation, Vec<u8>)>
+where
+    S: AsyncRead + Unpin,
+{
     let RouteInput {
         peer,
         inbound,
@@ -1894,11 +2000,14 @@ async fn relay_dns_tcp(stream: &mut TcpStream, resolver: &DnsResolver) -> Result
     }
 }
 
-async fn relay_anytls_dns_tcp(
-    stream: &mut anytls::AnyTlsStream,
+async fn relay_dns_tcp_stream<S>(
+    stream: &mut S,
     initial: Vec<u8>,
     resolver: &DnsResolver,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut prefix = initial.as_slice();
     loop {
         let mut length = [0; 2];
@@ -2036,6 +2145,301 @@ async fn relay_anytls_udp_direct(
             _ => unreachable!(),
         }
     }
+}
+
+pub(crate) async fn relay_tun_udp(
+    source: SocketAddr,
+    inbound: &str,
+    runtime: &ProxyRuntime,
+    mut packets: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    responses: mpsc::Sender<(Vec<u8>, SocketAddr, SocketAddr)>,
+    default_idle_timeout: std::time::Duration,
+    fixed_destination: bool,
+) -> Result<()> {
+    let Some((first, packet_destination)) = packets.recv().await else {
+        return Ok(());
+    };
+    let original_destination = packet_destination;
+    let evaluation = evaluate_udp_route(
+        vless::Destination::Ip(original_destination.ip(), original_destination.port()),
+        &first,
+        RouteInput {
+            peer: source,
+            inbound,
+            router: &runtime.router,
+            resolver: runtime.resolver.as_deref(),
+            linux: &LinuxRouteMetadata::default(),
+            auth_user: None,
+        },
+    )
+    .await?;
+    let RouteEvaluation {
+        decision,
+        destination,
+        mut options,
+    } = evaluation;
+    if let Some(mark) = runtime.tun_output_mark {
+        options.routing_mark = Some(mark);
+    }
+    if decision == RouteDecision::HijackDns {
+        let resolver = runtime
+            .resolver
+            .as_deref()
+            .context("DNS hijack requires a DNS configuration")?;
+        let mut packet = Some(first);
+        loop {
+            let request = match packet.take() {
+                Some(value) => value,
+                None => match packets.recv().await {
+                    Some((value, _)) => value,
+                    None => return Ok(()),
+                },
+            };
+            let response = resolver.exchange(&request).await?;
+            responses
+                .send((response, original_destination, source))
+                .await
+                .context("TUN UDP response channel closed")?;
+        }
+    }
+    let tag = match decision {
+        RouteDecision::Outbound(tag) => tag,
+        RouteDecision::Reject => return Ok(()),
+        RouteDecision::HijackDns => unreachable!(),
+    };
+    let dialer = runtime
+        .dialers
+        .get(&tag)
+        .with_context(|| format!("unknown outbound: {tag}"))?
+        .clone();
+    if matches!(dialer, Dialer::Block) {
+        return Ok(());
+    }
+    let idle_timeout = options
+        .udp_timeout
+        .as_deref()
+        .map(|value| parse_duration(Some(value)))
+        .unwrap_or(default_idle_timeout);
+    let resolver = runtime.resolver.clone();
+    let (initial_tx, initial_rx) = mpsc::channel(1);
+    initial_tx.send((first, original_destination)).await.ok();
+    drop(initial_tx);
+    let mut packets = tokio_stream::wrappers::ReceiverStream::new(initial_rx)
+        .chain(tokio_stream::wrappers::ReceiverStream::new(packets));
+
+    match dialer {
+        Dialer::Direct => {
+            let target = resolve_udp(&destination, resolver.as_deref()).await?;
+            let socket = direct_udp_socket(target, &options)?;
+            let connected = options.udp_connect && fixed_destination;
+            if connected {
+                socket.connect(target).await?;
+            }
+            let mut response = vec![0; u16::MAX as usize];
+            loop {
+                let event = tokio::time::timeout(idle_timeout, async {
+                    tokio::select! {
+                        packet = packets.next() => Ok::<_, anyhow::Error>((packet, None)),
+                        received = async {
+                            if connected {
+                                socket.recv(&mut response).await.map(|length| (length, target))
+                            } else {
+                                socket.recv_from(&mut response).await
+                            }
+                        } => Ok((None, Some(received?))),
+                    }
+                })
+                .await
+                .context("TUN UDP session idle timeout")??;
+                match event {
+                    (Some((packet, packet_destination)), None) => {
+                        if connected {
+                            socket.send(&packet).await?;
+                        } else {
+                            socket.send_to(&packet, packet_destination).await?;
+                        }
+                    }
+                    (None, Some((length, response_source))) => {
+                        let response_source =
+                            udp_response_destination(&destination, response_source, &options);
+                        let response_source =
+                            destination_socket_addr(&response_source, resolver.as_deref()).await?;
+                        responses
+                            .send((response[..length].to_vec(), response_source, source))
+                            .await
+                            .context("TUN UDP response channel closed")?;
+                    }
+                    (None, None) => return Ok(()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Dialer::Vless { client, user, xudp } => {
+            let mut stream = client.connect().await?;
+            vless::write_request_with_command(
+                &mut stream,
+                &user,
+                if xudp {
+                    vless::Command::Xudp
+                } else {
+                    vless::Command::Udp
+                },
+                &destination,
+            )
+            .await?;
+            let (mut read, mut write) = tokio::io::split(stream);
+            let mut response_read = false;
+            let mut first_xudp_packet = true;
+            let mut response = vec![0; u16::MAX as usize];
+            loop {
+                let event = tokio::time::timeout(idle_timeout, async {
+                    tokio::select! {
+                        packet = packets.next() => Ok::<_, anyhow::Error>((packet, None)),
+                        received = async {
+                            if !response_read {
+                                vless::read_response(&mut read).await?;
+                                response_read = true;
+                            }
+                            if xudp {
+                                let (address, payload) = vless::read_xudp_packet(&mut read).await?;
+                                Ok::<_, anyhow::Error>((address, payload))
+                            } else {
+                                let length = read.read_u16().await? as usize;
+                                read.read_exact(&mut response[..length]).await?;
+                                Ok((None, response[..length].to_vec()))
+                            }
+                        } => Ok((None, Some(received?))),
+                    }
+                })
+                .await
+                .context("TUN VLESS UDP session idle timeout")??;
+                match event {
+                    (Some((packet, packet_destination)), None) => {
+                        if xudp {
+                            let packet_destination = vless::Destination::Ip(
+                                packet_destination.ip(),
+                                packet_destination.port(),
+                            );
+                            vless::write_xudp_packet(
+                                &mut write,
+                                first_xudp_packet,
+                                &packet_destination,
+                                &packet,
+                            )
+                            .await?;
+                            first_xudp_packet = false;
+                        } else {
+                            if packet_destination != original_destination {
+                                bail!(
+                                    "classic VLESS UDP cannot change destination within one NAT mapping"
+                                )
+                            }
+                            write
+                                .write_u16(packet.len().try_into().context("UDP packet too large")?)
+                                .await?;
+                            write.write_all(&packet).await?;
+                            write.flush().await?;
+                        }
+                    }
+                    (None, Some((address, payload))) => {
+                        let response_source = address
+                            .as_ref()
+                            .map(|value| {
+                                udp_response_proxy_destination(&destination, value, &options)
+                            })
+                            .unwrap_or_else(|| destination.clone());
+                        let response_source =
+                            destination_socket_addr(&response_source, resolver.as_deref()).await?;
+                        responses
+                            .send((payload, response_source, source))
+                            .await
+                            .context("TUN UDP response channel closed")?;
+                    }
+                    (None, None) => return Ok(()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Dialer::AnyTls { client } => {
+            let anytls_destination = to_anytls_destination(&destination);
+            let connected = fixed_destination;
+            let initial = anytls::encode_address(&anytls::uot::magic_destination())?;
+            let mut stream = client.create_stream(&initial).await?;
+            anytls::uot::write_request(
+                &mut stream,
+                &anytls::uot::Request {
+                    is_connect: connected,
+                    destination: anytls_destination.clone(),
+                },
+            )
+            .await?;
+            loop {
+                let event = tokio::time::timeout(idle_timeout, async {
+                    tokio::select! {
+                        packet = packets.next() => Ok::<_, anyhow::Error>((packet, None)),
+                        packet = anytls::uot::read_packet(
+                            &mut stream,
+                            connected.then_some(&anytls_destination),
+                        ) => {
+                            Ok((None, Some(packet?)))
+                        }
+                    }
+                })
+                .await
+                .context("TUN AnyTLS UDP session idle timeout")??;
+                match event {
+                    (Some((packet, packet_destination)), None) => {
+                        let packet_destination = to_anytls_destination(&vless::Destination::Ip(
+                            packet_destination.ip(),
+                            packet_destination.port(),
+                        ));
+                        anytls::uot::write_packet(
+                            &mut stream,
+                            &packet_destination,
+                            &packet,
+                            connected,
+                        )
+                        .await?;
+                    }
+                    (None, Some((address, payload))) => {
+                        let response_source = udp_response_proxy_destination(
+                            &destination,
+                            &from_anytls_destination(&address),
+                            &options,
+                        );
+                        let response_source =
+                            destination_socket_addr(&response_source, resolver.as_deref()).await?;
+                        responses
+                            .send((payload, response_source, source))
+                            .await
+                            .context("TUN UDP response channel closed")?;
+                    }
+                    (None, None) => return Ok(()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Dialer::Block => Ok(()),
+    }
+}
+
+async fn destination_socket_addr(
+    destination: &vless::Destination,
+    resolver: Option<&DnsResolver>,
+) -> Result<SocketAddr> {
+    Ok(SocketAddr::new(
+        match destination {
+            vless::Destination::Ip(ip, _) => *ip,
+            vless::Destination::Domain(domain, _) => resolver
+                .context("domain UDP response requires a DNS configuration")?
+                .lookup(domain)
+                .await?
+                .into_iter()
+                .next()
+                .with_context(|| format!("no address for UDP response domain {domain}"))?,
+        },
+        destination.port(),
+    ))
 }
 
 async fn udp_session(

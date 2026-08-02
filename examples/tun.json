@@ -1,0 +1,26 @@
+{
+  "inbounds": [{
+    "type": "tun",
+    "tag": "tun-in",
+    "interface_name": "xhttp0",
+    "mtu": 9000,
+    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+    "stack": "mixed",
+    "auto_route": true,
+    "auto_redirect": true,
+    "iproute2_table_index": 22022,
+    "iproute2_rule_index": 12000,
+    "auto_redirect_input_mark": 8483,
+    "auto_redirect_output_mark": 8484,
+    "route_address": ["1.1.1.1/32", "2606:4700:4700::1111/128"],
+    "route_exclude_address": ["10.0.0.0/8", "fd00::/8"]
+  }],
+  "outbounds": [{
+    "type": "direct",
+    "tag": "direct"
+  }],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "direct"
+  }
+}

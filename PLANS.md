@@ -10,8 +10,8 @@ can run as both:
 
 - a VLESS/XHTTP server; and
 - an AnyTLS v2 server; and
-- a local SOCKS5, HTTP, or mixed proxy client with direct, block, and
-  VLESS/XHTTP or AnyTLS outbounds.
+- a local SOCKS5, HTTP, mixed, or Linux TUN proxy client with direct, block,
+  and VLESS/XHTTP or AnyTLS outbounds.
 
 The current goal is not to rewrite every sing-box protocol and platform
 feature. Compatibility work should prioritize the XHTTP/VLESS data path,
@@ -23,7 +23,7 @@ interoperability with sing-box and Xray-core.
 The implementation is usable rather than a protocol skeleton. At the time of
 this update:
 
-- `cargo test --all-targets` passes 62 tests;
+- `cargo test --all-targets` passes 68 tests;
 - `cargo clippy --all-targets -- -D warnings` passes; and
 - `tests/interop.sh` passes sing-box and Xray-core TCP/UDP interoperability in
   both client/server directions for all three XHTTP modes.
@@ -117,6 +117,35 @@ idle timeout, and close lifecycle.
 
 SOCKS5 UDP preserves datagram boundaries and can route through direct,
 classic VLESS UDP, or XUDP paths.
+
+### Linux TUN inbound
+
+- native L3 device creation/configuration through `tun-rs`
+- Tokio packet pumps between the device and the smoltcp userspace stack
+- TCP, UDP and ICMP extraction/handling
+- TCP/UDP dispatch through direct, AnyTLS and VLESS/XHTTP outbounds
+- normal route actions, sniffing, route options and DNS hijacking
+- IPv4 and IPv6 device addresses with explicit MTU and interface name
+- Linux automatic policy routing in a dedicated table/priority window
+- included/excluded route prefixes, included/excluded ingress interfaces,
+  included/excluded UIDs and UID ranges, and strict address-family routing
+- atomic nftables `auto_redirect` for local and forwarded IPv4/IPv6 TCP, UDP
+  and ICMP, with interface/MAC/UID/prefix filtering and outbound mark bypass
+- hot `route_address_set` / `route_exclude_address_set` CIDR extraction from
+  inline, local, remote source and binary SRS rule-sets
+- independent UDP NAT mapping/filtering modes, idle expiry, memory-aware
+  defaults and bounded LRU eviction
+- router forwarding sysctls, Docker `DOCKER-USER` compatibility, stale-state
+  recovery (including SIGKILL restart) and exact normal-shutdown cleanup
+- isolated client/gateway/server namespace verification for IPv4/IPv6 TCP,
+  UDP and ICMP
+- transactional setup and exact rollback on normal shutdown, cancellation,
+  or partially failed installation
+
+The runtime rejects Android package/user filters, explicit network namespaces,
+loopback remapping, the optional NFQUEUE pre-match controls and deprecated
+endpoint-independent NAT rather than silently ignoring them. `mixed`, `gvisor` and `smoltcp` select the same
+Rust smoltcp data plane; the native `system` stack is not implemented.
 
 ### Outbounds
 
@@ -215,7 +244,9 @@ Implemented rule-set sources:
 | `src/xmux.rs` | XHTTP HTTP-client pool selection, reuse, and request budgets |
 | `src/server.rs` | XHTTP server, HTTP/3 server, sessions, ordering, and limits |
 | `src/vless.rs` | VLESS handshake, TCP, classic UDP, and XUDP |
-| `src/proxy.rs` | SOCKS/HTTP/mixed inbounds, outbound dispatch, and UDP relay |
+| `src/proxy.rs` | SOCKS/HTTP/mixed/TUN flow dispatch, outbound dispatch, and UDP relay |
+| `src/tun.rs` | Linux TUN device, Tokio packet pumps, smoltcp TCP/UDP lifecycle |
+| `src/tun_route_linux.rs` | Transactional Linux auto-route/strict-route policy rules |
 | `src/anytls.rs` | AnyTLS TLS setup, sing-box client conversion, and inbound runtime |
 | `src/dns.rs` | DNS transports, parsing, lookup, selection, and caching |
 | `src/routing.rs` | Rule compilation, rule-set loading, matching, and actions |

@@ -161,6 +161,7 @@ pub enum RuleAction {
 #[derive(Debug, Clone)]
 pub struct Router {
     rules: Arc<RwLock<Vec<CompiledRule>>>,
+    rule_sets: Arc<RwLock<HashMap<String, Vec<CompiledRule>>>>,
     final_outbound: String,
     default_options: Arc<RwLock<RouteOptions>>,
 }
@@ -242,6 +243,7 @@ impl Router {
             .collect::<Result<_>>()?;
         Ok(Self {
             rules: Arc::new(RwLock::new(rules)),
+            rule_sets: Arc::new(RwLock::new(rule_sets)),
             final_outbound,
             default_options: Arc::new(RwLock::new(RouteOptions {
                 bind_interface: config.default_interface.clone(),
@@ -300,6 +302,14 @@ impl Router {
             .clone();
         *self.rules.write().expect("route rule lock poisoned") = rules;
         *self
+            .rule_sets
+            .write()
+            .expect("route rule-set lock poisoned") = updated
+            .rule_sets
+            .read()
+            .expect("updated route rule-set lock poisoned")
+            .clone();
+        *self
             .default_options
             .write()
             .expect("route default options lock poisoned") = updated
@@ -307,6 +317,11 @@ impl Router {
             .read()
             .expect("updated route default options lock poisoned")
             .clone();
+    }
+
+    pub(crate) fn rule_set_ip_cidrs(&self, tags: &[String]) -> Result<Vec<IpNet>> {
+        let sets = self.rule_sets.read().expect("route rule-set lock poisoned");
+        extract_rule_set_ip_cidrs(&sets, tags)
     }
 }
 
@@ -642,6 +657,38 @@ fn load_rule_sets(
     Ok(result)
 }
 
+pub(crate) fn load_rule_set_ip_cidrs(config: &RouteConfig, tags: &[String]) -> Result<Vec<IpNet>> {
+    let sets = load_rule_sets(config, true)?;
+    extract_rule_set_ip_cidrs(&sets, tags)
+}
+
+fn extract_rule_set_ip_cidrs(
+    sets: &HashMap<String, Vec<CompiledRule>>,
+    tags: &[String],
+) -> Result<Vec<IpNet>> {
+    let mut cidrs = Vec::new();
+    for tag in tags {
+        let rules = sets
+            .get(tag)
+            .with_context(|| format!("TUN route rule-set not found: {tag}"))?;
+        for rule in rules {
+            collect_destination_cidrs(rule, &mut cidrs);
+        }
+    }
+    cidrs.sort_by_key(ToString::to_string);
+    cidrs.dedup();
+    Ok(cidrs)
+}
+
+fn collect_destination_cidrs(rule: &CompiledRule, cidrs: &mut Vec<IpNet>) {
+    if !rule.invert {
+        cidrs.extend(rule.cidrs.iter().copied());
+    }
+    for nested in &rule.logical_rules {
+        collect_destination_cidrs(nested, cidrs);
+    }
+}
+
 fn load_remote_rule_set(set: &crate::singbox::RuleSetConfig) -> Result<Vec<RouteRule>> {
     use std::{
         collections::hash_map::DefaultHasher,
@@ -962,6 +1009,26 @@ mod tests {
             }),
             RouteDecision::Outbound("direct".into())
         );
+    }
+
+    #[test]
+    fn tun_route_rule_set_extracts_only_destination_cidrs() {
+        let config = RouteConfig {
+            rule_set: vec![RuleSetConfig {
+                r#type: "inline".into(),
+                tag: "router".into(),
+                rules: vec![RouteRule {
+                    ip_cidr: vec!["192.0.2.0/24".parse().unwrap()],
+                    source_ip_cidr: vec!["10.0.0.0/8".parse().unwrap()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let cidrs = load_rule_set_ip_cidrs(&config, &["router".into()]).unwrap();
+        assert_eq!(cidrs, ["192.0.2.0/24".parse().unwrap()]);
+        assert!(load_rule_set_ip_cidrs(&config, &["missing".into()]).is_err());
     }
 
     #[test]
