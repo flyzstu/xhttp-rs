@@ -1,8 +1,8 @@
 # xhttp-rs
 
 Rust implementation of the XHTTP transport used by sing-box and Xray-core.
-It provides a VLESS/XHTTP server and SOCKS, HTTP, or mixed local proxy clients,
-plus AnyTLS v2 client and server operation, using sing-box style JSON
+It provides a VLESS/XHTTP server, SOCKS, HTTP, mixed and Linux TUN local proxy
+clients, plus AnyTLS v2 client and server operation, using sing-box style JSON
 configuration.
 
 ## Build and run
@@ -50,6 +50,7 @@ is accepted directly. A minimal client configuration looks like:
 - [Rule-sets](examples/ruleset.json) demonstrates inline and local source
   rule-sets. Its local source data is in
   [ruleset-source.json](examples/ruleset-source.json).
+- [TUN](examples/tun.json) demonstrates the Linux Tokio/smoltcp TUN inbound.
 
 Validate either example from the repository root:
 
@@ -104,6 +105,61 @@ Remote source JSON and binary SRS rule-sets use the same route structure:
   ECH, and server ECH key support.
 - SOCKS5, HTTP proxy and mixed TCP inbounds, including username/password
   authentication and `auth_user` routing.
+- Linux TUN inbound using `tun-rs` and a Tokio-driven smoltcp userspace stack.
+  Extracted TCP and UDP flows use the same direct, AnyTLS, VLESS/XHTTP, routing,
+  sniffing and DNS-hijack dispatcher as local proxy inbounds; ICMP echo is
+  answered by the stack.
+
+### Linux TUN routing
+
+The TUN runtime can install Linux policy routes automatically. It detects and
+binds the physical default interface before creating TUN unless
+`default_interface` or `auto_detect_interface` is explicitly configured,
+preventing direct outbound traffic from looping into TUN. The example limits
+automatic routing to Cloudflare's public resolver addresses:
+
+```bash
+sudo cargo run -- run -c examples/tun.json
+```
+
+`auto_route` uses a dedicated iproute2 table and priority window (compatible
+defaults: table `2022`, rule priority `9000`). `route_address` and
+`route_exclude_address` select captured prefixes; `include_interface`,
+`exclude_interface`, UID/UID-range selectors and `strict_route` are supported.
+Every installed route/rule is rolled back on normal shutdown, cancellation,
+or a partially failed setup. Use custom table/rule indexes when another VPN
+already occupies the defaults, as shown in the example.
+
+`auto_redirect` adds an atomic nftables capture plane for locally generated and
+forwarded IPv4/IPv6 TCP, UDP and ICMP traffic. It supports ingress interface,
+source MAC, UID, route-prefix and proxy/DNS endpoint bypass filters, marks proxy
+outbound sockets to prevent loops, enables forwarding while active, and adds
+Docker `DOCKER-USER` compatibility rules when that chain exists. A deterministic
+table name and process lock recover stale nftables/policy-route state on the
+next start and preserve the forwarding sysctl values that preceded a hard kill.
+Unlike sing-tun, this data plane sends all selected protocols directly to the
+TUN table and therefore does not need a TCP REDIRECT listener or NFQUEUE reset
+path.
+
+The TUN address accepts a scalar or a list of IPv4/IPv6 prefixes. Supported
+stack names are `mixed`, `gvisor` (compatibility aliases) and `smoltcp`; all
+use the Rust smoltcp data plane. Linux source-MAC filters and individual/ranged
+UID filters are supported with `auto_redirect`. Android package/user filters,
+explicit network namespaces and loopback address remapping remain unsupported
+and fail validation.
+
+`route_address_set` and `route_exclude_address_set` extract destination CIDRs
+from inline, local, remote source-JSON and binary SRS rule-sets. Updates replace
+the nftables interval sets and dedicated iproute2 routes without restarting the
+TUN device; a failed reload retains the last valid rules. Local sets with an
+`update_interval` and remote sets use the shared router refresh snapshot.
+
+The TUN UDP NAT supports endpoint-independent, address-dependent and
+address-and-port-dependent mapping and filtering independently. Mappings expire
+after `udp_timeout`; `udp_nat_max` applies LRU eviction and closes every relay
+owned by the evicted mapping. When the limit is zero or omitted, Linux memory
+determines a value between 4096 and 16384. Direct, VLESS XUDP and AnyTLS UoT
+preserve variable destinations inside endpoint-independent mappings.
 
 ## Verification
 
@@ -111,6 +167,7 @@ Remote source JSON and binary SRS rule-sets use the same route structure:
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 tests/interop.sh
+sudo tests/tun-router-linux.sh
 ```
 
 The interoperability suite builds the included sing-box and Xray-core trees
@@ -138,7 +195,9 @@ Licensed under the [MIT License](LICENSE).
 
 Legacy GeoIP/Geosite databases, fake-IP DNS, `preferred_by` outbounds,
 remote rule-set `download_detour`, `packetaddr`, XHTTP DNS-discovered/server ECH
-and mux.cool are not enabled. Linux has no sing-box-compatible
+and mux.cool are not enabled. TUN package filters, explicit network namespaces,
+loopback remapping and sing-tun's optional NFQUEUE pre-match path are not enabled.
+Linux has no sing-box-compatible
 `network_is_constrained`, `tcp_multi_path` or TLS spoof facility; unsupported
 runtime-relevant options fail validation instead of being silently ignored.
 Set `XHTTP_CLASH_MODE=direct|global|rule` when using `clash_mode` rules.
