@@ -1,0 +1,49 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-router",
+      "interface_name": "xh-tun",
+      "mtu": 1500,
+      "address": ["172.31.0.1/30", "fdfe:dcba:9876::1/126"],
+      "stack": "smoltcp",
+      "auto_route": true,
+      "auto_redirect": true,
+      "strict_route": true,
+      "iproute2_table_index": 22023,
+      "iproute2_rule_index": 12120,
+      "auto_redirect_input_mark": "0x2223",
+      "auto_redirect_output_mark": "0x2224",
+      "route_address_set": "tun-routes",
+      "include_interface": "xh-client",
+      "include_uid_range": "0:65535",
+      "udp_timeout": "30s",
+      "udp_mapping": "endpoint_independent",
+      "udp_filtering": "address_and_port_dependent",
+      "udp_nat_max": 2
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_interface": "xh-uplink",
+    "final": "direct",
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "tun-routes",
+        "format": "source",
+        "path": "/tmp/xhttp-rs-tun-route-set.json",
+        "update_interval": "1s"
+      }
+    ]
+  }
+}
