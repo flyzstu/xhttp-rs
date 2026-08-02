@@ -19,7 +19,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: xhttp-client
-  namespace: xhttp
   labels:
     app: xhttp-client
 spec:
@@ -34,7 +33,7 @@ spec:
     spec:
       containers:
         - name: xhttp-client
-          image: ghcr.io/flyzstu/xhttp-rs:<short-sha>
+          image: ghcr.io/flyzstu/xhttp-rs:e404422
           args: ["run", "-c", "/etc/xhttp/config.json"]
           ports:
             - name: mixed-proxy
@@ -70,7 +69,6 @@ apiVersion: v1
 kind: Service
 metadata:
   name: xhttp-client
-  namespace: xhttp
   labels:
     app: xhttp-client
 spec:

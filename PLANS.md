@@ -1,16 +1,17 @@
 # xhttp-rs Implementation Plan
 
-Last updated: 2026-07-23
+Last updated: 2026-08-02
 
 ## Project goal
 
-`xhttp-rs` is a standalone Rust implementation of the sing-box/Xray XHTTP
-and VLESS path. It accepts a useful subset of sing-box JSON configuration and
+`xhttp-rs` is a standalone Rust implementation of the sing-box/Xray XHTTP,
+VLESS and AnyTLS paths. It accepts a useful subset of sing-box JSON configuration and
 can run as both:
 
 - a VLESS/XHTTP server; and
+- an AnyTLS v2 server; and
 - a local SOCKS5, HTTP, or mixed proxy client with direct, block, and
-  VLESS/XHTTP outbounds.
+  VLESS/XHTTP or AnyTLS outbounds.
 
 The current goal is not to rewrite every sing-box protocol and platform
 feature. Compatibility work should prioritize the XHTTP/VLESS data path,
@@ -22,12 +23,13 @@ interoperability with sing-box and Xray-core.
 The implementation is usable rather than a protocol skeleton. At the time of
 this update:
 
-- `cargo test --all-targets` passes 40 tests;
+- `cargo test --all-targets` passes 62 tests;
 - `cargo clippy --all-targets -- -D warnings` passes; and
 - `tests/interop.sh` passes sing-box and Xray-core TCP/UDP interoperability in
   both client/server directions for all three XHTTP modes.
 
-The interoperability suite also covers non-default metadata/data placements,
+The interoperability suite also covers AnyTLS v2 TCP/UDP in both directions
+with sing-box, non-default metadata/data placements,
 tokenish padding, a custom upload method, XMUX under concurrent logical
 connections, inline TLS certificates, expected TLS trust/hostname/ALPN
 failures, static client ECH over H1/H2/H3, a TLS `server_name` distinct from
@@ -121,6 +123,21 @@ classic VLESS UDP, or XUDP paths.
 - `direct`
 - `block`
 - `vless` with XHTTP
+- `anytls` with TLS, multiplexed session reuse and UDP-over-TCP v2
+
+### AnyTLS
+
+- protocol v2 authentication and all defined frame commands
+- client and server operation with sing-box-style configuration
+- dynamic padding scheme negotiation
+- reusable idle-session pools and cleanup controls
+- SYNACK reporting and timeout recovery
+- TCP and UDP-over-TCP v2
+- routing between AnyTLS, direct and VLESS/XHTTP paths
+- multi-user inbound authentication
+- client ECH from static configuration or DNS HTTPS records
+- server ECH from sing-box ECH key material
+- TLS custom roots, certificate/public-key pinning, ALPN, and mutual TLS
 
 ### DNS
 
@@ -199,6 +216,7 @@ Implemented rule-set sources:
 | `src/server.rs` | XHTTP server, HTTP/3 server, sessions, ordering, and limits |
 | `src/vless.rs` | VLESS handshake, TCP, classic UDP, and XUDP |
 | `src/proxy.rs` | SOCKS/HTTP/mixed inbounds, outbound dispatch, and UDP relay |
+| `src/anytls.rs` | AnyTLS TLS setup, sing-box client conversion, and inbound runtime |
 | `src/dns.rs` | DNS transports, parsing, lookup, selection, and caching |
 | `src/routing.rs` | Rule compilation, rule-set loading, matching, and actions |
 | `src/main.rs` | CLI, logging, config loading, and task lifecycle |

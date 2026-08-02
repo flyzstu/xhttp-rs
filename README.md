@@ -2,7 +2,8 @@
 
 Rust implementation of the XHTTP transport used by sing-box and Xray-core.
 It provides a VLESS/XHTTP server and SOCKS, HTTP, or mixed local proxy clients,
-using sing-box style JSON configuration.
+plus AnyTLS v2 client and server operation, using sing-box style JSON
+configuration.
 
 ## Build and run
 
@@ -98,6 +99,9 @@ Remote source JSON and binary SRS rule-sets use the same route structure:
 - Inline/local/remote sing-box source JSON and binary SRS rule-sets with a
   64 MiB limit, disk cache, stale-cache fallback and periodic atomic refresh.
 - Direct, block and VLESS/XHTTP outbounds.
+- AnyTLS v2 inbound and outbound with TLS, padding negotiation, session reuse,
+  SYNACK timeout recovery, UDP-over-TCP v2, static or DNS-discovered client
+  ECH, and server ECH key support.
 - SOCKS5, HTTP proxy and mixed TCP inbounds, including username/password
   authentication and `auth_user` routing.
 
@@ -133,8 +137,8 @@ Licensed under the [MIT License](LICENSE).
 ## Current boundaries
 
 Legacy GeoIP/Geosite databases, fake-IP DNS, `preferred_by` outbounds,
-remote rule-set `download_detour`, `packetaddr`, DNS-discovered/server ECH and
-mux.cool are not enabled. Linux has no sing-box-compatible
+remote rule-set `download_detour`, `packetaddr`, XHTTP DNS-discovered/server ECH
+and mux.cool are not enabled. Linux has no sing-box-compatible
 `network_is_constrained`, `tcp_multi_path` or TLS spoof facility; unsupported
 runtime-relevant options fail validation instead of being silently ignored.
 Set `XHTTP_CLASH_MODE=direct|global|rule` when using `clash_mode` rules.

@@ -140,7 +140,7 @@ fn user_name(uid: u32) -> Option<String> {
         })
 }
 
-fn default_interface() -> Option<String> {
+pub fn default_interface() -> Option<String> {
     fs::read_to_string("/proc/net/route")
         .ok()?
         .lines()

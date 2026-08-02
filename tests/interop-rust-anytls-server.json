@@ -1,0 +1,11 @@
+{
+  "inbounds": [{
+    "type": "anytls",
+    "tag": "anytls-in",
+    "listen": "127.0.0.1",
+    "listen_port": 18445,
+    "users": [{"name": "interop", "password": "interop-password"}]
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}],
+  "route": {"final": "direct"}
+}

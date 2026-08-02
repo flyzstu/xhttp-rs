@@ -113,6 +113,15 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             );
             continue;
         }
+        if inbound.r#type == "anytls" {
+            let outbounds = config.outbounds.clone();
+            let route = config.route.clone();
+            let dns = config.dns.clone();
+            tasks.spawn(
+                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns).await },
+            );
+            continue;
+        }
         if !(inbound.r#type == "vless"
             && inbound
                 .transport
@@ -147,7 +156,7 @@ async fn run(config: SingBoxConfig) -> Result<()> {
         tasks.spawn(server.run());
     }
     if tasks.is_empty() {
-        bail!("no supported VLESS XHTTP inbound found")
+        bail!("no supported inbound found")
     }
     tokio::select! {result=tasks.join_next()=>if let Some(v)=result{v??},_ = tokio::signal::ctrl_c()=>{}}
     tasks.abort_all();

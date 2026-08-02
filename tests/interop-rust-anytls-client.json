@@ -1,0 +1,20 @@
+{
+  "inbounds": [{
+    "type": "mixed",
+    "tag": "mixed-in",
+    "listen": "127.0.0.1",
+    "listen_port": 11085
+  }],
+  "outbounds": [{
+    "type": "anytls",
+    "tag": "anytls-out",
+    "server": "127.0.0.1",
+    "server_port": 18446,
+    "password": "interop-password",
+    "idle_session_check_interval": "30s",
+    "idle_session_timeout": "30s",
+    "min_idle_session": 1,
+    "tls": {"enabled": true, "insecure": true, "server_name": "localhost"}
+  }],
+  "route": {"final": "anytls-out"}
+}

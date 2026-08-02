@@ -1,6 +1,7 @@
 //! XHTTP transport compatible with the stream-one, stream-up and packet-up
 //! wire formats used by Xray-core and sing-box.
 
+pub mod anytls;
 pub mod client;
 pub mod config;
 pub mod dns;
@@ -11,6 +12,7 @@ pub mod routing;
 pub mod server;
 pub mod singbox;
 mod srs;
+pub mod tls;
 pub mod vless;
 mod xmux;
 

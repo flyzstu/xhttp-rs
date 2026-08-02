@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use ipnet::IpNet;
 use rand::Rng;
 use std::{
     cmp::Reverse,
@@ -39,13 +40,34 @@ struct Inner {
     cache: Mutex<DnsCache>,
     flights: Mutex<HashMap<CacheKey, Arc<Flight>>>,
     cache_enabled: bool,
+    strategy: Option<String>,
+    timeout: Duration,
+    client_subnet: Option<String>,
     http: reqwest::Client,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LookupOptions<'a> {
+    pub server: Option<&'a str>,
+    pub disable_cache: bool,
+    pub rewrite_ttl: Option<u32>,
+    pub timeout: Option<Duration>,
+    pub strategy: Option<&'a str>,
+    pub client_subnet: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum CacheKey {
-    Lookup(String, u16),
-    Wire(Vec<u8>),
+    Lookup {
+        name: String,
+        qtype: u16,
+        server: Option<String>,
+        client_subnet: Option<String>,
+    },
+    Wire {
+        query: Vec<u8>,
+        server: String,
+    },
 }
 
 #[derive(Clone)]
@@ -68,6 +90,7 @@ struct DnsCache {
     lru: VecDeque<(u64, u64, CacheKey)>,
     capacity: usize,
     clock: u64,
+    disable_expire: bool,
 }
 
 struct Flight {
@@ -112,6 +135,25 @@ struct IdleConnection {
 impl DnsResolver {
     pub fn new(config: &DnsConfig) -> Result<Self> {
         crate::install_crypto_provider();
+        validate_strategy(config.strategy.as_deref())?;
+        if let Some(subnet) = &config.client_subnet {
+            parse_client_subnet(subnet)?;
+        }
+        if config.reverse_mapping {
+            bail!("DNS reverse_mapping requires a TUN-style inbound and is not supported")
+        }
+        if config.optimistic.as_ref().is_some_and(optimistic_enabled) {
+            bail!("optimistic DNS cache is not supported")
+        }
+        for rule in &config.rules {
+            validate_dns_rule(rule, true)?;
+        }
+        let dns_timeout = config
+            .timeout
+            .as_deref()
+            .map(parse_duration)
+            .transpose()?
+            .unwrap_or(DNS_TIMEOUT);
         let dot_tls = if config.servers.iter().any(|server| server.r#type == "tls") {
             let mut roots = rustls::RootCertStore::empty();
             let native = rustls_native_certs::load_native_certs();
@@ -148,15 +190,29 @@ impl DnsResolver {
                 servers,
                 rules: config.rules.clone(),
                 final_tag,
-                cache: Mutex::new(DnsCache::new(config.cache_capacity.unwrap_or(4096).max(1))),
+                cache: Mutex::new(DnsCache::new(
+                    config.cache_capacity.unwrap_or(4096).max(1),
+                    config.disable_expire.unwrap_or(false),
+                )),
                 flights: Mutex::new(HashMap::new()),
                 cache_enabled: !config.disable_cache.unwrap_or(false),
-                http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
+                strategy: config.strategy.clone(),
+                timeout: dns_timeout,
+                client_subnet: config.client_subnet.clone(),
+                http: reqwest::Client::builder()
+                    .timeout(
+                        config
+                            .timeout
+                            .as_ref()
+                            .map_or(HTTP_TIMEOUT, |_| dns_timeout),
+                    )
+                    .build()?,
             }),
         })
     }
     pub async fn lookup(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        self.lookup_with(domain, None, false).await
+        self.lookup_with_options(domain, &LookupOptions::default())
+            .await
     }
     pub async fn lookup_with(
         &self,
@@ -164,15 +220,47 @@ impl DnsResolver {
         server_tag: Option<&str>,
         disable_cache: bool,
     ) -> Result<Vec<IpAddr>> {
+        self.lookup_with_options(
+            domain,
+            &LookupOptions {
+                server: server_tag,
+                disable_cache,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn lookup_with_options(
+        &self,
+        domain: &str,
+        options: &LookupOptions<'_>,
+    ) -> Result<Vec<IpAddr>> {
         let name = normalize(domain);
-        let (a, aaaa) = tokio::join!(
-            self.lookup_type(&name, 1, server_tag, disable_cache),
-            self.lookup_type(&name, 28, server_tag, disable_cache)
-        );
+        let strategy = options
+            .strategy
+            .or_else(|| {
+                self.select_rule(&name, 1)
+                    .or_else(|| self.select_rule(&name, 28))
+                    .and_then(|rule| rule.strategy.as_deref())
+            })
+            .or(self.inner.strategy.as_deref());
+        validate_strategy(strategy)?;
+        let query = |qtype| self.lookup_type(&name, qtype, options);
+        let (a, aaaa) = match strategy {
+            Some("ipv4_only") => (query(1).await, Ok(Vec::new())),
+            Some("ipv6_only") => (Ok(Vec::new()), query(28).await),
+            _ => tokio::join!(query(1), query(28)),
+        };
         let mut result = a.unwrap_or_default();
         result.extend(aaaa.unwrap_or_default());
         result.sort();
         result.dedup();
+        match strategy {
+            Some("prefer_ipv4") => result.sort_by_key(|address| !address.is_ipv4()),
+            Some("prefer_ipv6") => result.sort_by_key(IpAddr::is_ipv4),
+            _ => {}
+        }
         if result.is_empty() {
             bail!("DNS returned no addresses for {name}")
         }
@@ -181,26 +269,66 @@ impl DnsResolver {
     pub async fn exchange(&self, request: &[u8]) -> Result<Vec<u8>> {
         let (name, qtype, question_end) = parse_question(request)?;
         let request_id = dns_id(request)?;
-        let key = CacheKey::Wire(canonical_query(request));
-        let value = self
-            .cached(key, || async {
-                let server = self.select_server(&name)?;
-                let response = if server.config.r#type == "local" {
-                    local_response(request, &name, qtype, question_end).await?
-                } else {
-                    server.query(&self.inner.http, request).await?
-                };
-                validate_response(request_id, &response)?;
-                let ttl = if matches!(response[3] & 0x0f, 0 | 3) {
-                    Duration::from_secs(response_ttl(&response).clamp(1, 86400) as u64)
-                } else {
-                    Duration::ZERO
-                };
-                let mut canonical = response;
-                canonical[..2].fill(0);
-                Ok((CacheValue::Wire(canonical), ttl))
-            })
-            .await?;
+        let rule = self.select_rule(&name, qtype);
+        if rule.is_some_and(|rule| rule.action.as_deref() == Some("reject")) {
+            if rule.and_then(|rule| rule.method.as_deref()) == Some("drop") {
+                bail!("DNS query dropped by rule")
+            }
+            return refused_response(request, question_end);
+        }
+        let server_tag = rule
+            .and_then(|rule| rule.server.as_deref())
+            .unwrap_or(&self.inner.final_tag);
+        let server = self
+            .inner
+            .servers
+            .get(server_tag)
+            .cloned()
+            .with_context(|| format!("unknown DNS server: {server_tag}"))?;
+        let client_subnet = rule
+            .and_then(|rule| rule.client_subnet.as_deref())
+            .or(self.inner.client_subnet.as_deref());
+        let wire = if let Some(subnet) = client_subnet {
+            add_client_subnet(request, subnet)?
+        } else {
+            request.to_vec()
+        };
+        let key = CacheKey::Wire {
+            query: canonical_query(&wire),
+            server: server_tag.to_owned(),
+        };
+        let load = || async {
+            let mut response = if server.config.r#type == "local" {
+                local_response(&wire, &name, qtype, question_end).await?
+            } else {
+                tokio::time::timeout(
+                    rule.and_then(|rule| rule.timeout.as_deref())
+                        .map(parse_duration)
+                        .transpose()?
+                        .unwrap_or(self.inner.timeout),
+                    server.query(&self.inner.http, &wire),
+                )
+                .await
+                .context("DNS query timeout")??
+            };
+            validate_response(request_id, &response)?;
+            if let Some(ttl) = rule.and_then(|rule| rule.rewrite_ttl) {
+                rewrite_response_ttls(&mut response, ttl);
+            }
+            let ttl = if matches!(response[3] & 0x0f, 0 | 3) {
+                Duration::from_secs(response_ttl(&response).clamp(1, 86400) as u64)
+            } else {
+                Duration::ZERO
+            };
+            let mut canonical = response;
+            canonical[..2].fill(0);
+            Ok((CacheValue::Wire(canonical), ttl))
+        };
+        let value = if rule.is_some_and(|rule| rule.disable_cache) {
+            load().await?.0
+        } else {
+            self.cached(key, load).await?
+        };
         match value {
             CacheValue::Wire(mut response) => {
                 response[..2].copy_from_slice(&request_id.to_be_bytes());
@@ -209,14 +337,59 @@ impl DnsResolver {
             CacheValue::Addresses(_) => bail!("invalid DNS wire cache entry"),
         }
     }
+
+    pub async fn ech_config(&self, domain: &str) -> Result<Vec<u8>> {
+        let id = rand::random();
+        let query = build_query(id, &normalize(domain), 65)?;
+        let response = self.exchange(&query).await?;
+        parse_https_ech(id, &response)
+    }
+
     async fn lookup_type(
         &self,
         name: &str,
         qtype: u16,
-        server_tag: Option<&str>,
-        disable_cache: bool,
+        options: &LookupOptions<'_>,
     ) -> Result<Vec<IpAddr>> {
-        let key = CacheKey::Lookup(name.to_owned(), qtype);
+        let rule = if options.server.is_none() {
+            self.select_rule(name, qtype)
+        } else {
+            None
+        };
+        if rule.is_some_and(|rule| rule.action.as_deref() == Some("reject")) {
+            bail!("DNS lookup rejected by rule")
+        }
+        let server_tag = options
+            .server
+            .or_else(|| rule.and_then(|rule| rule.server.as_deref()));
+        let client_subnet = options
+            .client_subnet
+            .map(str::to_owned)
+            .or_else(|| {
+                rule.and_then(|rule| rule.client_subnet.as_deref())
+                    .map(str::to_owned)
+            })
+            .or_else(|| self.inner.client_subnet.clone());
+        if let Some(subnet) = &client_subnet {
+            parse_client_subnet(subnet)?;
+        }
+        let query_timeout = options
+            .timeout
+            .or(rule
+                .and_then(|rule| rule.timeout.as_deref())
+                .map(parse_duration)
+                .transpose()?)
+            .unwrap_or(self.inner.timeout);
+        let rewrite_ttl = options
+            .rewrite_ttl
+            .or_else(|| rule.and_then(|rule| rule.rewrite_ttl));
+        let disable_cache = options.disable_cache || rule.is_some_and(|rule| rule.disable_cache);
+        let key = CacheKey::Lookup {
+            name: name.to_owned(),
+            qtype,
+            server: server_tag.map(str::to_owned),
+            client_subnet: client_subnet.clone(),
+        };
         let load = || async {
             let server = match server_tag {
                 Some(tag) => self
@@ -225,7 +398,7 @@ impl DnsResolver {
                     .get(tag)
                     .cloned()
                     .with_context(|| format!("unknown DNS server: {tag}"))?,
-                None => self.select_server(name)?.clone(),
+                None => self.select_server(name, qtype)?.clone(),
             };
             if server.config.r#type == "local" {
                 let values = tokio::net::lookup_host((name, 0))
@@ -233,15 +406,21 @@ impl DnsResolver {
                     .map(|value| value.ip())
                     .filter(|ip| matches!((qtype, ip), (1, IpAddr::V4(_)) | (28, IpAddr::V6(_))))
                     .collect();
-                return Ok((CacheValue::Addresses(values), Duration::from_secs(30)));
+                return Ok((
+                    CacheValue::Addresses(values),
+                    Duration::from_secs(rewrite_ttl.unwrap_or(30).clamp(1, 86400) as u64),
+                ));
             }
             let id = rand::rng().random();
-            let request = build_query(id, name, qtype)?;
-            let response = server.query(&self.inner.http, &request).await?;
+            let request = build_query_with_subnet(id, name, qtype, client_subnet.as_deref())?;
+            let response =
+                tokio::time::timeout(query_timeout, server.query(&self.inner.http, &request))
+                    .await
+                    .context("DNS query timeout")??;
             let (addresses, ttl) = parse_response(id, qtype, &response)?;
             Ok((
                 CacheValue::Addresses(addresses),
-                Duration::from_secs(ttl.clamp(1, 86400) as u64),
+                Duration::from_secs(rewrite_ttl.unwrap_or(ttl).clamp(1, 86400) as u64),
             ))
         };
         let value = if disable_cache {
@@ -304,13 +483,17 @@ impl DnsResolver {
             .remove(&key);
         shared.map_err(anyhow::Error::msg)
     }
-    fn select_server(&self, name: &str) -> Result<&Arc<Upstream>> {
-        let tag = self
-            .inner
+    fn select_rule(&self, name: &str, qtype: u16) -> Option<&DnsRule> {
+        self.inner
             .rules
             .iter()
-            .find(|r| dns_rule_matches(r, name))
-            .and_then(|r| r.server.as_ref())
+            .find(|rule| dns_rule_matches(rule, name, qtype))
+    }
+
+    fn select_server(&self, name: &str, qtype: u16) -> Result<&Arc<Upstream>> {
+        let tag = self
+            .select_rule(name, qtype)
+            .and_then(|rule| rule.server.as_ref())
             .unwrap_or(&self.inner.final_tag);
         self.inner
             .servers
@@ -349,13 +532,14 @@ impl Flight {
 }
 
 impl DnsCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, disable_expire: bool) -> Self {
         Self {
             entries: HashMap::new(),
             expiry: BinaryHeap::new(),
             lru: VecDeque::new(),
             capacity,
             clock: 0,
+            disable_expire,
         }
     }
 
@@ -399,6 +583,9 @@ impl DnsCache {
     }
 
     fn purge_expired(&mut self, now: Instant) {
+        if self.disable_expire {
+            return;
+        }
         while self
             .expiry
             .peek()
@@ -508,7 +695,26 @@ async fn local_response(
 fn normalize(s: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
 }
-fn dns_rule_matches(r: &DnsRule, name: &str) -> bool {
+fn dns_rule_matches(r: &DnsRule, name: &str, qtype: u16) -> bool {
+    if r.r#type == "logical" {
+        let matched = match r.mode.as_deref().unwrap_or("and") {
+            "and" => r
+                .rules
+                .iter()
+                .all(|rule| dns_rule_matches(rule, name, qtype)),
+            "or" => r
+                .rules
+                .iter()
+                .any(|rule| dns_rule_matches(rule, name, qtype)),
+            _ => false,
+        };
+        return if r.invert { !matched } else { matched };
+    }
+    let query_type = r.query_type.is_empty()
+        || r.query_type
+            .iter()
+            .filter_map(|value| parse_query_type(value).ok())
+            .any(|value| value == qtype);
     let exact = r.domain.is_empty() || r.domain.iter().any(|v| normalize(v) == name);
     let suffix = r.domain_suffix.is_empty()
         || r.domain_suffix.iter().any(|v| {
@@ -519,12 +725,111 @@ fn dns_rule_matches(r: &DnsRule, name: &str) -> bool {
         || r.domain_keyword
             .iter()
             .any(|v| name.contains(&v.to_ascii_lowercase()));
-    exact && suffix && keyword
+    let regex = r.domain_regex.is_empty()
+        || r.domain_regex
+            .iter()
+            .filter_map(|value| regex::Regex::new(value).ok())
+            .any(|value| value.is_match(name));
+    let matched = query_type && exact && suffix && keyword && regex;
+    if r.invert { !matched } else { matched }
+}
+
+fn validate_dns_rule(rule: &DnsRule, top_level: bool) -> Result<()> {
+    if rule.r#type == "logical" {
+        if !matches!(rule.mode.as_deref(), Some("and") | Some("or")) {
+            bail!("logical DNS rule requires mode and/or")
+        }
+        if rule.rules.is_empty() {
+            bail!("logical DNS rule requires nested rules")
+        }
+        for nested in &rule.rules {
+            validate_dns_rule(nested, false)?;
+        }
+    } else if !matches!(rule.r#type.as_str(), "" | "default") {
+        bail!("unsupported DNS rule type: {}", rule.r#type)
+    }
+    for value in &rule.domain_regex {
+        regex::Regex::new(value).with_context(|| format!("invalid DNS domain_regex: {value}"))?;
+    }
+    for value in &rule.query_type {
+        parse_query_type(value)?;
+    }
+    if !top_level
+        && rule
+            .action
+            .as_deref()
+            .is_some_and(|action| !action.is_empty())
+    {
+        bail!("nested logical DNS rules cannot contain actions")
+    }
+    if !matches!(
+        rule.action.as_deref(),
+        None | Some("") | Some("route") | Some("reject")
+    ) {
+        bail!(
+            "unsupported DNS rule action: {}",
+            rule.action.as_deref().unwrap()
+        )
+    }
+    if rule.action.as_deref() == Some("reject")
+        && !matches!(
+            rule.method.as_deref(),
+            None | Some("") | Some("default") | Some("drop")
+        )
+    {
+        bail!(
+            "unsupported DNS reject method: {}",
+            rule.method.as_deref().unwrap()
+        )
+    }
+    if let Some(subnet) = &rule.client_subnet {
+        parse_client_subnet(subnet)?;
+    }
+    validate_strategy(rule.strategy.as_deref())
+}
+
+fn parse_query_type(value: &serde_json::Value) -> Result<u16> {
+    if let Some(value) = value.as_u64() {
+        return value
+            .try_into()
+            .context("DNS query_type number exceeds 65535");
+    }
+    let value = value
+        .as_str()
+        .context("DNS query_type must be a number or string")?;
+    if let Ok(value) = value.parse() {
+        return Ok(value);
+    }
+    Ok(match value.to_ascii_uppercase().as_str() {
+        "A" => 1,
+        "NS" => 2,
+        "CNAME" => 5,
+        "SOA" => 6,
+        "PTR" => 12,
+        "MX" => 15,
+        "TXT" => 16,
+        "AAAA" => 28,
+        "SRV" => 33,
+        "OPT" => 41,
+        "SVCB" => 64,
+        "HTTPS" => 65,
+        "CAA" => 257,
+        _ => bail!("unsupported DNS query_type name: {value}"),
+    })
 }
 fn build_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>> {
+    build_query_with_subnet(id, name, qtype, None)
+}
+
+fn build_query_with_subnet(
+    id: u16,
+    name: &str,
+    qtype: u16,
+    client_subnet: Option<&str>,
+) -> Result<Vec<u8>> {
     let mut b = Vec::with_capacity(64);
     b.extend(id.to_be_bytes());
-    b.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    b.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, u8::from(client_subnet.is_some())]);
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 {
             bail!("invalid DNS name")
@@ -535,7 +840,121 @@ fn build_query(id: u16, name: &str, qtype: u16) -> Result<Vec<u8>> {
     b.push(0);
     b.extend(qtype.to_be_bytes());
     b.extend(1u16.to_be_bytes());
+    if let Some(subnet) = client_subnet {
+        append_client_subnet_opt(&mut b, subnet)?;
+    }
     Ok(b)
+}
+
+fn add_client_subnet(request: &[u8], subnet: &str) -> Result<Vec<u8>> {
+    if request.len() < 12 {
+        bail!("invalid DNS query")
+    }
+    if u16::from_be_bytes([request[10], request[11]]) != 0 {
+        bail!("DNS client_subnet cannot be added to a query that already has additional records")
+    }
+    let mut wire = request.to_vec();
+    wire[10..12].copy_from_slice(&1u16.to_be_bytes());
+    append_client_subnet_opt(&mut wire, subnet)?;
+    Ok(wire)
+}
+
+fn append_client_subnet_opt(output: &mut Vec<u8>, subnet: &str) -> Result<()> {
+    let subnet = parse_client_subnet(subnet)?;
+    let (family, prefix, address) = match subnet {
+        IpNet::V4(network) => (
+            1u16,
+            network.prefix_len(),
+            network.network().octets().to_vec(),
+        ),
+        IpNet::V6(network) => (
+            2u16,
+            network.prefix_len(),
+            network.network().octets().to_vec(),
+        ),
+    };
+    let address_length = usize::from(prefix).div_ceil(8);
+    let option_length: u16 = (4 + address_length)
+        .try_into()
+        .context("EDNS client subnet option is too large")?;
+    output.push(0);
+    output.extend(41u16.to_be_bytes());
+    output.extend(1232u16.to_be_bytes());
+    output.extend(0u32.to_be_bytes());
+    output.extend((4u16 + option_length).to_be_bytes());
+    output.extend(8u16.to_be_bytes());
+    output.extend(option_length.to_be_bytes());
+    output.extend(family.to_be_bytes());
+    output.push(prefix);
+    output.push(0);
+    output.extend(&address[..address_length]);
+    Ok(())
+}
+
+fn refused_response(request: &[u8], question_end: usize) -> Result<Vec<u8>> {
+    let mut response = request
+        .get(..question_end)
+        .context("truncated DNS question")?
+        .to_vec();
+    response[2] |= 0x80;
+    response[3] = (response[3] & 0xf0) | 5;
+    response[6..12].fill(0);
+    Ok(response)
+}
+
+fn parse_client_subnet(value: &str) -> Result<IpNet> {
+    value
+        .parse::<IpNet>()
+        .or_else(|_| {
+            value.parse::<IpAddr>().map(|address| match address {
+                IpAddr::V4(address) => IpNet::new(address.into(), 32).expect("valid IPv4 prefix"),
+                IpAddr::V6(address) => IpNet::new(address.into(), 128).expect("valid IPv6 prefix"),
+            })
+        })
+        .with_context(|| format!("invalid DNS client_subnet: {value}"))
+}
+
+fn validate_strategy(strategy: Option<&str>) -> Result<()> {
+    if matches!(
+        strategy,
+        None | Some("")
+            | Some("prefer_ipv4")
+            | Some("prefer_ipv6")
+            | Some("ipv4_only")
+            | Some("ipv6_only")
+    ) {
+        Ok(())
+    } else {
+        bail!("unsupported DNS strategy: {}", strategy.unwrap())
+    }
+}
+
+fn parse_duration(value: &str) -> Result<Duration> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, Duration::from_millis(1))
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, Duration::from_secs(1))
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, Duration::from_secs(60))
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, Duration::from_secs(3600))
+    } else {
+        bail!("invalid DNS duration: {value}")
+    };
+    let count: u32 = number.parse().context("parse DNS duration")?;
+    Ok(multiplier * count)
+}
+
+fn optimistic_enabled(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(enabled) => *enabled,
+        serde_json::Value::Object(options) => options
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        serde_json::Value::Null => false,
+        _ => true,
+    }
 }
 impl Upstream {
     fn new(config: DnsServer, dot_tls: Option<TlsConnector>) -> Result<Self> {
@@ -879,6 +1298,17 @@ fn age_response_ttls(response: &mut [u8], elapsed: u32) {
     }
 }
 
+fn rewrite_response_ttls(response: &mut [u8], replacement: u32) {
+    let Ok(offsets) = ttl_offsets(response) else {
+        return;
+    };
+    for (offset, record_type, _) in offsets {
+        if record_type != 41 {
+            response[offset..offset + 4].copy_from_slice(&replacement.to_be_bytes());
+        }
+    }
+}
+
 fn ttl_offsets(message: &[u8]) -> Result<Vec<(usize, u16, u32)>> {
     if message.len() < 12 {
         bail!("truncated DNS message")
@@ -960,6 +1390,72 @@ fn parse_response(id: u16, qtype: u16, b: &[u8]) -> Result<(Vec<IpAddr>, u32)> {
         p += len
     }
     Ok((out, if ttl == u32::MAX { 30 } else { ttl }))
+}
+
+fn parse_https_ech(id: u16, message: &[u8]) -> Result<Vec<u8>> {
+    if message.len() < 12 || dns_id(message)? != id {
+        bail!("invalid DNS HTTPS response")
+    }
+    let flags = u16::from_be_bytes([message[2], message[3]]);
+    if flags & 0x8000 == 0 || flags & 15 != 0 {
+        bail!("DNS HTTPS error rcode {}", flags & 15)
+    }
+    let questions = u16::from_be_bytes([message[4], message[5]]) as usize;
+    let answers = u16::from_be_bytes([message[6], message[7]]) as usize;
+    let mut position = 12;
+    for _ in 0..questions {
+        skip_name(message, &mut position)?;
+        position = position
+            .checked_add(4)
+            .filter(|value| *value <= message.len())
+            .context("truncated DNS HTTPS question")?;
+    }
+    for _ in 0..answers {
+        skip_name(message, &mut position)?;
+        let header = message
+            .get(position..position + 10)
+            .context("truncated DNS HTTPS answer")?;
+        let record_type = u16::from_be_bytes([header[0], header[1]]);
+        let length = u16::from_be_bytes([header[8], header[9]]) as usize;
+        position += 10;
+        let end = position
+            .checked_add(length)
+            .filter(|value| *value <= message.len())
+            .context("truncated DNS HTTPS record data")?;
+        if record_type != 65 {
+            position = end;
+            continue;
+        }
+        position = position
+            .checked_add(2)
+            .filter(|value| *value <= end)
+            .context("truncated DNS HTTPS priority")?;
+        skip_name(message, &mut position)?;
+        if position > end {
+            bail!("DNS HTTPS target exceeds record")
+        }
+        while position < end {
+            let parameter = message
+                .get(position..position + 4)
+                .context("truncated DNS HTTPS parameter")?;
+            let key = u16::from_be_bytes([parameter[0], parameter[1]]);
+            let value_length = u16::from_be_bytes([parameter[2], parameter[3]]) as usize;
+            position += 4;
+            let value_end = position
+                .checked_add(value_length)
+                .filter(|value| *value <= end)
+                .context("truncated DNS HTTPS parameter value")?;
+            if key == 5 {
+                if value_length == 0 {
+                    bail!("empty ECH config in DNS HTTPS record")
+                }
+                return Ok(message[position..value_end].to_vec());
+            }
+            position = value_end;
+        }
+        position = end;
+    }
+    bail!("no ECH config found in DNS HTTPS records")
 }
 
 #[cfg(feature = "fuzzing")]
@@ -1050,14 +1546,94 @@ mod tests {
         let q = build_query(7, "example.com", 1).unwrap();
         assert_eq!(&q[12..25], b"\x07example\x03com\0");
     }
+
+    #[test]
+    fn query_encodes_edns_client_subnet() {
+        let query = build_query_with_subnet(7, "example.com", 1, Some("192.0.2.129/24")).unwrap();
+        assert_eq!(&query[10..12], &1u16.to_be_bytes());
+        assert!(query.ends_with(&[
+            0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 11, 0, 8, 0, 7, 0, 1, 24, 0, 192, 0, 2,
+        ]));
+    }
+
+    #[test]
+    fn dns_rules_match_query_type_regex_and_invert() {
+        let rule = DnsRule {
+            query_type: vec![serde_json::Value::String("HTTPS".into())],
+            domain_regex: vec![r"^api\d+\.example$".into()],
+            ..Default::default()
+        };
+        assert!(dns_rule_matches(&rule, "api12.example", 65));
+        assert!(!dns_rule_matches(&rule, "api12.example", 1));
+        assert!(!dns_rule_matches(&rule, "www.example", 65));
+        assert!(dns_rule_matches(
+            &DnsRule {
+                invert: true,
+                ..rule
+            },
+            "www.example",
+            65
+        ));
+    }
+
+    #[test]
+    fn refused_response_preserves_question() {
+        let query = build_query(7, "example.com", 1).unwrap();
+        let (_, _, question_end) = parse_question(&query).unwrap();
+        let response = refused_response(&query, question_end).unwrap();
+        assert_eq!(&response[..2], &7u16.to_be_bytes());
+        assert_ne!(response[2] & 0x80, 0);
+        assert_eq!(response[3] & 0x0f, 5);
+        assert_eq!(&response[12..], &query[12..question_end]);
+    }
+
+    #[test]
+    fn lookup_cache_key_separates_server_and_subnet() {
+        let first = CacheKey::Lookup {
+            name: "example.com".into(),
+            qtype: 1,
+            server: Some("a".into()),
+            client_subnet: Some("192.0.2.0/24".into()),
+        };
+        let second = CacheKey::Lookup {
+            name: "example.com".into(),
+            qtype: 1,
+            server: Some("b".into()),
+            client_subnet: Some("192.0.2.0/24".into()),
+        };
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn parses_ech_from_https_record() {
+        let query = build_query(7, "example.com", 65).unwrap();
+        let mut response = query;
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response.extend([0xc0, 0x0c]);
+        response.extend(65u16.to_be_bytes());
+        response.extend(1u16.to_be_bytes());
+        response.extend(60u32.to_be_bytes());
+        let ech = [0, 4, 0xfe, 0x0d, 0, 0];
+        let mut rdata = Vec::new();
+        rdata.extend(1u16.to_be_bytes());
+        rdata.push(0);
+        rdata.extend(5u16.to_be_bytes());
+        rdata.extend((ech.len() as u16).to_be_bytes());
+        rdata.extend(ech);
+        response.extend((rdata.len() as u16).to_be_bytes());
+        response.extend(rdata);
+        assert_eq!(parse_https_ech(7, &response).unwrap(), ech);
+    }
     #[test]
     fn rule_suffix() {
         let r = DnsRule {
             domain_suffix: vec!["example.com".into()],
             ..Default::default()
         };
-        assert!(dns_rule_matches(&r, "www.example.com"));
-        assert!(!dns_rule_matches(&r, "badexample.com"));
+        assert!(dns_rule_matches(&r, "www.example.com", 1));
+        assert!(!dns_rule_matches(&r, "badexample.com", 1));
     }
     #[tokio::test]
     async fn udp_lookup_and_ttl_cache() {

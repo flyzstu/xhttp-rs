@@ -24,6 +24,7 @@ pub struct RouteContext<'a> {
     pub auth_user: Option<&'a str>,
     pub process_name: Option<&'a str>,
     pub process_path: Option<&'a str>,
+    pub package_name: Option<&'a str>,
     pub user: Option<&'a str>,
     pub user_id: Option<u32>,
     pub clash_mode: Option<&'a str>,
@@ -52,7 +53,7 @@ pub struct RouteOptions {
     pub override_address: Option<String>,
     pub override_port: Option<u16>,
     pub network_strategy: Option<String>,
-    pub fallback_delay: Option<u32>,
+    pub fallback_delay: Option<String>,
     pub udp_disable_domain_unmapping: bool,
     pub udp_connect: bool,
     pub udp_timeout: Option<String>,
@@ -87,7 +88,7 @@ impl RouteOptions {
             self.network_strategy = newer.network_strategy.clone();
         }
         if newer.fallback_delay.is_some() {
-            self.fallback_delay = newer.fallback_delay;
+            self.fallback_delay = newer.fallback_delay.clone();
         }
         self.udp_disable_domain_unmapping |= newer.udp_disable_domain_unmapping;
         self.udp_connect |= newer.udp_connect;
@@ -152,6 +153,8 @@ pub enum RuleAction {
         timeout: Option<String>,
         strategy: Option<String>,
         disable_cache: bool,
+        rewrite_ttl: Option<u32>,
+        client_subnet: Option<String>,
     },
 }
 
@@ -159,6 +162,7 @@ pub enum RuleAction {
 pub struct Router {
     rules: Arc<RwLock<Vec<CompiledRule>>>,
     final_outbound: String,
+    default_options: Arc<RwLock<RouteOptions>>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +243,13 @@ impl Router {
         Ok(Self {
             rules: Arc::new(RwLock::new(rules)),
             final_outbound,
+            default_options: Arc::new(RwLock::new(RouteOptions {
+                bind_interface: config.default_interface.clone(),
+                routing_mark: config.default_mark,
+                network_strategy: config.default_network_strategy.clone(),
+                fallback_delay: config.default_fallback_delay.clone(),
+                ..Default::default()
+            })),
         })
     }
 
@@ -274,6 +285,13 @@ impl Router {
         &self.final_outbound
     }
 
+    pub fn default_options(&self) -> RouteOptions {
+        self.default_options
+            .read()
+            .expect("route default options lock poisoned")
+            .clone()
+    }
+
     pub fn replace_from(&self, updated: Self) {
         let rules = updated
             .rules
@@ -281,6 +299,14 @@ impl Router {
             .expect("updated route rule lock poisoned")
             .clone();
         *self.rules.write().expect("route rule lock poisoned") = rules;
+        *self
+            .default_options
+            .write()
+            .expect("route default options lock poisoned") = updated
+            .default_options
+            .read()
+            .expect("updated route default options lock poisoned")
+            .clone();
     }
 }
 
@@ -346,12 +372,18 @@ impl CompiledRule {
                     sniffers: lower(&rule.sniffer),
                     timeout: rule.timeout.clone(),
                 },
-                Some("resolve") => RuleAction::Resolve {
-                    server: rule.server.clone(),
-                    timeout: rule.timeout.clone(),
-                    strategy: rule.strategy.clone(),
-                    disable_cache: rule.disable_cache,
-                },
+                Some("resolve") => {
+                    RuleAction::Resolve {
+                        server: rule.server.clone(),
+                        timeout: rule.timeout.clone(),
+                        strategy: rule.strategy.clone(),
+                        // This resolver never serves optimistic/stale entries, so
+                        // disable_optimistic_cache is inherently satisfied.
+                        disable_cache: rule.disable_cache,
+                        rewrite_ttl: rule.rewrite_ttl,
+                        client_subnet: rule.client_subnet.clone(),
+                    }
+                }
                 Some(value) => bail!("unsupported route action: {value}"),
             }
         } else {
@@ -508,9 +540,9 @@ impl CompiledRule {
                         .iter()
                         .any(|regex| regex.is_match(value))
                 }))
-            && match_field(&self.package_names, c.process_name)
+            && match_field(&self.package_names, c.package_name)
             && (self.package_name_regexes.is_empty()
-                || c.process_name.is_some_and(|value| {
+                || c.package_name.is_some_and(|value| {
                     self.package_name_regexes
                         .iter()
                         .any(|regex| regex.is_match(value))
@@ -773,7 +805,7 @@ fn route_options(rule: &RouteRule) -> Result<RouteOptions> {
         override_address: rule.override_address.clone(),
         override_port: rule.override_port,
         network_strategy: rule.network_strategy.clone(),
-        fallback_delay: rule.fallback_delay,
+        fallback_delay: rule.fallback_delay.clone(),
         udp_disable_domain_unmapping: rule.udp_disable_domain_unmapping,
         udp_connect: rule.udp_connect,
         udp_timeout: rule.udp_timeout.clone(),
@@ -1004,5 +1036,75 @@ mod tests {
             router.route(&context),
             RouteDecision::Outbound("proxy".into())
         );
+    }
+
+    #[test]
+    fn package_rules_do_not_match_process_names() {
+        let config = RouteConfig {
+            rules: vec![RouteRule {
+                package_name: vec!["curl".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            }],
+            final_outbound: Some("direct".into()),
+            ..Default::default()
+        };
+        let router = Router::compile(&config, "direct").unwrap();
+        assert_eq!(
+            router.route(&RouteContext {
+                process_name: Some("curl"),
+                ..Default::default()
+            }),
+            RouteDecision::Outbound("direct".into())
+        );
+        assert_eq!(
+            router.route(&RouteContext {
+                package_name: Some("curl"),
+                ..Default::default()
+            }),
+            RouteDecision::Outbound("proxy".into())
+        );
+    }
+
+    #[test]
+    fn resolve_carries_cache_ttl_and_client_subnet_options() {
+        let config = RouteConfig {
+            rules: vec![RouteRule {
+                action: Some("resolve".into()),
+                rewrite_ttl: Some(60),
+                client_subnet: Some("192.0.2.0/24".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let router = Router::compile(&config, "direct").unwrap();
+        assert!(matches!(
+            router.next_action(&RouteContext::default(), 0),
+            Some((
+                0,
+                RuleAction::Resolve {
+                    rewrite_ttl: Some(60),
+                    client_subnet: Some(subnet),
+                    ..
+                }
+            )) if subnet == "192.0.2.0/24"
+        ));
+    }
+
+    #[test]
+    fn route_defaults_become_direct_dial_options() {
+        let config = RouteConfig {
+            default_interface: Some("eth0".into()),
+            default_mark: Some(123),
+            default_network_strategy: Some("prefer_ipv6".into()),
+            default_fallback_delay: Some("150ms".into()),
+            ..Default::default()
+        };
+        let router = Router::compile(&config, "direct").unwrap();
+        let options = router.default_options();
+        assert_eq!(options.bind_interface.as_deref(), Some("eth0"));
+        assert_eq!(options.routing_mark, Some(123));
+        assert_eq!(options.network_strategy.as_deref(), Some("prefer_ipv6"));
+        assert_eq!(options.fallback_delay.as_deref(), Some("150ms"));
     }
 }

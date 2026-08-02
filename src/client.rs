@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use axum::http::HeaderMap;
 use futures_util::StreamExt;
 use reqwest::{Body, Client as HttpClient, Method};
-use rustls::pki_types::{EchConfigListBytes, pem::PemObject};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_util::io::ReaderStream;
@@ -21,17 +20,16 @@ impl Client {
     pub fn new(mut config: ClientConfig) -> Result<Self> {
         crate::install_crypto_provider();
         config.transport.validate()?;
-        if config.tls.ech_config.is_some() && config.tls.ech_config_path.is_some() {
-            anyhow::bail!("ECH config and config_path are mutually exclusive");
+        let ech_sources = usize::from(config.tls.ech_config.is_some())
+            + usize::from(config.tls.ech_config_path.is_some())
+            + usize::from(config.tls.ech_config_bytes.is_some());
+        if ech_sources > 1 {
+            anyhow::bail!("ECH config, config_path and discovered config are mutually exclusive");
         }
-        if (config.tls.ech_config.is_some() || config.tls.ech_config_path.is_some())
-            && !config.server.starts_with("https://")
-        {
+        if ech_sources != 0 && !config.server.starts_with("https://") {
             anyhow::bail!("ECH requires HTTPS");
         }
-        if (config.tls.ech_config.is_some() || config.tls.ech_config_path.is_some())
-            && config.tls.insecure
-        {
+        if ech_sources != 0 && config.tls.insecure {
             anyhow::bail!("ECH cannot be combined with insecure certificate verification");
         }
         let xmux_config = config.transport.xmux.clone();
@@ -220,19 +218,12 @@ impl Client {
 
 fn build_http_client(config: &ClientConfig) -> Result<HttpClient> {
     let mut b = HttpClient::builder()
-        .danger_accept_invalid_certs(config.tls.insecure)
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(300));
     if config.transport.xmux.h_keep_alive_period > 0 {
         b = b.tcp_keepalive(Duration::from_secs(
             config.transport.xmux.h_keep_alive_period,
         ));
-    }
-    if let Some(path) = &config.tls.ca_certificate {
-        let pem = std::fs::read(path).context("read CA certificate")?;
-        b = b.add_root_certificate(reqwest::Certificate::from_pem(&pem)?)
-    } else if let Some(pem) = &config.tls.ca_pem {
-        b = b.add_root_certificate(reqwest::Certificate::from_pem(pem.as_bytes())?)
     }
     if let Some(address) = config.connect_addr {
         let host = url::Url::parse(&config.server)?
@@ -250,69 +241,63 @@ fn build_http_client(config: &ClientConfig) -> Result<HttpClient> {
         b = b.http2_prior_knowledge()
     }
 
-    let ech_pem = load_ech_pem(&config.tls)?;
-    if let Some(ech_pem) = ech_pem {
-        let ech = parse_ech_config(&ech_pem)?;
-        let mut roots = rustls::RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            roots.add(cert).context("add native root certificate")?;
+    let ca_pem = match (&config.tls.ca_pem, &config.tls.ca_certificate) {
+        (Some(pem), None) => Some(pem.as_bytes().to_vec()),
+        (None, Some(path)) => Some(std::fs::read(path).context("read CA certificate")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("CA PEM and CA certificate path are mutually exclusive")
         }
-        if let Some(path) = &config.tls.ca_certificate {
-            add_ca_pem(
-                &mut roots,
-                &std::fs::read(path).context("read CA certificate")?,
-            )?;
-        } else if let Some(pem) = &config.tls.ca_pem {
-            add_ca_pem(&mut roots, pem.as_bytes())?;
+    };
+    let client_certificate = match (
+        &config.tls.client_certificate,
+        &config.tls.client_certificate_path,
+    ) {
+        (Some(pem), None) => Some(pem.as_bytes().to_vec()),
+        (None, Some(path)) => Some(std::fs::read(path).context("read TLS client certificate")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("client certificate and client_certificate_path are mutually exclusive")
         }
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_ech(rustls::client::EchMode::Enable(ech))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls.alpn_protocols = if config.tls.http3 {
+    };
+    let client_key = match (&config.tls.client_key, &config.tls.client_key_path) {
+        (Some(pem), None) => Some(pem.as_bytes().to_vec()),
+        (None, Some(path)) => Some(std::fs::read(path).context("read TLS client key")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("client key and client_key_path are mutually exclusive")
+        }
+    };
+    let tls = crate::tls::build_client_config(&crate::tls::ClientOptions {
+        insecure: config.tls.insecure,
+        include_native_roots: true,
+        ca_pem,
+        alpn: if config.tls.http3 {
             vec![b"h3".to_vec()]
         } else if config.tls.http2_only {
             vec![b"h2".to_vec()]
         } else {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        };
-        b = b.use_preconfigured_tls(tls);
-    }
+        },
+        ech_config: load_ech_pem(&config.tls)?,
+        certificate_public_key_sha256: crate::tls::decode_public_key_pins(
+            &config.tls.certificate_public_key_sha256,
+        )?,
+        client_certificate,
+        client_key,
+    })?;
+    b = b.use_preconfigured_tls((*tls).clone());
     b.build().context("build XHTTP HTTP client")
 }
 
 fn load_ech_pem(tls: &crate::config::ClientTlsConfig) -> Result<Option<Vec<u8>>> {
-    match (&tls.ech_config, &tls.ech_config_path) {
-        (Some(pem), None) => Ok(Some(pem.as_bytes().to_vec())),
-        (None, Some(path)) => Ok(Some(std::fs::read(path).context("read ECH config")?)),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => anyhow::bail!("ECH config and config_path are mutually exclusive"),
+    match (&tls.ech_config, &tls.ech_config_path, &tls.ech_config_bytes) {
+        (Some(pem), None, None) => Ok(Some(pem.as_bytes().to_vec())),
+        (None, Some(path), None) => Ok(Some(std::fs::read(path).context("read ECH config")?)),
+        (None, None, Some(bytes)) => Ok(Some(bytes.clone())),
+        (None, None, None) => Ok(None),
+        _ => anyhow::bail!("ECH config, config_path and discovered config are mutually exclusive"),
     }
-}
-
-pub(crate) fn parse_ech_config(pem: &[u8]) -> Result<rustls::client::EchConfig> {
-    let pem = normalize_ech_pem(pem);
-    let bytes = EchConfigListBytes::from_pem_slice(&pem).context("parse ECH config PEM")?;
-    rustls::client::EchConfig::new(bytes, rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES)
-        .context("select supported ECH config")
-}
-
-fn normalize_ech_pem(pem: &[u8]) -> Vec<u8> {
-    String::from_utf8_lossy(pem)
-        .replace("BEGIN ECH CONFIGS", "BEGIN ECHCONFIG")
-        .replace("END ECH CONFIGS", "END ECHCONFIG")
-        .into_bytes()
-}
-
-fn add_ca_pem(roots: &mut rustls::RootCertStore, pem: &[u8]) -> Result<()> {
-    let mut reader = std::io::Cursor::new(pem);
-    for cert in rustls_pemfile::certs(&mut reader) {
-        roots.add(cert?).context("add custom CA certificate")?;
-    }
-    Ok(())
 }
 
 async fn copy_response(

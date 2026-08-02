@@ -70,9 +70,15 @@ pub struct DnsConfig {
     pub rules: Vec<DnsRule>,
     #[serde(rename = "final")]
     pub final_server: Option<String>,
+    pub strategy: Option<String>,
     pub independent_cache: Option<bool>,
     pub disable_cache: Option<bool>,
+    pub disable_expire: Option<bool>,
     pub cache_capacity: Option<usize>,
+    pub optimistic: Option<serde_json::Value>,
+    pub timeout: Option<String>,
+    pub reverse_mapping: bool,
+    pub client_subnet: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -86,15 +92,31 @@ pub struct DnsServer {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DnsRule {
+    pub r#type: String,
+    pub mode: Option<String>,
+    pub rules: Vec<DnsRule>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub query_type: Vec<serde_json::Value>,
     #[serde(deserialize_with = "one_or_many")]
     pub domain: Vec<String>,
     #[serde(deserialize_with = "one_or_many")]
     pub domain_suffix: Vec<String>,
     #[serde(deserialize_with = "one_or_many")]
     pub domain_keyword: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub domain_regex: Vec<String>,
     pub server: Option<String>,
     pub action: Option<String>,
     pub outbound: Option<String>,
+    pub invert: bool,
+    pub strategy: Option<String>,
+    pub disable_cache: bool,
+    pub disable_optimistic_cache: bool,
+    pub rewrite_ttl: Option<u32>,
+    pub timeout: Option<String>,
+    pub client_subnet: Option<String>,
+    pub method: Option<String>,
+    pub no_drop: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -104,6 +126,10 @@ pub struct RouteConfig {
     #[serde(rename = "final")]
     pub final_outbound: Option<String>,
     pub auto_detect_interface: Option<bool>,
+    pub default_interface: Option<String>,
+    pub default_mark: Option<u32>,
+    pub default_network_strategy: Option<String>,
+    pub default_fallback_delay: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -196,7 +222,7 @@ pub struct RouteRule {
     pub override_address: Option<String>,
     pub override_port: Option<u16>,
     pub network_strategy: Option<String>,
-    pub fallback_delay: Option<u32>,
+    pub fallback_delay: Option<String>,
     pub udp_disable_domain_unmapping: bool,
     pub udp_connect: bool,
     pub udp_timeout: Option<String>,
@@ -252,6 +278,7 @@ pub struct Inbound {
     pub users: Vec<User>,
     pub transport: Option<XHttpTransport>,
     pub tls: Option<TlsConfig>,
+    pub padding_scheme: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -265,6 +292,11 @@ pub struct Outbound {
     pub packet_encoding: Option<String>,
     pub transport: Option<XHttpTransport>,
     pub tls: Option<TlsConfig>,
+    pub password: Option<String>,
+    pub idle_session_check_interval: Option<String>,
+    pub idle_session_timeout: Option<String>,
+    pub min_idle_session: Option<usize>,
+    pub disable_reuse: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -285,6 +317,17 @@ pub struct TlsConfig {
     pub certificate_path: Option<String>,
     pub key_path: Option<String>,
     #[serde(deserialize_with = "one_or_many")]
+    pub certificate_public_key_sha256: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub client_certificate: Vec<String>,
+    pub client_certificate_path: Option<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub client_key: Vec<String>,
+    pub client_key_path: Option<String>,
+    pub client_authentication: Option<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub client_certificate_public_key_sha256: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
     pub alpn: Vec<String>,
     pub ech: Option<EchConfig>,
 }
@@ -296,6 +339,9 @@ pub struct EchConfig {
     pub config: Vec<String>,
     pub config_path: Option<String>,
     pub query_server_name: Option<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub key: Vec<String>,
+    pub key_path: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -466,10 +512,12 @@ impl SingBoxConfig {
 
     pub fn validate_runtime(&self) -> Result<()> {
         let mut supported = 0usize;
-        let has_proxy_inbound = self
-            .inbounds
-            .iter()
-            .any(|inbound| matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed"));
+        let has_proxy_inbound = self.inbounds.iter().any(|inbound| {
+            matches!(
+                inbound.r#type.as_str(),
+                "socks" | "http" | "mixed" | "anytls"
+            )
+        });
         for inbound in &self.inbounds {
             match inbound.r#type.as_str() {
                 "socks" | "http" | "mixed" => {
@@ -522,6 +570,46 @@ impl SingBoxConfig {
                         bail!("TLS inbound requires certificate/key or certificate_path/key_path")
                     }
                 }
+                "anytls" => {
+                    supported += 1;
+                    inbound
+                        .listen_port
+                        .context("AnyTLS inbound requires listen_port")?;
+                    if inbound.users.is_empty() {
+                        bail!("AnyTLS inbound requires at least one user")
+                    }
+                    for user in &inbound.users {
+                        user.password
+                            .as_deref()
+                            .filter(|password| !password.is_empty())
+                            .context("AnyTLS inbound user requires password")?;
+                    }
+                    if !inbound.padding_scheme.is_empty() {
+                        anytls::PaddingScheme::parse(inbound.padding_scheme.join("\n").as_bytes())
+                            .context("invalid AnyTLS padding_scheme")?;
+                    }
+                    if let Some(tls) = inbound.tls.as_ref().filter(|tls| tls.enabled) {
+                        if tls.certificate.is_empty() && tls.certificate_path.is_none()
+                            || tls.key.is_empty() && tls.key_path.is_none()
+                        {
+                            bail!("AnyTLS TLS inbound requires certificate and key")
+                        }
+                        crate::anytls::validate_server_tls(tls)?;
+                    }
+                    if let Some(ech) = inbound
+                        .tls
+                        .as_ref()
+                        .and_then(|tls| tls.ech.as_ref())
+                        .filter(|ech| ech.enabled)
+                    {
+                        if !ech.key.is_empty() && ech.key_path.is_some() {
+                            bail!("ECH key and key_path are mutually exclusive")
+                        }
+                        if ech.key.is_empty() && ech.key_path.is_none() {
+                            bail!("AnyTLS ECH inbound requires key or key_path")
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -571,12 +659,14 @@ impl SingBoxConfig {
                                 ech.config.join("\n").into_bytes()
                             } else if let Some(path) = &ech.config_path {
                                 std::fs::read(path).context("read ECH config")?
+                            } else if self.dns.is_none() {
+                                bail!("DNS-discovered ECH requires a DNS configuration")
                             } else {
-                                bail!(
-                                    "DNS-discovered ECH is not supported; provide config or config_path"
-                                )
+                                Vec::new()
                             };
-                            crate::client::parse_ech_config(&pem)?;
+                            if !pem.is_empty() {
+                                crate::tls::parse_ech_config(&pem)?;
+                            }
                         }
                         if !matches!(
                             outbound.packet_encoding.as_deref(),
@@ -584,6 +674,40 @@ impl SingBoxConfig {
                         ) {
                             bail!("unsupported VLESS packet_encoding")
                         }
+                    }
+                    "anytls" => {
+                        outbound
+                            .server
+                            .as_ref()
+                            .context("AnyTLS outbound requires server")?;
+                        outbound
+                            .password
+                            .as_deref()
+                            .filter(|password| !password.is_empty())
+                            .context("AnyTLS outbound requires password")?;
+                        if !outbound.tls.as_ref().is_some_and(|tls| tls.enabled) {
+                            bail!("AnyTLS outbound requires TLS")
+                        }
+                        if let Some(ech) = outbound
+                            .tls
+                            .as_ref()
+                            .and_then(|tls| tls.ech.as_ref())
+                            .filter(|ech| ech.enabled)
+                        {
+                            if !ech.config.is_empty() && ech.config_path.is_some() {
+                                bail!("ECH config and config_path are mutually exclusive")
+                            }
+                            if !ech.config.is_empty() {
+                                crate::tls::parse_ech_config(ech.config.join("\n").as_bytes())?;
+                            } else if let Some(path) = &ech.config_path {
+                                crate::tls::parse_ech_config(
+                                    &std::fs::read(path).context("read ECH config")?,
+                                )?;
+                            } else if self.dns.is_none() {
+                                bail!("DNS-discovered ECH requires a DNS configuration")
+                            }
+                        }
+                        crate::anytls::validate_outbound(outbound)?;
                     }
                     value => bail!("unsupported outbound type for proxy inbound: {value}"),
                 }
@@ -671,5 +795,111 @@ mod tests {
         )
         .unwrap();
         assert!(transport.build().is_err());
+    }
+
+    #[test]
+    fn validates_anytls_client_and_server_configuration() {
+        let config = SingBoxConfig::from_json(
+            r#"{
+                "inbounds":[{
+                    "type":"anytls","listen_port":8443,
+                    "users":[{"name":"user","password":"secret"}],
+                    "padding_scheme":["stop=2","0=30-30","1=100-200"]
+                }],
+                "outbounds":[{
+                    "type":"anytls","tag":"proxy","server":"example.com",
+                    "server_port":443,"password":"secret",
+                    "idle_session_timeout":"45s",
+                    "tls":{"enabled":true,"insecure":true}
+                }]
+            }"#,
+        )
+        .unwrap();
+        config.validate_runtime().unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_anytls_configuration() {
+        let config = SingBoxConfig::from_json(
+            r#"{
+                "inbounds":[{"type":"socks","listen_port":1080}],
+                "outbounds":[{"type":"anytls","server":"example.com","tls":{"enabled":true}}]
+            }"#,
+        )
+        .unwrap();
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_anytls_padding_and_session_durations() {
+        let invalid_padding = SingBoxConfig::from_json(
+            r#"{
+                "inbounds":[{
+                    "type":"anytls","listen_port":8443,
+                    "users":[{"password":"secret"}],
+                    "padding_scheme":["0=30-30"]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            invalid_padding
+                .validate_runtime()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid AnyTLS padding_scheme")
+        );
+
+        let invalid_duration = SingBoxConfig::from_json(
+            r#"{
+                "inbounds":[{"type":"socks","listen_port":1080}],
+                "outbounds":[{
+                    "type":"anytls","server":"example.com","password":"secret",
+                    "idle_session_timeout":"forever",
+                    "tls":{"enabled":true,"insecure":true}
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(
+            invalid_duration
+                .validate_runtime()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid AnyTLS duration")
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_conflicting_anytls_ech() {
+        for (ech, expected) in [
+            (
+                r#"{"enabled":true}"#,
+                "DNS-discovered ECH requires a DNS configuration",
+            ),
+            (
+                r#"{"enabled":true,"config":["dummy"],"config_path":"ech.pem"}"#,
+                "ECH config and config_path are mutually exclusive",
+            ),
+        ] {
+            let config = SingBoxConfig::from_json(&format!(
+                r#"{{
+                    "inbounds":[{{"type":"socks","listen_port":1080}}],
+                    "outbounds":[{{
+                        "type":"anytls","server":"example.com","password":"secret",
+                        "tls":{{"enabled":true,"insecure":true,"ech":{ech}}}
+                    }}]
+                }}"#
+            ))
+            .unwrap();
+            assert!(
+                config
+                    .validate_runtime()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "{expected}"
+            );
+        }
     }
 }

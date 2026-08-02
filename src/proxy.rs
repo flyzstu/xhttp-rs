@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
@@ -27,21 +28,32 @@ type BoxIo = Box<dyn Io>;
 enum Dialer {
     Direct,
     Block,
+    AnyTls {
+        client: anytls::Client,
+    },
     Vless {
         client: Box<Client>,
         user: String,
         xudp: bool,
     },
 }
-pub async fn run_socks(
-    inbound: Inbound,
+
+pub(crate) struct ProxyRuntime {
+    dialers: Arc<HashMap<String, Dialer>>,
+    router: Arc<Router>,
+    resolver: Option<Arc<DnsResolver>>,
+}
+
+pub(crate) async fn build_runtime(
     outbounds: Vec<Outbound>,
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
-) -> Result<()> {
-    if !matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
-        bail!("unsupported proxy inbound: {}", inbound.r#type)
-    }
+) -> Result<ProxyRuntime> {
+    let resolver = dns
+        .as_ref()
+        .map(DnsResolver::new)
+        .transpose()?
+        .map(Arc::new);
     let mut dialers = HashMap::new();
     let mut first_tag = None;
     for outbound in outbounds {
@@ -56,16 +68,19 @@ pub async fn run_socks(
                     .transport
                     .context("VLESS outbound requires transport")?
                     .build()?;
-                let tls = outbound.tls.unwrap_or_default();
+                let tls = outbound.tls.clone().unwrap_or_default();
                 let scheme = if tls.enabled { "https" } else { "http" };
-                let server = outbound.server.context("VLESS outbound requires server")?;
+                let server = outbound
+                    .server
+                    .as_ref()
+                    .context("VLESS outbound requires server")?;
                 let port = outbound
                     .server_port
                     .unwrap_or(if tls.enabled { 443 } else { 80 });
                 let url_name = if tls.enabled {
-                    tls.server_name.as_deref().unwrap_or(&server)
+                    tls.server_name.as_deref().unwrap_or(server)
                 } else {
-                    &server
+                    server
                 };
                 let url = format!(
                     "{scheme}://{}:{}{}",
@@ -73,6 +88,25 @@ pub async fn run_socks(
                     port,
                     transport.path
                 );
+                let ech_config_bytes =
+                    if let Some(ech) = tls.ech.as_ref().filter(|ech| {
+                        ech.enabled && ech.config.is_empty() && ech.config_path.is_none()
+                    }) {
+                        let query_name = ech
+                            .query_server_name
+                            .as_deref()
+                            .or(tls.server_name.as_deref())
+                            .unwrap_or(server);
+                        Some(
+                            resolver
+                                .as_deref()
+                                .context("DNS-discovered ECH requires a DNS configuration")?
+                                .ech_config(query_name)
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
                 let client = Client::new(ClientConfig {
                     listen: String::new(),
                     server: url,
@@ -90,6 +124,19 @@ pub async fn run_socks(
                         } else {
                             Some(tls.certificate.join("\n"))
                         },
+                        certificate_public_key_sha256: tls.certificate_public_key_sha256.clone(),
+                        client_certificate: if tls.client_certificate.is_empty() {
+                            None
+                        } else {
+                            Some(tls.client_certificate.join("\n"))
+                        },
+                        client_certificate_path: tls.client_certificate_path.clone(),
+                        client_key: if tls.client_key.is_empty() {
+                            None
+                        } else {
+                            Some(tls.client_key.join("\n"))
+                        },
+                        client_key_path: tls.client_key_path.clone(),
                         http2_only: false,
                         http3: tls.alpn.iter().any(|value| value == "h3"),
                         ech_config: tls.ech.as_ref().and_then(|ech| {
@@ -100,11 +147,15 @@ pub async fn run_socks(
                             .as_ref()
                             .filter(|ech| ech.enabled)
                             .and_then(|ech| ech.config_path.clone()),
+                        ech_config_bytes,
                     },
                 })?;
                 Dialer::Vless {
                     client: Box::new(client),
-                    user: outbound.uuid.context("VLESS outbound requires uuid")?,
+                    user: outbound
+                        .uuid
+                        .clone()
+                        .context("VLESS outbound requires uuid")?,
                     xudp: match outbound.packet_encoding.as_deref() {
                         None | Some("xudp") => true,
                         Some("") => false,
@@ -112,6 +163,9 @@ pub async fn run_socks(
                     },
                 }
             }
+            "anytls" => Dialer::AnyTls {
+                client: crate::anytls::build_client(&outbound, resolver.clone())?,
+            },
             "block" => Dialer::Block,
             other => bail!("unsupported outbound type: {other}"),
         };
@@ -122,7 +176,10 @@ pub async fn run_socks(
     }
     dialers.entry("direct".into()).or_insert(Dialer::Direct);
     let default = first_tag.unwrap_or_else(|| "direct".into());
-    let route_config = route.unwrap_or_default();
+    let mut route_config = route.unwrap_or_default();
+    if route_config.auto_detect_interface == Some(true) {
+        route_config.default_interface = crate::linux_route::default_interface();
+    }
     let compile_config = route_config.clone();
     let compile_default = default.clone();
     let router = Arc::new(
@@ -133,11 +190,312 @@ pub async fn run_socks(
         .context("route compiler task failed")??,
     );
     start_rule_set_updater(router.clone(), route_config, default);
-    let resolver = dns
-        .as_ref()
-        .map(DnsResolver::new)
-        .transpose()?
-        .map(Arc::new);
+    Ok(ProxyRuntime {
+        dialers: Arc::new(dialers),
+        router,
+        resolver,
+    })
+}
+
+pub(crate) async fn relay_anytls_tcp(
+    mut stream: anytls::AnyTlsStream,
+    destination: anytls::Address,
+    source: SocketAddr,
+    inbound: &str,
+    user: Option<&str>,
+    runtime: &ProxyRuntime,
+) -> Result<()> {
+    let destination = from_anytls_destination(&destination);
+    let (evaluation, initial) = evaluate_anytls_tcp_route(
+        &mut stream,
+        destination,
+        RouteInput {
+            peer: source,
+            inbound,
+            router: &runtime.router,
+            resolver: runtime.resolver.as_deref(),
+            linux: &LinuxRouteMetadata::default(),
+            auth_user: user,
+        },
+    )
+    .await?;
+    let RouteEvaluation {
+        decision,
+        destination,
+        options,
+    } = evaluation;
+    if decision == RouteDecision::HijackDns {
+        let resolver = runtime
+            .resolver
+            .as_deref()
+            .context("DNS hijack requires a DNS configuration")?;
+        stream.handshake_success().await?;
+        return relay_anytls_dns_tcp(&mut stream, initial, resolver).await;
+    }
+    let tag = match decision {
+        RouteDecision::Outbound(tag) => tag,
+        RouteDecision::Reject => {
+            if options.reject_method.as_deref() != Some("drop") {
+                stream
+                    .handshake_failure("connection rejected by route")
+                    .await?;
+            }
+            bail!("AnyTLS inbound connection rejected")
+        }
+        RouteDecision::HijackDns => unreachable!(),
+    };
+    let dialer = runtime
+        .dialers
+        .get(&tag)
+        .with_context(|| format!("unknown outbound: {tag}"))?;
+    match dialer {
+        Dialer::Direct => {
+            let mut target = tokio::time::timeout(
+                options
+                    .connect_timeout
+                    .as_deref()
+                    .map(|value| parse_duration(Some(value)))
+                    .unwrap_or_else(|| std::time::Duration::from_secs(5)),
+                connect_direct(&destination, runtime.resolver.as_deref(), &options),
+            )
+            .await
+            .context("AnyTLS target connect timeout")??;
+            crate::anytls::configure_tcp(&target).context("enable TCP_NODELAY on AnyTLS target")?;
+            stream.handshake_success().await?;
+            if !initial.is_empty() {
+                write_first_packet(&mut target, &initial, &options).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::AnyTls { client } => {
+            let encoded = anytls::encode_address(&to_anytls_destination(&destination))?;
+            let mut target = client.create_stream(&encoded).await?;
+            stream.handshake_success().await?;
+            if !initial.is_empty() {
+                target.write_all(&initial).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::Vless { client, user, .. } => {
+            let mut target = client.connect().await?;
+            vless::write_request(&mut target, user, &destination).await?;
+            stream.handshake_success().await?;
+            vless::read_response(&mut target).await?;
+            if !initial.is_empty() {
+                target.write_all(&initial).await?;
+            }
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::Block => {
+            stream.handshake_failure("connection blocked").await?;
+            bail!("AnyTLS inbound connection blocked")
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn relay_anytls_udp(
+    mut stream: anytls::AnyTlsStream,
+    request: anytls::uot::Request,
+    source: SocketAddr,
+    inbound: &str,
+    user: Option<&str>,
+    runtime: &ProxyRuntime,
+) -> Result<()> {
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        anytls::uot::read_packet(
+            &mut stream,
+            request.is_connect.then_some(&request.destination),
+        ),
+    )
+    .await
+    .context("AnyTLS UoT first packet timeout")??;
+    let first_destination = from_anytls_destination(&first.0);
+    let evaluation = evaluate_udp_route(
+        first_destination,
+        &first.1,
+        RouteInput {
+            peer: source,
+            inbound,
+            router: &runtime.router,
+            resolver: runtime.resolver.as_deref(),
+            linux: &LinuxRouteMetadata::default(),
+            auth_user: user,
+        },
+    )
+    .await?;
+    let RouteEvaluation {
+        decision,
+        destination,
+        options,
+    } = evaluation;
+    let routed_destination = to_anytls_destination(&destination);
+    if decision == RouteDecision::HijackDns {
+        let resolver = runtime
+            .resolver
+            .as_deref()
+            .context("DNS hijack requires a DNS configuration")?;
+        stream.handshake_success().await?;
+        return relay_anytls_dns_udp(
+            &mut stream,
+            &request,
+            (routed_destination, first.1),
+            resolver,
+            &options,
+        )
+        .await;
+    }
+    let tag = match decision {
+        RouteDecision::Outbound(tag) => tag,
+        RouteDecision::Reject => {
+            if options.reject_method.as_deref() != Some("drop") {
+                stream
+                    .handshake_failure("UDP connection rejected by route")
+                    .await?;
+            }
+            bail!("AnyTLS UDP connection rejected")
+        }
+        RouteDecision::HijackDns => unreachable!(),
+    };
+    match runtime
+        .dialers
+        .get(&tag)
+        .with_context(|| format!("unknown outbound: {tag}"))?
+    {
+        Dialer::Direct => {
+            stream.handshake_success().await?;
+            relay_anytls_udp_direct(
+                &mut stream,
+                &request,
+                (routed_destination, first.1),
+                runtime.resolver.as_deref(),
+                &options,
+            )
+            .await?;
+        }
+        Dialer::AnyTls { client } => {
+            let encoded = anytls::encode_address(&anytls::uot::magic_destination())?;
+            let mut target = client.create_stream(&encoded).await?;
+            let target_request = anytls::uot::Request {
+                is_connect: request.is_connect,
+                destination: routed_destination.clone(),
+            };
+            anytls::uot::write_request(&mut target, &target_request).await?;
+            anytls::uot::write_packet(
+                &mut target,
+                &routed_destination,
+                &first.1,
+                request.is_connect,
+            )
+            .await?;
+            stream.handshake_success().await?;
+            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
+        }
+        Dialer::Vless { client, user, xudp } => {
+            if !*xudp && !request.is_connect {
+                stream
+                    .handshake_failure("unconnected UoT requires VLESS XUDP")
+                    .await?;
+                bail!("unconnected UoT requires VLESS XUDP")
+            }
+            let mut target = client.connect().await?;
+            let initial_destination = destination;
+            vless::write_request_with_command(
+                &mut target,
+                user,
+                if *xudp {
+                    vless::Command::Xudp
+                } else {
+                    vless::Command::Udp
+                },
+                &initial_destination,
+            )
+            .await?;
+            vless::read_response(&mut target).await?;
+            if *xudp {
+                vless::write_xudp_packet(&mut target, true, &initial_destination, &first.1).await?;
+            } else {
+                target
+                    .write_u16(first.1.len().try_into().context("UDP packet too large")?)
+                    .await?;
+                target.write_all(&first.1).await?;
+                target.flush().await?;
+            }
+            stream.handshake_success().await?;
+            let (mut inbound_read, mut inbound_write) = tokio::io::split(stream);
+            let (mut target_read, mut target_write) = tokio::io::split(target);
+            let mut first_xudp_packet = false;
+            let mut response = vec![0; u16::MAX as usize];
+            loop {
+                tokio::select! {
+                    packet = anytls::uot::read_packet(
+                        &mut inbound_read,
+                        request.is_connect.then_some(&request.destination),
+                    ) => {
+                        let (destination, payload) = packet?;
+                        if *xudp {
+                            vless::write_xudp_packet(
+                                &mut target_write,
+                                first_xudp_packet,
+                                &from_anytls_destination(&destination),
+                                &payload,
+                            ).await?;
+                            first_xudp_packet = false;
+                        } else {
+                            target_write
+                                .write_u16(payload.len().try_into().context("UDP packet too large")?)
+                                .await?;
+                            target_write.write_all(&payload).await?;
+                            target_write.flush().await?;
+                        }
+                    }
+                    packet = async {
+                        if *xudp {
+                            let (source, payload) = vless::read_xudp_packet(&mut target_read).await?;
+                            Ok::<_, anyhow::Error>((
+                                source.unwrap_or_else(|| initial_destination.clone()),
+                                payload,
+                            ))
+                        } else {
+                            let length = target_read.read_u16().await? as usize;
+                            target_read.read_exact(&mut response[..length]).await?;
+                            Ok((initial_destination.clone(), response[..length].to_vec()))
+                        }
+                    } => {
+                        let (source, payload) = packet?;
+                        anytls::uot::write_packet(
+                            &mut inbound_write,
+                            &to_anytls_destination(&source),
+                            &payload,
+                            request.is_connect,
+                        ).await?;
+                    }
+                }
+            }
+        }
+        Dialer::Block => {
+            stream.handshake_failure("UDP connection blocked").await?;
+            bail!("AnyTLS UDP connection blocked")
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_socks(
+    inbound: Inbound,
+    outbounds: Vec<Outbound>,
+    route: Option<RouteConfig>,
+    dns: Option<DnsConfig>,
+) -> Result<()> {
+    if !matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
+        bail!("unsupported proxy inbound: {}", inbound.r#type)
+    }
+    let ProxyRuntime {
+        dialers,
+        router,
+        resolver,
+    } = build_runtime(outbounds, route, dns).await?;
     let listen = socket(
         inbound.listen.as_deref().unwrap_or("127.0.0.1"),
         inbound
@@ -145,12 +503,12 @@ pub async fn run_socks(
             .context("SOCKS inbound requires listen_port")?,
     );
     let listener = TcpListener::bind(&listen).await?;
-    let dialers = Arc::new(dialers);
     let tag = Arc::new(inbound.tag.unwrap_or_else(|| "socks-in".into()));
     let protocol = Arc::new(inbound.r#type);
     let users = Arc::new(inbound.users);
     loop {
         let (stream, peer) = listener.accept().await?;
+        crate::anytls::configure_tcp(&stream).context("enable TCP_NODELAY on proxy inbound")?;
         let router = router.clone();
         let resolver = resolver.clone();
         let dialers = dialers.clone();
@@ -320,7 +678,18 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
     if matches!(dialer, Dialer::Block) {
         bail!("connection blocked by outbound")
     }
-    if let Dialer::Vless { client, user, .. } = dialer {
+    if let Dialer::AnyTls { client } = dialer {
+        let anytls_destination = to_anytls_destination(&destination);
+        let encoded = anytls::encode_address(&anytls_destination)?;
+        let mut remote = client.create_stream(&encoded).await?;
+        if !initial.is_empty() {
+            remote.write_all(&initial).await?;
+        }
+        if let Some(reply) = &reply {
+            local.write_all(reply).await?;
+        }
+        tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
+    } else if let Dialer::Vless { client, user, .. } = dialer {
         let mut remote = client.connect().await?;
         vless::write_request(&mut remote, user, &destination).await?;
         if !initial.is_empty() {
@@ -403,11 +772,10 @@ fn reset_tcp_on_close(_stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn write_first_packet(
-    remote: &mut BoxIo,
-    packet: &[u8],
-    options: &RouteOptions,
-) -> Result<()> {
+async fn write_first_packet<W>(remote: &mut W, packet: &[u8], options: &RouteOptions) -> Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     let Some(server_name) = tls_server_name(packet) else {
         remote.write_all(packet).await?;
         return Ok(());
@@ -503,7 +871,7 @@ async fn evaluate_tcp_route(
     let mut detected_protocol = None;
     let mut detected_client = None;
     let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
-    let mut options = RouteOptions::default();
+    let mut options = router.default_options();
     let mut cursor = 0;
     let decision = loop {
         let context = RouteContext {
@@ -552,15 +920,24 @@ async fn evaluate_tcp_route(
                 timeout,
                 strategy,
                 disable_cache,
+                rewrite_ttl,
+                client_subnet,
             } => {
                 if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
                     destination_ip = select_address(
                         resolve_for_route(
                             resolver,
                             name,
-                            server.as_deref(),
-                            timeout.as_deref(),
-                            disable_cache,
+                            crate::dns::LookupOptions {
+                                server: server.as_deref(),
+                                disable_cache,
+                                rewrite_ttl,
+                                timeout: timeout
+                                    .as_deref()
+                                    .map(|value| parse_duration(Some(value))),
+                                strategy: strategy.as_deref(),
+                                client_subnet: client_subnet.as_deref(),
+                            },
                         )
                         .await?,
                         strategy.as_deref(),
@@ -590,6 +967,146 @@ async fn evaluate_tcp_route(
         destination: override_destination(destination, &options)?,
         options,
     })
+}
+
+async fn evaluate_anytls_tcp_route(
+    stream: &mut anytls::AnyTlsStream,
+    destination: vless::Destination,
+    input: RouteInput<'_>,
+) -> Result<(RouteEvaluation, Vec<u8>)> {
+    let RouteInput {
+        peer,
+        inbound,
+        router,
+        resolver,
+        linux,
+        auth_user,
+    } = input;
+    let mut domain = match &destination {
+        vless::Destination::Domain(value, _) => Some(value.clone()),
+        vless::Destination::Ip(_, _) => None,
+    };
+    let mut destination_ip = match &destination {
+        vless::Destination::Ip(value, _) => Some(*value),
+        vless::Destination::Domain(_, _) => None,
+    };
+    if destination_ip.is_none()
+        && let (Some(name), Some(resolver)) = (domain.as_deref(), resolver)
+    {
+        destination_ip = resolver
+            .lookup(name)
+            .await
+            .ok()
+            .and_then(|values| values.into_iter().next());
+    }
+    let mut initial = Vec::new();
+    let mut detected_protocol = None;
+    let mut detected_client = None;
+    let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
+    let mut options = router.default_options();
+    let mut cursor = 0;
+    let decision = loop {
+        let context = RouteContext {
+            domain: domain.as_deref(),
+            destination_ip,
+            destination_port: Some(destination.port()),
+            source_ip: Some(peer.ip()),
+            source_port: Some(peer.port()),
+            network: Some("tcp"),
+            protocol: detected_protocol.as_deref(),
+            client: detected_client.as_deref(),
+            inbound: Some(inbound),
+            auth_user,
+            process_name: linux.process_name.as_deref(),
+            process_path: linux.process_path.as_deref(),
+            user: linux.user.as_deref(),
+            user_id: linux.user_id,
+            clash_mode: clash_mode.as_deref(),
+            network_type: linux.network_type.as_deref(),
+            network_is_expensive: linux.network_is_expensive,
+            network_is_constrained: linux.network_is_constrained,
+            wifi_ssid: linux.wifi_ssid.as_deref(),
+            wifi_bssid: linux.wifi_bssid.as_deref(),
+            interface_addresses: Some(&linux.interface_addresses),
+            network_interface_addresses: Some(&linux.network_interface_addresses),
+            source_mac_address: linux.source_mac_address.as_deref(),
+            source_hostname: linux.source_hostname.as_deref(),
+            default_interface_addresses: &linux.default_interface_addresses,
+            ..Default::default()
+        };
+        let Some((index, action)) = router.next_action(&context, cursor) else {
+            break RouteDecision::Outbound(router.final_outbound().to_owned());
+        };
+        cursor = index + 1;
+        match action {
+            RuleAction::Route {
+                decision,
+                options: action_options,
+            } => {
+                options.merge(&action_options);
+                break decision;
+            }
+            RuleAction::RouteOptions(action_options) => options.merge(&action_options),
+            RuleAction::Resolve {
+                server,
+                timeout,
+                strategy,
+                disable_cache,
+                rewrite_ttl,
+                client_subnet,
+            } => {
+                if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
+                    destination_ip = select_address(
+                        resolve_for_route(
+                            resolver,
+                            name,
+                            crate::dns::LookupOptions {
+                                server: server.as_deref(),
+                                disable_cache,
+                                rewrite_ttl,
+                                timeout: timeout
+                                    .as_deref()
+                                    .map(|value| parse_duration(Some(value))),
+                                strategy: strategy.as_deref(),
+                                client_subnet: client_subnet.as_deref(),
+                            },
+                        )
+                        .await?,
+                        strategy.as_deref(),
+                    );
+                }
+            }
+            RuleAction::Sniff { sniffers, timeout } => {
+                if initial.is_empty() {
+                    let mut buffer = vec![0; 8192];
+                    if let Ok(Ok(length)) = tokio::time::timeout(
+                        parse_duration(timeout.as_deref()),
+                        stream.read(&mut buffer),
+                    )
+                    .await
+                    {
+                        buffer.truncate(length);
+                        initial = buffer;
+                    }
+                }
+                if let Some(sniffed) = sniff_payload(&initial, false, &sniffers) {
+                    detected_protocol = Some(sniffed.protocol);
+                    detected_client = sniffed.client;
+                    if sniffed.domain.is_some() {
+                        domain = sniffed.domain;
+                    }
+                }
+            }
+        }
+    };
+    Ok((
+        RouteEvaluation {
+            decision,
+            destination: override_destination(destination, &options)?,
+            options,
+        },
+        initial,
+    ))
 }
 
 async fn evaluate_udp_route(
@@ -625,7 +1142,7 @@ async fn evaluate_udp_route(
     let mut detected_protocol = None;
     let mut detected_client = None;
     let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
-    let mut options = RouteOptions::default();
+    let mut options = router.default_options();
     let mut cursor = 0;
     let decision = loop {
         let context = RouteContext {
@@ -674,15 +1191,24 @@ async fn evaluate_udp_route(
                 timeout,
                 strategy,
                 disable_cache,
+                rewrite_ttl,
+                client_subnet,
             } => {
                 if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
                     destination_ip = select_address(
                         resolve_for_route(
                             resolver,
                             name,
-                            server.as_deref(),
-                            timeout.as_deref(),
-                            disable_cache,
+                            crate::dns::LookupOptions {
+                                server: server.as_deref(),
+                                disable_cache,
+                                rewrite_ttl,
+                                timeout: timeout
+                                    .as_deref()
+                                    .map(|value| parse_duration(Some(value))),
+                                strategy: strategy.as_deref(),
+                                client_subnet: client_subnet.as_deref(),
+                            },
                         )
                         .await?,
                         strategy.as_deref(),
@@ -713,15 +1239,13 @@ async fn evaluate_udp_route(
 async fn resolve_for_route(
     resolver: &DnsResolver,
     name: &str,
-    server: Option<&str>,
-    timeout: Option<&str>,
-    disable_cache: bool,
+    options: crate::dns::LookupOptions<'_>,
 ) -> Result<Vec<IpAddr>> {
     tokio::time::timeout(
-        timeout
-            .map(|value| parse_duration(Some(value)))
+        options
+            .timeout
             .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-        resolver.lookup_with(name, server, disable_cache),
+        resolver.lookup_with_options(name, &options),
     )
     .await
     .context("route DNS resolution timeout")?
@@ -1370,6 +1894,150 @@ async fn relay_dns_tcp(stream: &mut TcpStream, resolver: &DnsResolver) -> Result
     }
 }
 
+async fn relay_anytls_dns_tcp(
+    stream: &mut anytls::AnyTlsStream,
+    initial: Vec<u8>,
+    resolver: &DnsResolver,
+) -> Result<()> {
+    let mut prefix = initial.as_slice();
+    loop {
+        let mut length = [0; 2];
+        match read_prefixed_exact(stream, &mut prefix, &mut length).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let mut request = vec![0; u16::from_be_bytes(length) as usize];
+        read_prefixed_exact(stream, &mut prefix, &mut request).await?;
+        let response = resolver.exchange(&request).await?;
+        stream
+            .write_u16(
+                response
+                    .len()
+                    .try_into()
+                    .context("DNS response too large")?,
+            )
+            .await?;
+        stream.write_all(&response).await?;
+        stream.flush().await?;
+    }
+}
+
+async fn read_prefixed_exact<R>(
+    reader: &mut R,
+    prefix: &mut &[u8],
+    output: &mut [u8],
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
+    let copied = prefix.len().min(output.len());
+    output[..copied].copy_from_slice(&prefix[..copied]);
+    *prefix = &prefix[copied..];
+    reader.read_exact(&mut output[copied..]).await.map(|_| ())
+}
+
+async fn relay_anytls_dns_udp(
+    stream: &mut anytls::AnyTlsStream,
+    request: &anytls::uot::Request,
+    first: (anytls::Address, Vec<u8>),
+    resolver: &DnsResolver,
+    options: &RouteOptions,
+) -> Result<()> {
+    let idle_timeout = options
+        .udp_timeout
+        .as_deref()
+        .map(|value| parse_duration(Some(value)))
+        .unwrap_or_else(|| std::time::Duration::from_secs(120));
+    let mut packet = Some(first);
+    loop {
+        let (destination, payload) = match packet.take() {
+            Some(packet) => packet,
+            None => tokio::time::timeout(
+                idle_timeout,
+                anytls::uot::read_packet(
+                    stream,
+                    request.is_connect.then_some(&request.destination),
+                ),
+            )
+            .await
+            .context("AnyTLS hijacked DNS UDP idle timeout")??,
+        };
+        let response = resolver.exchange(&payload).await?;
+        anytls::uot::write_packet(stream, &destination, &response, request.is_connect).await?;
+    }
+}
+
+async fn relay_anytls_udp_direct(
+    stream: &mut anytls::AnyTlsStream,
+    request: &anytls::uot::Request,
+    first: (anytls::Address, Vec<u8>),
+    resolver: Option<&DnsResolver>,
+    options: &RouteOptions,
+) -> Result<()> {
+    let first_destination = from_anytls_destination(&first.0);
+    let first_target = resolve_udp(&first_destination, resolver).await?;
+    let socket = direct_udp_socket(first_target, options)?;
+    let connected = request.is_connect || options.udp_connect;
+    if connected {
+        socket.connect(first_target).await?;
+    }
+    if connected {
+        socket.send(&first.1).await?;
+    } else {
+        socket.send_to(&first.1, first_target).await?;
+    }
+    let idle_timeout = options
+        .udp_timeout
+        .as_deref()
+        .map(|value| parse_duration(Some(value)))
+        .unwrap_or_else(|| std::time::Duration::from_secs(120));
+    let mut response = vec![0; u16::MAX as usize];
+    loop {
+        let event = tokio::time::timeout(idle_timeout, async {
+            tokio::select! {
+                packet = anytls::uot::read_packet(
+                    stream,
+                    request.is_connect.then_some(&request.destination),
+                ) => Ok::<_, anyhow::Error>((Some(packet?), None)),
+                received = async {
+                    if connected {
+                        socket.recv(&mut response).await.map(|length| (length, first_target))
+                    } else {
+                        socket.recv_from(&mut response).await
+                    }
+                } => Ok((None, Some(received?))),
+            }
+        })
+        .await
+        .context("AnyTLS direct UDP idle timeout")??;
+        match event {
+            (Some((destination, payload)), None) => {
+                if connected {
+                    socket.send(&payload).await?;
+                } else {
+                    let destination =
+                        override_destination(from_anytls_destination(&destination), options)?;
+                    socket
+                        .send_to(&payload, resolve_udp(&destination, resolver).await?)
+                        .await?;
+                }
+            }
+            (None, Some((length, source))) => {
+                let response_source = udp_response_destination(&first_destination, source, options);
+                anytls::uot::write_packet(
+                    stream,
+                    &to_anytls_destination(&response_source),
+                    &response[..length],
+                    request.is_connect,
+                )
+                .await?;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 async fn udp_session(
     relay: Arc<UdpSocket>,
     client: SocketAddr,
@@ -1398,9 +2066,9 @@ async fn udp_session(
                         packet = packets.recv() => Ok::<_, anyhow::Error>((packet, None)),
                         received = async {
                             if options.udp_connect {
-                                socket.recv(&mut response).await
+                                socket.recv(&mut response).await.map(|length| (length, target))
                             } else {
-                                socket.recv_from(&mut response).await.map(|(length, _)| length)
+                                socket.recv_from(&mut response).await
                             }
                         } => Ok((None, Some(received?))),
                     }
@@ -1415,10 +2083,12 @@ async fn udp_session(
                             socket.send_to(&packet, target).await?;
                         }
                     }
-                    (None, Some(length)) => {
+                    (None, Some((length, source))) => {
+                        let response_source =
+                            udp_response_destination(&destination, source, &options);
                         relay
                             .send_to(
-                                &encode_socks_udp(&destination, &response[..length])?,
+                                &encode_socks_udp(&response_source, &response[..length])?,
                                 client,
                             )
                             .await?;
@@ -1491,9 +2161,61 @@ async fn udp_session(
                         }
                     }
                     (None, Some((source, payload))) => {
-                        let source = source.as_ref().unwrap_or(&destination);
+                        let source = source
+                            .as_ref()
+                            .map(|source| {
+                                udp_response_proxy_destination(&destination, source, &options)
+                            })
+                            .unwrap_or_else(|| destination.clone());
                         relay
-                            .send_to(&encode_socks_udp(source, &payload)?, client)
+                            .send_to(&encode_socks_udp(&source, &payload)?, client)
+                            .await?;
+                    }
+                    (None, None) => return Ok(()),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Dialer::AnyTls { client: anytls } => {
+            let destination = to_anytls_destination(&destination);
+            let initial = anytls::encode_address(&anytls::uot::magic_destination())?;
+            let mut stream = anytls.create_stream(&initial).await?;
+            anytls::uot::write_request(
+                &mut stream,
+                &anytls::uot::Request {
+                    is_connect: true,
+                    destination: destination.clone(),
+                },
+            )
+            .await?;
+            let mut response = vec![0; u16::MAX as usize];
+            loop {
+                let event = tokio::time::timeout(idle_timeout, async {
+                    tokio::select! {
+                        packet = packets.recv() => Ok::<_, anyhow::Error>((packet, None)),
+                        packet = anytls::uot::read_packet(&mut stream, Some(&destination)) => {
+                            let (source, payload) = packet?;
+                            Ok((None, Some((source, payload))))
+                        }
+                    }
+                })
+                .await
+                .context("AnyTLS UDP session idle timeout")??;
+                match event {
+                    (Some(packet), None) => {
+                        anytls::uot::write_packet(&mut stream, &destination, &packet, true).await?;
+                    }
+                    (None, Some((source, payload))) => {
+                        let source = from_anytls_destination(&source);
+                        let source = udp_response_proxy_destination(
+                            &from_anytls_destination(&destination),
+                            &source,
+                            &options,
+                        );
+                        response.clear();
+                        response.extend_from_slice(&payload);
+                        relay
+                            .send_to(&encode_socks_udp(&source, &response)?, client)
                             .await?;
                     }
                     (None, None) => return Ok(()),
@@ -1502,6 +2224,46 @@ async fn udp_session(
             }
         }
         Dialer::Block => Ok(()),
+    }
+}
+
+fn to_anytls_destination(destination: &vless::Destination) -> anytls::Address {
+    match destination {
+        vless::Destination::Ip(ip, port) => anytls::Address::Ip(*ip, *port),
+        vless::Destination::Domain(domain, port) => anytls::Address::Domain(domain.clone(), *port),
+    }
+}
+
+fn from_anytls_destination(destination: &anytls::Address) -> vless::Destination {
+    match destination {
+        anytls::Address::Ip(ip, port) => vless::Destination::Ip(*ip, *port),
+        anytls::Address::Domain(domain, port) => vless::Destination::Domain(domain.clone(), *port),
+    }
+}
+
+fn udp_response_destination(
+    requested: &vless::Destination,
+    source: SocketAddr,
+    options: &RouteOptions,
+) -> vless::Destination {
+    udp_response_proxy_destination(
+        requested,
+        &vless::Destination::Ip(source.ip(), source.port()),
+        options,
+    )
+}
+
+fn udp_response_proxy_destination(
+    requested: &vless::Destination,
+    source: &vless::Destination,
+    options: &RouteOptions,
+) -> vless::Destination {
+    if !options.udp_disable_domain_unmapping
+        && matches!(requested, vless::Destination::Domain(_, _))
+    {
+        requested.clone()
+    } else {
+        source.clone()
     }
 }
 
@@ -1663,28 +2425,82 @@ async fn connect_direct(
             .as_deref()
             .or(options.network_strategy.as_deref()),
     );
-    for address in addresses {
-        let socket = if address.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        socket.set_reuseaddr(options.reuse_addr)?;
-        if let Some(bind) = if address.is_ipv4() {
-            options.inet4_bind_address.as_deref()
-        } else {
-            options.inet6_bind_address.as_deref()
-        } {
-            socket.bind(SocketAddr::new(bind.parse()?, 0))?;
+    if addresses.is_empty() {
+        bail!("direct connection strategy selected no addresses")
+    }
+    let fallback_delay = options
+        .fallback_delay
+        .as_deref()
+        .map(|value| parse_duration(Some(value)))
+        .unwrap_or_else(|| std::time::Duration::from_millis(300));
+    let mut pending = FuturesUnordered::new();
+    let mut addresses = addresses.into_iter();
+    if let Some(address) = addresses.next() {
+        pending.push(connect_direct_address(address, timeout_duration, options));
+    }
+    let mut next_address = addresses.next();
+    let mut last_error = None;
+    loop {
+        if next_address.is_none() {
+            match pending.next().await {
+                Some(Ok(stream)) => return Ok(stream),
+                Some(Err(error)) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                None => break,
+            }
         }
-        set_linux_socket_options(&socket, options)?;
-        if let Ok(Ok(stream)) =
-            tokio::time::timeout(timeout_duration, socket.connect(address)).await
-        {
-            return Ok(stream);
+        tokio::select! {
+            result = pending.next() => match result {
+                Some(Ok(stream)) => return Ok(stream),
+                Some(Err(error)) => {
+                    last_error = Some(error);
+                    if pending.is_empty()
+                        && let Some(address) = next_address.take()
+                    {
+                        pending.push(connect_direct_address(address, timeout_duration, options));
+                        next_address = addresses.next();
+                    }
+                }
+                None => unreachable!("at least one direct connection attempt is pending"),
+            },
+            () = tokio::time::sleep(fallback_delay) => {
+                if let Some(address) = next_address.take() {
+                    pending.push(connect_direct_address(address, timeout_duration, options));
+                    next_address = addresses.next();
+                }
+            }
         }
     }
-    bail!("all direct connection attempts failed")
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("all direct connection attempts failed"))
+        .context("all direct connection attempts failed"))
+}
+
+async fn connect_direct_address(
+    address: SocketAddr,
+    timeout_duration: std::time::Duration,
+    options: &RouteOptions,
+) -> Result<TcpStream> {
+    let socket = if address.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(options.reuse_addr)?;
+    if let Some(bind) = if address.is_ipv4() {
+        options.inet4_bind_address.as_deref()
+    } else {
+        options.inet6_bind_address.as_deref()
+    } {
+        socket.bind(SocketAddr::new(bind.parse()?, 0))?;
+    }
+    set_linux_socket_options(&socket, options)?;
+    tokio::time::timeout(timeout_duration, socket.connect(address))
+        .await
+        .with_context(|| format!("connect to {address} timed out"))?
+        .with_context(|| format!("connect to {address}"))
 }
 
 fn order_addresses(addresses: &mut Vec<SocketAddr>, strategy: Option<&str>) {
@@ -1884,6 +2700,27 @@ mod tests {
     use crate::Server;
     use crate::config::{Mode, ServerConfig, TransportConfig};
     use crate::singbox::XHttpTransport;
+
+    #[test]
+    fn udp_domain_unmapping_can_be_disabled() {
+        let requested = vless::Destination::Domain("example.com".into(), 53);
+        let source = vless::Destination::Ip("192.0.2.1".parse().unwrap(), 53);
+        assert_eq!(
+            udp_response_proxy_destination(&requested, &source, &RouteOptions::default()),
+            requested
+        );
+        assert_eq!(
+            udp_response_proxy_destination(
+                &requested,
+                &source,
+                &RouteOptions {
+                    udp_disable_domain_unmapping: true,
+                    ..Default::default()
+                }
+            ),
+            source
+        );
+    }
     #[tokio::test]
     async fn socks_routes_to_direct_outbound() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();

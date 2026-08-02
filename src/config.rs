@@ -294,8 +294,15 @@ pub struct ClientTlsConfig {
     pub insecure: bool,
     pub ca_certificate: Option<String>,
     pub ca_pem: Option<String>,
+    pub certificate_public_key_sha256: Vec<String>,
+    pub client_certificate: Option<String>,
+    pub client_certificate_path: Option<String>,
+    pub client_key: Option<String>,
+    pub client_key_path: Option<String>,
     pub http2_only: bool,
     pub http3: bool,
     pub ech_config: Option<String>,
     pub ech_config_path: Option<String>,
+    #[serde(skip)]
+    pub ech_config_bytes: Option<Vec<u8>>,
 }

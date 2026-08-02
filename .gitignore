@@ -3,3 +3,4 @@
 *.log
 *.pid
 .DS_Store
+.aider*

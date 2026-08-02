@@ -18,7 +18,7 @@ trap cleanup EXIT
 
 cd "$project_dir"
 cargo build --quiet
-(cd "$workspace_dir/sing-box" && go build -tags with_quic -o "$tmp_dir/sing-box" ./cmd/sing-box)
+(cd "$workspace_dir/xhttp-box" && go build -tags with_quic -o "$tmp_dir/sing-box" ./cmd/sing-box)
 (cd "$workspace_dir/Xray-core" && go build -o "$tmp_dir/xray" ./main)
 
 python3 -m http.server 19091 --bind 127.0.0.1 >"$tmp_dir/http.log" 2>&1 &
@@ -246,4 +246,26 @@ request 11083
 kill "${pids[-1]}" "${pids[-2]}" 2>/dev/null || true
 unset 'pids[-1]' 'pids[-1]'
 
-echo "sing-box and Xray TCP/UDP interoperability passed in both directions for all XHTTP modes"
+echo "testing sing-box AnyTLS client -> Rust AnyTLS server"
+jq --rawfile cert "$tmp_dir/cert.pem" --rawfile key "$tmp_dir/key.pem" \
+  '.inbounds[0].tls={"enabled":true,"certificate":($cert|split("\n")|map(select(length>0))),"key":($key|split("\n")|map(select(length>0)))}' \
+  tests/interop-rust-anytls-server.json >"$tmp_dir/rust-anytls-server.json"
+./target/debug/xhttp run -c "$tmp_dir/rust-anytls-server.json" >"$tmp_dir/rust-anytls-server.log" 2>&1 & pids+=("$!")
+"$tmp_dir/sing-box" run -c tests/interop-singbox-anytls-client.json >"$tmp_dir/sing-anytls-client.log" 2>&1 & pids+=("$!")
+request 11084
+udp_request 11084
+kill "${pids[-1]}" "${pids[-2]}" 2>/dev/null || true
+unset 'pids[-1]' 'pids[-1]'
+
+echo "testing Rust AnyTLS client -> sing-box AnyTLS server"
+jq --rawfile cert "$tmp_dir/cert.pem" --rawfile key "$tmp_dir/key.pem" \
+  '.inbounds[0].tls={"enabled":true,"certificate":($cert|split("\n")|map(select(length>0))),"key":($key|split("\n")|map(select(length>0)))}' \
+  tests/interop-singbox-anytls-server.json >"$tmp_dir/sing-anytls-server.json"
+"$tmp_dir/sing-box" run -c "$tmp_dir/sing-anytls-server.json" >"$tmp_dir/sing-anytls-server.log" 2>&1 & pids+=("$!")
+./target/debug/xhttp run -c tests/interop-rust-anytls-client.json >"$tmp_dir/rust-anytls-client.log" 2>&1 & pids+=("$!")
+request 11085
+udp_request 11085
+kill "${pids[-1]}" "${pids[-2]}" 2>/dev/null || true
+unset 'pids[-1]' 'pids[-1]'
+
+echo "sing-box, Xray and AnyTLS TCP/UDP interoperability passed in both directions"
