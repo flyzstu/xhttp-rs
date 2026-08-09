@@ -5,6 +5,8 @@ It provides a VLESS/XHTTP server, SOCKS, HTTP, mixed and Linux TUN local proxy
 clients, plus AnyTLS v2 client and server operation, using sing-box style JSON
 configuration.
 
+**Version:** [v0.1.1](https://github.com/flyzstu/xhttp-rs/releases/tag/v0.1.1)
+
 ## Build and run
 
 ```bash
