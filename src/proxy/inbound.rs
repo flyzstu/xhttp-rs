@@ -494,3 +494,120 @@ fn authenticate(users: &[User], name: &str, password: &str) -> Result<()> {
         .then_some(())
         .context("invalid proxy credentials")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn user(name: &str, password: &str) -> User {
+        User {
+            name: Some(name.into()),
+            password: Some(password.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn authenticate_matches_configured_users() {
+        let users = vec![user("alice", "secret"), user("bob", "hunter2")];
+        assert!(authenticate(&users, "alice", "secret").is_ok());
+        assert!(authenticate(&users, "bob", "hunter2").is_ok());
+        assert!(authenticate(&users, "alice", "wrong").is_err());
+        assert!(authenticate(&users, "carol", "secret").is_err());
+        assert!(authenticate(&[], "alice", "secret").is_err());
+    }
+
+    #[tokio::test]
+    async fn socks_handshake_accepts_connect_without_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut stream, &[]).await.unwrap()
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend(443u16.to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let (command, destination, auth_user) = server.await.unwrap();
+        assert_eq!(command, 1);
+        assert_eq!(destination.port(), 443);
+        assert!(auth_user.is_none());
+    }
+
+    #[tokio::test]
+    async fn socks_handshake_accepts_udp_associate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut stream, &[]).await.unwrap()
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        client
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let (command, _, _) = server.await.unwrap();
+        assert_eq!(command, 3);
+    }
+
+    #[tokio::test]
+    async fn socks_handshake_authenticates_and_rejects_bad_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let users = vec![user("alice", "secret")];
+        let users2 = users.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut stream, &users).await
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 2]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 2]);
+        client
+            .write_all(&[1, 5, b'a', b'l', b'i', b'c', b'e', 6, b's', b'e', b'c', b'r', b'e', b't'])
+            .await
+            .unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [1, 0]);
+        client
+            .write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0x01, 0xbb])
+            .await
+            .unwrap();
+        let (command, _, auth_user) = server.await.unwrap().unwrap();
+        assert_eq!(command, 1);
+        assert_eq!(auth_user.as_deref(), Some("alice"));
+
+        // Wrong password is rejected.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            socks_handshake(&mut stream, &users2).await
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 2]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        client
+            .write_all(&[1, 5, b'a', b'l', b'i', b'c', b'e', 5, b'w', b'r', b'o', b'n', b'g'])
+            .await
+            .unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [1, 1]);
+        assert!(server.await.unwrap().is_err());
+    }
+}

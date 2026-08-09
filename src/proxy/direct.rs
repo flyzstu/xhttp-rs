@@ -292,3 +292,56 @@ fn set_linux_socket_options(_socket: &tokio::net::TcpSocket, options: &RouteOpti
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        if ip.contains(':') {
+            format!("[{ip}]:{port}").parse().unwrap()
+        } else {
+            format!("{ip}:{port}").parse().unwrap()
+        }
+    }
+
+    #[test]
+    fn order_addresses_filters_and_sorts_by_strategy() {
+        let v4a = addr("192.0.2.1", 80);
+        let v4b = addr("192.0.2.2", 80);
+        let v6a = addr("2001:db8::1", 80);
+        let v6b = addr("2001:db8::2", 80);
+
+        let mut addresses = vec![v4a, v6a, v4b, v6b];
+        order_addresses(&mut addresses, Some("ipv4_only"));
+        assert_eq!(addresses, vec![v4a, v4b]);
+
+        let mut addresses = vec![v4a, v6a];
+        order_addresses(&mut addresses, Some("ipv6_only"));
+        assert_eq!(addresses, vec![v6a]);
+
+        let mut addresses = vec![v6a, v4a];
+        order_addresses(&mut addresses, Some("prefer_ipv4"));
+        assert_eq!(addresses, vec![v4a, v6a]);
+
+        let mut addresses = vec![v4a, v6a];
+        order_addresses(&mut addresses, Some("prefer_ipv6"));
+        assert_eq!(addresses, vec![v6a, v4a]);
+
+        // Unknown and empty strategies keep the order.
+        let mut addresses = vec![v6a, v4a, v6b];
+        order_addresses(&mut addresses, Some("garbage"));
+        assert_eq!(addresses, vec![v6a, v4a, v6b]);
+        let mut addresses = vec![v6a, v4a];
+        order_addresses(&mut addresses, None);
+        assert_eq!(addresses, vec![v6a, v4a]);
+    }
+
+    #[test]
+    fn order_addresses_empty_input_is_safe() {
+        let mut addresses: Vec<SocketAddr> = Vec::new();
+        order_addresses(&mut addresses, Some("ipv4_only"));
+        order_addresses(&mut addresses, Some("prefer_ipv6"));
+        assert!(addresses.is_empty());
+    }
+}

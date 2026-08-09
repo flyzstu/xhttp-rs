@@ -246,4 +246,53 @@ mod tests {
         assert_eq!(manager.pool_count(), 4);
         drop(leases);
     }
+
+    #[test]
+    fn exhausted_request_budget_retires_pool_and_opens_a_new_one() {
+        let manager = test_manager(XmuxConfig {
+            max_connections: RangeConfig { from: 2, to: 2 },
+            h_max_request_times: RangeConfig { from: 1, to: 1 },
+            ..Default::default()
+        });
+        // acquire_connection consumes one request budget; the lease keeps the pool.
+        let mut lease = manager.acquire_connection().unwrap();
+        let first_pool = lease.request_pool.clone();
+        // The second packet request exceeds the budget and must rotate pools.
+        let _ = lease.http_for_packet().unwrap();
+        {
+            let first = first_pool.lock().unwrap();
+            assert!(first.retired);
+        }
+        assert_ne!(Arc::as_ptr(&first_pool), Arc::as_ptr(&lease.request_pool));
+    }
+
+    #[test]
+    fn active_count_respects_max_connections_when_concurrency_limited() {
+        let manager = test_manager(XmuxConfig {
+            max_concurrency: RangeConfig { from: 2, to: 2 },
+            max_connections: RangeConfig { from: 4, to: 4 },
+            ..Default::default()
+        });
+        // 8 sequential leases: each pair saturates one pool's concurrency,
+        // and the max_connections cap bounds the pool table to 4 pools.
+        for _ in 0..8 {
+            drop(manager.acquire_connection().unwrap());
+        }
+        assert_eq!(manager.pool_count(), 4);
+    }
+
+    #[test]
+    fn retired_pool_with_no_running_leases_is_reclaimed_on_next_creation() {
+        let manager = test_manager(XmuxConfig {
+            max_connections: RangeConfig { from: 1, to: 1 },
+            c_max_reuse_times: RangeConfig { from: 1, to: 1 },
+            ..Default::default()
+        });
+        // The first lease exhausts the reuse budget; dropping it leaves the
+        // pool retired with zero running leases. The next connection must
+        // reclaim it and create a fresh pool.
+        drop(manager.acquire_connection().unwrap());
+        drop(manager.acquire_connection().unwrap());
+        assert_eq!(manager.pool_count(), 1);
+    }
 }

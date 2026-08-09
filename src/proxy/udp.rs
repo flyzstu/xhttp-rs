@@ -569,3 +569,86 @@ fn encode_address(output: &mut Vec<u8>, destination: &vless::Destination) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socks_udp_round_trips_ipv4_and_domain() {
+        let v4 = vless::Destination::Ip("192.0.2.7".parse().unwrap(), 53);
+        let encoded = encode_socks_udp(&v4, b"query").unwrap();
+        assert_eq!(&encoded[..3], &[0, 0, 0]);
+        let (decoded, payload) = parse_socks_udp(&encoded).unwrap();
+        assert_eq!(decoded, v4);
+        assert_eq!(payload, b"query");
+
+        let domain = vless::Destination::Domain("dns.example".into(), 53);
+        let encoded = encode_socks_udp(&domain, b"q").unwrap();
+        assert_eq!(encoded[3], 3);
+        assert_eq!(encoded[4], 11);
+        let (decoded, payload) = parse_socks_udp(&encoded).unwrap();
+        assert_eq!(decoded, domain);
+        assert_eq!(payload, b"q");
+    }
+
+    #[test]
+    fn socks_udp_round_trips_ipv6() {
+        let v6 = vless::Destination::Ip("2001:db8::9".parse().unwrap(), 443);
+        let encoded = encode_socks_udp(&v6, b"data").unwrap();
+        assert_eq!(encoded[3], 4);
+        let (decoded, payload) = parse_socks_udp(&encoded).unwrap();
+        assert_eq!(decoded, v6);
+        assert_eq!(payload, b"data");
+    }
+
+    #[test]
+    fn socks_udp_rejects_malformed_packets() {
+        assert!(parse_socks_udp(&[0, 0]).is_err()); // too short
+        assert!(parse_socks_udp(&[1, 0, 0]).is_err()); // bad reserved field
+        assert!(parse_socks_udp(&[0, 0, 1, 0]).is_err()); // fragmented
+        assert!(parse_socks_udp(&[0, 0, 0, 9, 1, 2, 3]).is_err()); // truncated address
+        assert!(parse_socks_udp(&[0, 0, 0, 9, 3, 20]).is_err()); // bad address type
+    }
+
+    #[test]
+    fn domain_name_too_long_is_rejected() {
+        let domain = "x".repeat(256);
+        let destination = vless::Destination::Domain(domain, 1);
+        assert!(encode_socks_udp(&destination, b"").is_err());
+    }
+
+    #[test]
+    fn udp_response_preserves_domain_unless_disabled() {
+        let requested = vless::Destination::Domain("example.com".into(), 53);
+        let source = vless::Destination::Ip("192.0.2.1".parse().unwrap(), 53);
+        assert_eq!(
+            udp_response_proxy_destination(&requested, &source, &RouteOptions::default()),
+            requested
+        );
+        assert_eq!(
+            udp_response_proxy_destination(
+                &requested,
+                &source,
+                &RouteOptions {
+                    udp_disable_domain_unmapping: true,
+                    ..Default::default()
+                },
+            ),
+            source
+        );
+        let ip_requested = vless::Destination::Ip("192.0.2.9".parse().unwrap(), 53);
+        assert_eq!(
+            udp_response_proxy_destination(&ip_requested, &source, &RouteOptions::default()),
+            source
+        );
+    }
+
+    #[test]
+    fn anytls_destination_conversions_round_trip() {
+        let v4 = vless::Destination::Ip("192.0.2.4".parse().unwrap(), 8443);
+        assert_eq!(from_anytls_destination(&to_anytls_destination(&v4)), v4);
+        let domain = vless::Destination::Domain("svc.example".into(), 443);
+        assert_eq!(from_anytls_destination(&to_anytls_destination(&domain)), domain);
+    }
+}

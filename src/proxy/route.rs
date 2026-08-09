@@ -702,3 +702,156 @@ pub(super) fn tls_server_name(data: &[u8]) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::RouteOptions;
+
+    #[test]
+    fn sniff_detects_tls_with_server_name() {
+        let mut hello = vec![
+            1, 0, 0, 0, // handshake header
+            0x03, 0x03, // version
+        ];
+        hello.extend([0u8; 32]); // random
+        hello.push(0); // session id length
+        hello.extend(0x00u16.to_be_bytes()); // cipher suites length
+        hello.push(0); // compression methods length
+        hello.extend(0x00u16.to_be_bytes()); // extensions length
+        let len = hello.len() as u32;
+        hello[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend((hello.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hello);
+        let sniffed = sniff_payload(&record, false, &[]).unwrap();
+        assert_eq!(sniffed.protocol, "tls");
+    }
+
+    #[test]
+    fn tls_server_name_extracts_sni_extension() {
+        // Minimal TLS ClientHello carrying a server_name (SNI) extension.
+        let mut hello = vec![1, 0, 0, 0, 0x03, 0x03];
+        hello.extend([0u8; 32]);
+        hello.push(0); // session id
+        hello.extend([0, 2, 0x13, 0x01]); // cipher suite TLS_AES_128_GCM_SHA256
+        hello.push(1); // compression methods length
+        hello.push(0);
+
+        // server_name extension: type(2)=0 len(2) payload[list_len(2) name_type(1) name_len(2) name]
+        let name = b"example.com";
+        let payload = [
+            0x00, 0x0d, // server name list length = 13
+            0x00, // name type host_name
+            0x00, 0x0b, // name length
+        ];
+        let mut hello_ext = payload.to_vec();
+        hello_ext.extend_from_slice(name);
+        let mut extensions = Vec::new();
+        extensions.extend(0x0000u16.to_be_bytes()); // extension type server_name
+        extensions.extend((hello_ext.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&hello_ext);
+        hello.extend((extensions.len() as u16).to_be_bytes()); // total extensions length
+        hello.extend_from_slice(&extensions);
+
+        let len = hello.len() as u32;
+        hello[1..4].copy_from_slice(&len.to_be_bytes()[1..]);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend((hello.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hello);
+
+        assert_eq!(tls_server_name(&record).as_deref(), Some("example.com"));
+        assert_eq!(tls_server_name(b"too short"), None);
+    }
+
+    #[test]
+    fn sniff_detects_http_and_extracts_host_and_client() {
+        let data = b"GET /path HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8\r\n\r\n";
+        let sniffed = sniff_payload(data, false, &[]).unwrap();
+        assert_eq!(sniffed.protocol, "http");
+        assert_eq!(sniffed.domain.as_deref(), Some("example.com"));
+        assert_eq!(sniffed.client.as_deref(), Some("curl/8"));
+    }
+
+    #[test]
+    fn sniff_respects_sniffer_filters() {
+        let data = b"SSH-2.0-OpenSSH_9";
+        let sniffed = sniff_payload(data, false, &["ssh".into()]).unwrap();
+        assert_eq!(sniffed.protocol, "ssh");
+        assert!(sniff_payload(data, false, &["http".into()]).is_none());
+    }
+
+    #[test]
+    fn sniff_detects_udp_protocols() {
+        let stun = [0u8, 0, 0, 0, 0x21, 0x12, 0xa4, 0x42];
+        assert_eq!(sniff_payload(&stun, true, &[]).unwrap().protocol, "stun");
+        let quic = [0xc0u8, 0, 0, 0];
+        assert_eq!(sniff_payload(&quic, true, &[]).unwrap().protocol, "quic");
+        assert!(sniff_payload(&[0u8; 8], true, &[]).is_none());
+    }
+
+    #[test]
+    fn dns_detection_and_question_name() {
+        let mut query = vec![0u8; 12];
+        query[2] = 1; // RD flag
+        query[4..6].copy_from_slice(&1u16.to_be_bytes()); // one question
+        query.extend(b"\x07example\x03com\x00");
+        query.extend(1u16.to_be_bytes()); // qtype A
+        query.extend(1u16.to_be_bytes()); // qclass IN
+        assert!(is_dns_message(&query, false));
+        assert_eq!(dns_question_name(&query, false).as_deref(), Some("example.com"));
+
+        let mut tcp = vec![0u8; 0];
+        tcp.extend((query.len() as u16).to_be_bytes());
+        tcp.extend_from_slice(&query);
+        assert!(is_dns_message(&tcp, true));
+        assert_eq!(dns_question_name(&tcp, true).as_deref(), Some("example.com"));
+        assert!(!is_dns_message(&[0u8; 4], false));
+    }
+
+    #[test]
+    fn select_address_applies_strategies() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(select_address(vec![v4, v6], Some("ipv4_only")), Some(v4));
+        assert_eq!(select_address(vec![v4, v6], Some("ipv6_only")), Some(v6));
+        assert_eq!(select_address(vec![v4, v6], Some("prefer_ipv6")), Some(v6));
+        assert_eq!(select_address(vec![v6, v4], Some("prefer_ipv4")), Some(v4));
+        assert_eq!(select_address(vec![v4, v6], None), Some(v4));
+        assert_eq!(select_address(Vec::new(), None), None);
+    }
+
+    #[test]
+    fn override_destination_applies_address_and_port() {
+        let original = vless::Destination::Domain("example.com".into(), 80);
+        let options = RouteOptions {
+            override_address: Some("192.0.2.5".into()),
+            override_port: Some(443),
+            ..Default::default()
+        };
+        assert_eq!(
+            override_destination(original, &options).unwrap(),
+            vless::Destination::Ip("192.0.2.5".parse().unwrap(), 443)
+        );
+        let domain_override = RouteOptions {
+            override_address: Some("other.test".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            override_destination(
+                vless::Destination::Ip("192.0.2.1".parse().unwrap(), 53),
+                &domain_override,
+            )
+            .unwrap(),
+            vless::Destination::Domain("other.test".into(), 53)
+        );
+        assert_eq!(
+            override_destination(
+                vless::Destination::Domain("example.com".into(), 80),
+                &RouteOptions::default(),
+            )
+            .unwrap(),
+            vless::Destination::Domain("example.com".into(), 80)
+        );
+    }
+}

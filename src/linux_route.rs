@@ -323,3 +323,68 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_is_empty_only_when_all_flags_are_clear() {
+        assert!(LinuxMetadataScope::default().is_empty());
+        assert!(!LinuxMetadataScope {
+            process: true,
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!LinuxMetadataScope {
+            hostname: true,
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn scope_union_or_combines_flags() {
+        let process = LinuxMetadataScope {
+            process: true,
+            ..Default::default()
+        };
+        let network = LinuxMetadataScope {
+            network: true,
+            ..Default::default()
+        };
+        let combined = process.union(network);
+        assert!(combined.process);
+        assert!(combined.network);
+        assert!(!combined.user);
+        assert!(!combined.interface);
+        assert!(!combined.mac);
+        assert!(!combined.hostname);
+
+        let mac_hostname = LinuxMetadataScope {
+            mac: true,
+            hostname: true,
+            ..Default::default()
+        };
+        let merged = combined.union(mac_hostname);
+        assert!(merged.process && merged.network && merged.mac && merged.hostname);
+        assert!(!merged.user);
+
+        let empty = LinuxMetadataScope::default();
+        assert_eq!(combined.union(empty), combined);
+        assert_eq!(empty.union(mac_hostname), mac_hostname);
+    }
+
+    #[test]
+    fn scope_union_is_idempotent() {
+        let scope = LinuxMetadataScope {
+            process: true,
+            user: true,
+            interface: true,
+            network: true,
+            mac: true,
+            hostname: true,
+        };
+        assert_eq!(scope.union(scope), scope);
+    }
+}

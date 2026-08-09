@@ -549,3 +549,209 @@ pub(super) fn skip_name(b: &[u8], p: &mut usize) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn question(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = vec![0u8; 12];
+        query[2] = 1;
+        query[4..6].copy_from_slice(&1u16.to_be_bytes());
+        for label in name.split('.') {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend(qtype.to_be_bytes());
+        query.extend(1u16.to_be_bytes());
+        query
+    }
+
+    #[test]
+    fn parse_question_extracts_name_type_and_end() {
+        let query = question("www.example.com", 1);
+        let (name, qtype, end) = parse_question(&query).unwrap();
+        assert_eq!(name, "www.example.com");
+        assert_eq!(qtype, 1);
+        assert_eq!(&query[12..end], &query[12..]);
+        assert!(parse_question(&[0u8; 4]).is_err());
+        assert!(parse_question(&[0u8; 12]).is_err()); // zero questions
+    }
+
+    #[test]
+    fn parse_question_rejects_compression_and_long_labels() {
+        let mut compressed = vec![0u8; 12];
+        compressed[4..6].copy_from_slice(&1u16.to_be_bytes());
+        compressed.push(0xc0);
+        compressed.push(0x0c);
+        assert!(parse_question(&compressed).is_err());
+
+        let mut long = vec![0u8; 12];
+        long[4..6].copy_from_slice(&1u16.to_be_bytes());
+        long.push(64); // label length 64 > 63
+        assert!(parse_question(&long).is_err());
+    }
+
+    #[test]
+    fn build_query_round_trips_through_parse_question() {
+        let query = build_query(7, "example.com", 28).unwrap();
+        assert_eq!(&query[..2], &7u16.to_be_bytes());
+        let (name, qtype, _) = parse_question(&query).unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(qtype, 28);
+    }
+
+    #[test]
+    fn build_query_with_subnet_appends_edns_option() {
+        let query = build_query_with_subnet(1, "example.com", 1, Some("192.0.2.0/24")).unwrap();
+        assert_eq!(&query[10..12], &1u16.to_be_bytes()); // ARCOUNT
+        assert!(query.ends_with(&[
+            0, 0, 41, 4, 208, // EDNS root
+            0, 0, 0, 0, // extended rcode, version, DO, Z
+            0, 11, // option length
+            0, 8, // option code client subnet
+            0, 7, // option data length
+            0, 1, 24, 0, 192, 0, 2,
+        ]));
+        assert!(build_query(1, "bad..name", 1).is_err());
+    }
+
+    #[test]
+    fn add_client_subnet_validates_empty_additional_records() {
+        let query = build_query(1, "example.com", 1).unwrap();
+        let modified = add_client_subnet(&query, "2001:db8::/32").unwrap();
+        assert_eq!(&modified[10..12], &1u16.to_be_bytes());
+        let mut with_additional = query.clone();
+        with_additional[10..12].copy_from_slice(&1u16.to_be_bytes());
+        assert!(add_client_subnet(&with_additional, "192.0.2.0/24").is_err());
+    }
+
+    #[test]
+    fn parse_client_subnet_accepts_network_and_single_address() {
+        assert!(parse_client_subnet("192.0.2.0/24").is_ok());
+        assert!(parse_client_subnet("2001:db8::/32").is_ok());
+        let single = parse_client_subnet("10.0.0.1").unwrap();
+        assert_eq!(single.prefix_len(), 32);
+        assert!(parse_client_subnet("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn refused_response_preserves_question_and_sets_rcode() {
+        let query = question("example.com", 1);
+        let (_, _, question_end) = parse_question(&query).unwrap();
+        let response = refused_response(&query, question_end).unwrap();
+        assert_eq!(&response[..2], &query[..2]);
+        assert_ne!(response[2] & 0x80, 0);
+        assert_eq!(response[3] & 0x0f, 5);
+        assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(&response[12..], &query[12..question_end]);
+    }
+
+    #[test]
+    fn dns_id_and_canonical_query_round_trip() {
+        let query = build_query(42, "example.com", 1).unwrap();
+        assert_eq!(dns_id(&query).unwrap(), 42);
+        let canonical = canonical_query(&query);
+        assert_eq!(&canonical[..2], &[0, 0]);
+        assert_eq!(&canonical[2..], &query[2..]);
+    }
+
+    #[test]
+    fn validate_response_checks_id_and_flags() {
+        let mut response = build_query(7, "example.com", 1).unwrap();
+        response[2] = 0x81; // response flag
+        assert!(validate_response(7, &response).is_ok());
+        assert!(validate_response(8, &response).is_err()); // id mismatch
+        response[2] = 0x01; // not a response
+        assert!(validate_response(7, &response).is_err());
+        assert!(validate_response(7, &[0u8; 4]).is_err()); // truncated
+    }
+
+    #[test]
+    fn ttl_offsets_and_rewrite_visit_only_records() {
+        let mut response = build_query(1, "example.com", 1).unwrap();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        response.extend([0xc0, 0x0c]);
+        response.extend(1u16.to_be_bytes()); // A
+        response.extend(1u16.to_be_bytes()); // class
+        response.extend(300u32.to_be_bytes()); // ttl
+        response.extend(4u16.to_be_bytes()); // rdlength
+        response.extend([1, 2, 3, 4]);
+
+        let offsets = ttl_offsets(&response).unwrap();
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets[0].1, 1); // record type A
+        assert_eq!(offsets[0].2, 300); // ttl
+        assert_eq!(response_ttl(&response), 300);
+
+        rewrite_response_ttls(&mut response, 60);
+        assert_eq!(response_ttl(&response), 60);
+        age_response_ttls(&mut response, 10);
+        assert_eq!(response_ttl(&response), 50);
+    }
+
+    #[test]
+    fn parse_response_extracts_matching_addresses_and_ttl() {
+        let mut response = build_query(1, "example.com", 1).unwrap();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&2u16.to_be_bytes()); // ANCOUNT
+        response.extend([0xc0, 0x0c]);
+        response.extend(1u16.to_be_bytes());
+        response.extend(1u16.to_be_bytes());
+        response.extend(60u32.to_be_bytes());
+        response.extend(4u16.to_be_bytes());
+        response.extend([10, 0, 0, 1]);
+        response.extend([0xc0, 0x0c]);
+        response.extend(28u16.to_be_bytes()); // AAAA, does not match qtype
+        response.extend(1u16.to_be_bytes());
+        response.extend(120u32.to_be_bytes());
+        response.extend(16u16.to_be_bytes());
+        response.extend([0u8; 16]);
+
+        let (addresses, ttl) = parse_response(1, 1, &response).unwrap();
+        assert_eq!(addresses, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ttl, 60);
+    }
+
+    #[test]
+    fn skip_name_handles_labels_pointers_and_errors() {
+        // name occupies bytes 0..13: \x07example \x03com \x00
+        let data = b"\x07example\x03com\x00\xc0\x0c";
+        let mut position = 0;
+        assert!(skip_name(data, &mut position).is_ok());
+        assert_eq!(position, 13);
+        // A compression pointer advances by two bytes.
+        let mut pointer_position = 13;
+        assert!(skip_name(data, &mut pointer_position).is_ok());
+        assert_eq!(pointer_position, 15);
+        assert!(skip_name(&[0u8; 0], &mut 0).is_err()); // empty
+        let mut pos = 0;
+        let long = [0x40u8]; // label length 64 invalid
+        assert!(skip_name(&long, &mut pos).is_err());
+        // A label whose length runs past the buffer is truncated.
+        let mut pos = 0;
+        let truncated = [0x05u8, b'a'];
+        assert!(skip_name(&truncated, &mut pos).is_err());
+    }
+
+    #[test]
+    fn parse_query_type_accepts_numbers_and_names() {
+        assert_eq!(parse_query_type(&serde_json::json!(1)).unwrap(), 1);
+        assert_eq!(parse_query_type(&serde_json::json!("AAAA")).unwrap(), 28);
+        assert_eq!(parse_query_type(&serde_json::json!("HTTPS")).unwrap(), 65);
+        assert!(parse_query_type(&serde_json::json!(70000)).unwrap_err().to_string().contains("65535"));
+        assert!(parse_query_type(&serde_json::json!("BOGUS")).is_err());
+    }
+
+    #[test]
+    fn validate_strategy_accepts_known_and_rejects_unknown() {
+        assert!(validate_strategy(None).is_ok());
+        assert!(validate_strategy(Some("prefer_ipv4")).is_ok());
+        assert!(validate_strategy(Some("ipv6_only")).is_ok());
+        assert!(validate_strategy(Some("random")).is_err());
+    }
+}

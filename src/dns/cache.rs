@@ -173,3 +173,130 @@ impl DnsCache {
         self.lru.make_contiguous().sort_by_key(|entry| entry.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup_key(name: &str) -> CacheKey {
+        CacheKey::Lookup {
+            name: name.into(),
+            qtype: 1,
+            server: Some("test".into()),
+            client_subnet: None,
+        }
+    }
+
+    fn wire_key(query: &[u8]) -> CacheKey {
+        CacheKey::Wire {
+            query: query.into(),
+            server: "test".into(),
+        }
+    }
+
+    #[test]
+    fn insert_and_get_return_the_value() {
+        let mut cache = DnsCache::new(16, false);
+        let key = lookup_key("example.com");
+        cache.insert(key.clone(), CacheValue::Addresses(vec!["1.2.3.4".parse().unwrap()]), Duration::from_secs(60));
+        assert!(matches!(
+            cache.get(&key),
+            Some(CacheValue::Addresses(ref addresses)) if addresses == &vec!["1.2.3.4".parse::<IpAddr>().unwrap()]
+        ));
+        assert!(cache.get(&lookup_key("other.com")).is_none());
+    }
+
+    #[test]
+    fn wire_value_ages_ttls_on_get() {
+        let mut cache = DnsCache::new(16, false);
+        let mut response = vec![0u8; 12];
+        response[6..8].copy_from_slice(&1u16.to_be_bytes()); // one answer
+        response.extend([0xc0, 0x0c]);
+        response.extend(1u16.to_be_bytes());
+        response.extend(1u16.to_be_bytes());
+        response.extend(100u32.to_be_bytes()); // ttl 100
+        response.extend(4u16.to_be_bytes());
+        response.extend([1, 2, 3, 4]);
+        let key = wire_key(&[0u8; 4]);
+        cache.insert(key.clone(), CacheValue::Wire(response.clone()), Duration::from_secs(60));
+        // Immediately after insert the TTL is still ~100.
+        let first = cache.get(&key).unwrap();
+        let CacheValue::Wire(first_bytes) = first else { panic!() };
+        let ttl_offsets = super::super::message::ttl_offsets(&first_bytes).unwrap();
+        assert_eq!(ttl_offsets[0].2, 100);
+        // Force expiry of the entry and confirm it is gone.
+        std::thread::sleep(Duration::from_millis(5));
+        let mut cache = DnsCache::new(16, false);
+        cache.insert(key.clone(), CacheValue::Wire(response), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn expired_entries_are_purged() {
+        let mut cache = DnsCache::new(16, false);
+        let key = lookup_key("short.com");
+        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn disable_expire_keeps_entries_forever() {
+        let mut cache = DnsCache::new(16, true);
+        let key = lookup_key("forever.com");
+        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cache.get(&key).is_some());
+    }
+
+    #[test]
+    fn lru_evicts_the_least_recently_used_entry() {
+        let mut cache = DnsCache::new(2, false);
+        let a = lookup_key("a.com");
+        let b = lookup_key("b.com");
+        let c = lookup_key("c.com");
+        cache.insert(a.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        cache.insert(b.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        // Touching a makes b the least recently used.
+        let _ = cache.get(&a);
+        cache.insert(c.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        assert!(cache.get(&b).is_none());
+        assert!(cache.get(&a).is_some());
+        assert!(cache.get(&c).is_some());
+    }
+
+    #[test]
+    fn stale_lru_entries_do_not_evict_reinserted_keys() {
+        let mut cache = DnsCache::new(1, false);
+        let key = lookup_key("x.com");
+        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        // Same key reinserted gets a new version; the stale LRU entry must not evict it.
+        cache.insert(key.clone(), CacheValue::Addresses(vec!["9.9.9.9".parse().unwrap()]), Duration::from_secs(60));
+        let value = cache.get(&key).unwrap();
+        assert!(matches!(value, CacheValue::Addresses(ref v) if v == &vec!["9.9.9.9".parse::<IpAddr>().unwrap()]));
+    }
+
+    #[test]
+    fn compact_lru_rebuilds_from_current_entries() {
+        let mut cache = DnsCache::new(5, false);
+        for name in ["a.com", "b.com", "c.com", "d.com", "e.com"] {
+            cache.insert(lookup_key(name), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        }
+        // Force a compact by touching entries and growing the LRU queue.
+        let keys: Vec<_> = ["a.com", "b.com", "c.com", "d.com", "e.com"]
+            .map(lookup_key)
+            .into_iter()
+            .collect();
+        for _ in 0..40 {
+            for key in &keys {
+                let _ = cache.get(key);
+            }
+        }
+        cache.compact_lru();
+        // No panic and entries remain retrievable.
+        for key in &keys {
+            assert!(cache.get(key).is_some());
+        }
+    }
+}
