@@ -151,6 +151,10 @@ Rust smoltcp data plane; the native `system` stack is not implemented.
 
 - `direct`
 - `block`
+- `selector` — a group forwarding to one manually selected member outbound,
+  with a `default` member, switchable at runtime by a future Clash API
+- `urltest` — a group that periodically probes each member through its dialer
+  and auto-selects the fastest within `tolerance`
 - `vless` with XHTTP
 - `anytls` with TLS, multiplexed session reuse and UDP-over-TCP v2
 

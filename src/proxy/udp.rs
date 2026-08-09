@@ -16,7 +16,7 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{Dialer, parse_duration};
+use super::{Dialer, Group, parse_duration, resolve_dialer};
 use super::direct::direct_udp_socket;
 use super::route::{RouteEvaluation, RouteInput, evaluate_udp_route};
 
@@ -25,6 +25,7 @@ pub(super) struct UdpAssociateRuntime<'a> {
     pub(super) router: &'a Router,
     pub(super) resolver: Option<&'a DnsResolver>,
     pub(super) dialers: &'a HashMap<String, Dialer>,
+    pub(super) groups: &'a HashMap<String, Arc<Group>>,
     pub(super) linux_metadata: LinuxRouteMetadata,
     pub(super) auth_user: Option<String>,
 }
@@ -38,6 +39,7 @@ pub(super) async fn udp_associate(
         router,
         resolver,
         dialers,
+        groups,
         linux_metadata,
         auth_user,
     } = runtime;
@@ -113,7 +115,7 @@ pub(super) async fn udp_associate(
                         continue;
                     }
                 };
-                let Some(dialer) = dialers.get(&tag).cloned() else {
+                let Some(dialer) = resolve_dialer(dialers, groups, &tag) else {
                     tracing::warn!(outbound = %tag, "UDP route selected an unknown outbound");
                     continue;
                 };
@@ -412,6 +414,7 @@ async fn udp_session(
             }
         }
         Dialer::Block => Ok(()),
+        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
     }
 }
 pub(super) fn to_anytls_destination(destination: &vless::Destination) -> anytls::Address {

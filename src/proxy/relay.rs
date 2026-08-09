@@ -72,10 +72,9 @@ pub(crate) async fn relay_anytls_tcp(
         RouteDecision::HijackDns => unreachable!(),
     };
     let dialer = runtime
-        .dialers
-        .get(&tag)
+        .dialer_for(&tag)
         .with_context(|| format!("unknown outbound: {tag}"))?;
-    match dialer {
+    match &dialer {
         Dialer::Direct => {
             let mut target = tokio::time::timeout(
                 options
@@ -117,6 +116,7 @@ pub(crate) async fn relay_anytls_tcp(
             stream.handshake_failure("connection blocked").await?;
             bail!("AnyTLS inbound connection blocked")
         }
+        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
     }
     Ok(())
 }
@@ -165,9 +165,8 @@ pub(crate) async fn relay_tun_tcp(
         RouteDecision::Reject => bail!("TUN TCP connection rejected by route"),
         RouteDecision::HijackDns => unreachable!(),
     };
-    match runtime
-        .dialers
-        .get(&tag)
+    match &runtime
+        .dialer_for(&tag)
         .with_context(|| format!("unknown outbound: {tag}"))?
     {
         Dialer::Direct => {
@@ -204,6 +203,7 @@ pub(crate) async fn relay_tun_tcp(
             tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
         }
         Dialer::Block => bail!("TUN TCP connection blocked by outbound"),
+        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
     }
     Ok(())
 }
@@ -271,9 +271,8 @@ pub(crate) async fn relay_anytls_udp(
         }
         RouteDecision::HijackDns => unreachable!(),
     };
-    match runtime
-        .dialers
-        .get(&tag)
+    match &runtime
+        .dialer_for(&tag)
         .with_context(|| format!("unknown outbound: {tag}"))?
     {
         Dialer::Direct => {
@@ -391,6 +390,7 @@ pub(crate) async fn relay_anytls_udp(
             stream.handshake_failure("UDP connection blocked").await?;
             bail!("AnyTLS UDP connection blocked")
         }
+        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
     }
     Ok(())
 }
@@ -602,11 +602,9 @@ pub(crate) async fn relay_tun_udp(
         RouteDecision::HijackDns => unreachable!(),
     };
     let dialer = runtime
-        .dialers
-        .get(&tag)
-        .with_context(|| format!("unknown outbound: {tag}"))?
-        .clone();
-    if matches!(dialer, Dialer::Block) {
+        .dialer_for(&tag)
+        .with_context(|| format!("unknown outbound: {tag}"))?;
+    if matches!(&dialer, Dialer::Block) {
         return Ok(());
     }
     let idle_timeout = options
@@ -621,7 +619,7 @@ pub(crate) async fn relay_tun_udp(
     let mut packets = tokio_stream::wrappers::ReceiverStream::new(initial_rx)
         .chain(tokio_stream::wrappers::ReceiverStream::new(packets));
 
-    match dialer {
+    match &dialer {
         Dialer::Direct => {
             let target = resolve_udp(&destination, resolver.as_deref()).await?;
             let socket = direct_udp_socket(target, &options)?;
@@ -672,8 +670,8 @@ pub(crate) async fn relay_tun_udp(
             let mut stream = client.connect().await?;
             vless::write_request_with_command(
                 &mut stream,
-                &user,
-                if xudp {
+                user,
+                if *xudp {
                     vless::Command::Xudp
                 } else {
                     vless::Command::Udp
@@ -694,7 +692,7 @@ pub(crate) async fn relay_tun_udp(
                                 vless::read_response(&mut read).await?;
                                 response_read = true;
                             }
-                            if xudp {
+                            if *xudp {
                                 let (address, payload) = vless::read_xudp_packet(&mut read).await?;
                                 Ok::<_, anyhow::Error>((address, payload))
                             } else {
@@ -709,7 +707,7 @@ pub(crate) async fn relay_tun_udp(
                 .context("TUN VLESS UDP session idle timeout")??;
                 match event {
                     (Some((packet, packet_destination)), None) => {
-                        if xudp {
+                        if *xudp {
                             let packet_destination = vless::Destination::Ip(
                                 packet_destination.ip(),
                                 packet_destination.port(),
@@ -814,5 +812,6 @@ pub(crate) async fn relay_tun_udp(
             }
         }
         Dialer::Block => Ok(()),
+        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
     }
 }

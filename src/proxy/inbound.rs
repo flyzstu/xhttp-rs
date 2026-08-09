@@ -17,7 +17,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use super::{BoxIo, Dialer, ProxyRuntime, build_runtime, parse_duration, socket};
+use super::{BoxIo, Dialer, Group, ProxyRuntime, build_runtime, parse_duration, resolve_dialer, socket};
 use super::direct::connect_direct;
 use super::relay::write_first_packet;
 use super::route::{RouteEvaluation, RouteInput, evaluate_tcp_route};
@@ -35,6 +35,7 @@ pub async fn run_socks(
     }
     let ProxyRuntime {
         dialers,
+        groups,
         router,
         resolver,
         ..
@@ -55,6 +56,7 @@ pub async fn run_socks(
         let router = router.clone();
         let resolver = resolver.clone();
         let dialers = dialers.clone();
+        let groups = groups.clone();
         let tag = tag.clone();
         let protocol = protocol.clone();
         let users = users.clone();
@@ -69,6 +71,7 @@ pub async fn run_socks(
                     router: &router,
                     resolver: resolver.as_deref(),
                     dialers: &dialers,
+                    groups: &groups,
                 },
             )
             .await
@@ -86,6 +89,7 @@ struct HandleRuntime<'a> {
     router: &'a Router,
     resolver: Option<&'a DnsResolver>,
     dialers: &'a HashMap<String, Dialer>,
+    groups: &'a HashMap<String, Arc<Group>>,
 }
 async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'_>) -> Result<()> {
     let HandleRuntime {
@@ -95,6 +99,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         router,
         resolver,
         dialers,
+        groups,
     } = runtime;
     let proxy_address = local.local_addr()?;
     let linux_metadata = {
@@ -129,6 +134,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
                     router,
                     resolver,
                     dialers,
+                    groups,
                     linux_metadata,
                     auth_user,
                 },
@@ -189,13 +195,12 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         }
         RouteDecision::HijackDns => unreachable!(),
     };
-    let dialer = dialers
-        .get(&tag)
+    let dialer = resolve_dialer(dialers, groups, &tag)
         .with_context(|| format!("unknown outbound: {tag}"))?;
-    if matches!(dialer, Dialer::Block) {
+    if matches!(&dialer, Dialer::Block) {
         bail!("connection blocked by outbound")
     }
-    if let Dialer::AnyTls { client } = dialer {
+    if let Dialer::AnyTls { client } = &dialer {
         let anytls_destination = to_anytls_destination(&destination);
         let encoded = anytls::encode_address(&anytls_destination)?;
         let mut remote = client.create_stream(&encoded).await?;
@@ -206,7 +211,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
             local.write_all(reply).await?;
         }
         tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
-    } else if let Dialer::Vless { client, user, .. } = dialer {
+    } else if let Dialer::Vless { client, user, .. } = &dialer {
         let mut remote = client.connect().await?;
         vless::write_request(&mut remote, user, &destination).await?;
         if !initial.is_empty() {

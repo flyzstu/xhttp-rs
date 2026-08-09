@@ -392,6 +392,11 @@ pub struct Outbound {
     pub idle_session_timeout: Option<String>,
     pub min_idle_session: Option<usize>,
     pub disable_reuse: bool,
+    pub outbounds: Vec<String>,
+    pub default: Option<String>,
+    pub url: Option<String>,
+    pub interval: Option<String>,
+    pub tolerance: Option<u16>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -629,6 +634,25 @@ impl SingBoxConfig {
                 self.validate_outbound(outbound)?;
             }
         }
+        for outbound in &self.outbounds {
+            if !matches!(outbound.r#type.as_str(), "selector" | "urltest") {
+                continue;
+            }
+            let tag = outbound.tag.as_deref().unwrap_or(&outbound.r#type);
+            if outbound.outbounds.is_empty() {
+                bail!("{tag} outbound requires at least one member")
+            }
+            if let Some(default) = &outbound.default
+                && !outbound.outbounds.contains(default)
+            {
+                bail!("{tag} outbound default {default} is not a member")
+            }
+            for member in &outbound.outbounds {
+                if !outbound_tags.contains(member) {
+                    bail!("{tag} outbound references unknown outbound: {member}")
+                }
+            }
+        }
         if let Some(route) = &self.route {
             crate::routing::Router::compile(
                 route,
@@ -761,7 +785,7 @@ impl SingBoxConfig {
 
     fn validate_outbound(&self, outbound: &Outbound) -> Result<()> {
         match outbound.r#type.as_str() {
-            "direct" | "block" => {}
+            "direct" | "block" | "selector" | "urltest" => {}
             "vless" => {
                 outbound
                     .server
@@ -1009,5 +1033,34 @@ mod tests {
                 "{expected}"
             );
         }
+    }
+
+    #[test]
+    fn selector_and_urltest_outbounds_validate_members() {
+        let valid = r#"{
+            "inbounds":[{"type":"socks","listen_port":1080}],
+            "outbounds":[
+                {"type":"direct","tag":"direct"},
+                {"type":"selector","tag":"proxy","outbounds":["direct"],"default":"direct"},
+                {"type":"urltest","tag":"auto","outbounds":["direct"],"url":"http://gstatic.com/generate_204"}
+            ]
+        }"#;
+        let config = SingBoxConfig::from_json(valid).unwrap();
+        config.validate_runtime().unwrap();
+
+        // Empty member list is rejected.
+        let empty = valid.replace("\"outbounds\":[\"direct\"]", "\"outbounds\":[]");
+        let config = SingBoxConfig::from_json(&empty).unwrap();
+        assert!(config.validate_runtime().is_err());
+
+        // Unknown member is rejected.
+        let bad = valid.replace("\"outbounds\":[\"direct\"]", "\"outbounds\":[\"ghost\"]");
+        let config = SingBoxConfig::from_json(&bad).unwrap();
+        assert!(config.validate_runtime().is_err());
+
+        // Selector default that is not a member is rejected.
+        let bad_default = valid.replace("\"default\":\"direct\"", "\"default\":\"ghost\"");
+        let config = SingBoxConfig::from_json(&bad_default).unwrap();
+        assert!(config.validate_runtime().is_err());
     }
 }

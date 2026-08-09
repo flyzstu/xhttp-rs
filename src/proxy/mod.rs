@@ -10,14 +10,16 @@ use crate::{
     dns::DnsResolver,
     routing::Router,
     singbox::{DnsConfig, Outbound, RouteConfig},
+    vless,
 };
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
     net::ToSocketAddrs,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use url::Url;
 
 pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_tun_tcp, relay_tun_udp};
 pub use inbound::run_socks;
@@ -30,7 +32,7 @@ trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 type BoxIo = Box<dyn Io>;
 #[derive(Clone)]
-enum Dialer {
+pub(crate) enum Dialer {
     Direct,
     Block,
     AnyTls {
@@ -41,11 +43,154 @@ enum Dialer {
         user: String,
         xudp: bool,
     },
+    Group(Arc<Group>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupKind {
+    Selector,
+    UrlTest,
+}
+
+/// An outbound group: `Selector` forwards to a manually chosen member,
+/// `UrlTest` periodically probes its members and auto-selects the fastest.
+/// The `selected` state is shared so a Clash API can switch nodes at runtime.
+#[derive(Clone)]
+pub(crate) struct Group {
+    kind: GroupKind,
+    members: Vec<String>,
+    selected: Arc<RwLock<String>>,
+    url: Option<String>,
+    interval: std::time::Duration,
+    tolerance: u16,
+}
+
+impl Group {
+    pub(crate) fn new(
+        kind: GroupKind,
+        members: Vec<String>,
+        default: Option<String>,
+        url: Option<String>,
+        interval: Option<String>,
+        tolerance: Option<u16>,
+    ) -> Result<Self> {
+        let selected = default
+            .or_else(|| members.first().cloned())
+            .context("group requires a default member")?;
+        Ok(Self {
+            kind,
+            members,
+            selected: Arc::new(RwLock::new(selected)),
+            url,
+            interval: crate::util::parse_duration_lenient(interval.as_deref())
+                .max(std::time::Duration::from_secs(1)),
+            tolerance: tolerance.unwrap_or(50),
+        })
+    }
+
+    pub(crate) fn kind(&self) -> GroupKind {
+        self.kind
+    }
+
+    pub(crate) fn now(&self) -> String {
+        self.selected
+            .read()
+            .expect("group selection lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn all(&self) -> &[String] {
+        &self.members
+    }
+
+    pub(crate) fn select(&self, tag: &str) -> bool {
+        if !self.members.iter().any(|member| member == tag) {
+            return false;
+        }
+        *self
+            .selected
+            .write()
+            .expect("group selection lock poisoned") = tag.to_owned();
+        true
+    }
+
+    pub(crate) fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub(crate) fn interval(&self) -> std::time::Duration {
+        self.interval
+    }
+
+    pub(crate) fn tolerance(&self) -> u16 {
+        self.tolerance
+    }
+}
+
+impl Dialer {
+    /// Probe latency through this dialer to a URL, returning milliseconds.
+    async fn probe_delay(&self, url: &str) -> Option<u16> {
+        let url = Url::parse(url).ok()?;
+        let host = url.host_str()?.to_owned();
+        let mut stream = self.connect_for_probe(&url, None).await.ok()?;
+        let start = std::time::Instant::now();
+        let request = format!(
+            "HEAD {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            url.path(),
+            host
+        );
+        stream.write_all(request.as_bytes()).await.ok()?;
+        stream.flush().await.ok()?;
+        let mut response = [0u8; 1];
+        stream.read_exact(&mut response).await.ok()?;
+        Some(start.elapsed().as_millis().min(u16::MAX as u128) as u16)
+    }
+
+    /// Establish a TCP stream through this dialer to a probe URL's host and
+    /// port, returning the raw byte stream for a latency check.
+    async fn connect_for_probe(&self, url: &Url, resolver: Option<&DnsResolver>) -> Result<BoxIo> {
+        let host = url.host_str().context("probe URL has no host")?.to_owned();
+        let port = url.port_or_known_default().context("probe URL has no port")?;
+        match self {
+            Self::Direct => {
+                let destination = vless::Destination::Domain(host, port);
+                let stream = crate::proxy::direct::connect_direct(
+                    &destination,
+                    resolver,
+                    &Default::default(),
+                )
+                .await?;
+                Ok(Box::new(stream))
+            }
+            Self::Vless { client, user, .. } => {
+                let mut stream = client.connect().await?;
+                vless::write_request(
+                    &mut stream,
+                    user,
+                    &vless::Destination::Domain(host, port),
+                )
+                .await?;
+                vless::read_response(&mut stream).await?;
+                Ok(Box::new(stream))
+            }
+            Self::AnyTls { client } => {
+                let destination = crate::proxy::udp::to_anytls_destination(
+                    &vless::Destination::Domain(host, port),
+                );
+                let stream = client
+                    .create_stream(&anytls::encode_address(&destination)?)
+                    .await?;
+                Ok(Box::new(stream))
+            }
+            Self::Block | Self::Group(_) => bail!("cannot probe through block/group outbound"),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct ProxyRuntime {
     dialers: Arc<HashMap<String, Dialer>>,
+    groups: Arc<HashMap<String, Arc<Group>>>,
     router: Arc<Router>,
     resolver: Option<Arc<DnsResolver>>,
     tun_output_mark: Option<u32>,
@@ -62,6 +207,7 @@ pub(crate) async fn build_runtime(
         .transpose()?
         .map(Arc::new);
     let mut dialers = HashMap::new();
+    let mut groups = HashMap::new();
     let mut first_tag = None;
     for outbound in outbounds {
         let tag = outbound
@@ -69,6 +215,23 @@ pub(crate) async fn build_runtime(
             .clone()
             .unwrap_or_else(|| outbound.r#type.clone());
         let dialer = match outbound.r#type.as_str() {
+            "selector" | "urltest" => {
+                let kind = if outbound.r#type == "selector" {
+                    GroupKind::Selector
+                } else {
+                    GroupKind::UrlTest
+                };
+                let group = Arc::new(Group::new(
+                    kind,
+                    outbound.outbounds.clone(),
+                    outbound.default.clone(),
+                    outbound.url.clone(),
+                    outbound.interval.clone(),
+                    outbound.tolerance,
+                )?);
+                groups.insert(tag.clone(), group.clone());
+                Dialer::Group(group)
+            }
             "direct" => Dialer::Direct,
             "vless" => {
                 let transport = outbound
@@ -197,12 +360,15 @@ pub(crate) async fn build_runtime(
         .context("route compiler task failed")??,
     );
     start_rule_set_updater(router.clone(), route_config, default);
-    Ok(ProxyRuntime {
+    let runtime = ProxyRuntime {
         dialers: Arc::new(dialers),
+        groups: Arc::new(groups),
         router,
         resolver,
         tun_output_mark: None,
-    })
+    };
+    runtime.start_url_tests();
+    Ok(runtime)
 }
 
 impl ProxyRuntime {
@@ -213,6 +379,102 @@ impl ProxyRuntime {
     pub(crate) fn rule_set_ip_cidrs(&self, tags: &[String]) -> Result<Vec<ipnet::IpNet>> {
         self.router.rule_set_ip_cidrs(tags)
     }
+
+    /// Resolve a dialer by tag, following `selector`/`urltest` groups to their
+    /// currently selected member.
+    pub(crate) fn dialer_for(&self, tag: &str) -> Option<Dialer> {
+        let mut current = tag.to_owned();
+        for _ in 0..8 {
+            if let Dialer::Group(group) = self.dialers.get(&current)? {
+                current = group.now();
+                continue;
+            }
+            return self.dialers.get(&current).cloned();
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn group(&self, tag: &str) -> Option<&Arc<Group>> {
+        self.groups.get(tag)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn groups(&self) -> &HashMap<String, Arc<Group>> {
+        &self.groups
+    }
+
+    /// Spawn a background task for each `urltest` group that periodically
+    /// probes its members and auto-selects the fastest within tolerance.
+    fn start_url_tests(&self) {
+        let runtime = self.clone();
+        for (tag, group) in self.groups.iter() {
+            if group.kind() != GroupKind::UrlTest {
+                continue;
+            }
+            let Some(url) = group.url().map(str::to_owned) else {
+                continue;
+            };
+            let interval = group.interval();
+            let tag = tag.clone();
+            let group = group.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                loop {
+                    run_url_test(&runtime, &tag, &group, &url).await;
+                    tokio::time::sleep(interval).await;
+                }
+            });
+        }
+    }
+}
+
+async fn run_url_test(
+    runtime: &ProxyRuntime,
+    tag: &str,
+    group: &Arc<Group>,
+    url: &str,
+) {
+    let tolerance = group.tolerance();
+    let mut best: Option<(String, u16)> = None;
+    for member in group.all() {
+        let Some(dialer) = runtime.dialer_for(member) else {
+            continue;
+        };
+        let Some(delay) = dialer.probe_delay(url).await else {
+            continue;
+        };
+        match &best {
+            Some((_, best_delay)) if delay + tolerance >= *best_delay => {}
+            _ => best = Some((member.clone(), delay)),
+        }
+    }
+    if let Some((best_tag, _)) = best {
+        let _ = group.select(&best_tag);
+        tracing::debug!(%tag, %best_tag, "urltest group updated");
+    }
+}
+
+/// Resolve a dialer by tag, following `selector`/`urltest` groups to their
+/// currently selected member. Used by paths that hold dialers and groups
+/// separately (SOCKS/HTTP inbound, UDP associate).
+pub(crate) fn resolve_dialer(
+    dialers: &HashMap<String, Dialer>,
+    groups: &HashMap<String, Arc<Group>>,
+    tag: &str,
+) -> Option<Dialer> {
+    let mut current = tag.to_owned();
+    for _ in 0..8 {
+        match dialers.get(&current) {
+            Some(Dialer::Group(group)) => {
+                current = group.now();
+                continue;
+            }
+            Some(dialer) => return Some(dialer.clone()),
+            None => return groups.get(&current).map(|group| Dialer::Group(group.clone())),
+        }
+    }
+    None
 }
 
 fn start_rule_set_updater(router: Arc<Router>, config: RouteConfig, default_outbound: String) {
@@ -263,6 +525,65 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+    #[test]
+    fn selector_group_selects_members_and_defaults_to_first() {
+        let group = Group::new(
+            GroupKind::Selector,
+            vec!["a".into(), "b".into()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(group.kind(), GroupKind::Selector);
+        assert_eq!(group.now(), "a");
+        assert_eq!(group.all(), &["a", "b"]);
+        assert!(group.select("b"));
+        assert_eq!(group.now(), "b");
+        assert!(!group.select("missing"));
+        assert_eq!(group.now(), "b");
+    }
+
+    #[test]
+    fn selector_group_honors_default_member() {
+        let group = Group::new(
+            GroupKind::Selector,
+            vec!["a".into(), "b".into()],
+            Some("b".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(group.now(), "b");
+    }
+
+    #[test]
+    fn url_test_group_defaults_and_exposes_probe_params() {
+        let group = Group::new(
+            GroupKind::UrlTest,
+            vec!["a".into(), "b".into()],
+            None,
+            Some("http://gstatic.com/generate_204".into()),
+            Some("5m".into()),
+            Some(80),
+        )
+        .unwrap();
+        assert_eq!(group.kind(), GroupKind::UrlTest);
+        assert_eq!(group.now(), "a");
+        assert_eq!(group.url(), Some("http://gstatic.com/generate_204"));
+        assert_eq!(group.interval(), std::time::Duration::from_secs(300));
+        assert_eq!(group.tolerance(), 80);
+        assert!(group.select("b"));
+        assert_eq!(group.now(), "b");
+    }
+
+    #[test]
+    fn group_requires_a_default_member() {
+        assert!(Group::new(GroupKind::Selector, vec![], None, None, None, None).is_err());
+    }
 
     #[test]
     fn udp_domain_unmapping_can_be_disabled() {
@@ -324,6 +645,61 @@ mod tests {
         let mut data = [0; 5];
         client.read_exact(&mut data).await.unwrap();
         assert_eq!(&data, b"route");
+        task.abort();
+    }
+    #[tokio::test]
+    async fn socks_routes_through_selector_outbound() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+        let inbound = Inbound {
+            r#type: "socks".into(),
+            listen: Some("127.0.0.1".into()),
+            listen_port: Some(listen.port()),
+            ..Default::default()
+        };
+        let outbounds = vec![
+            Outbound {
+                r#type: "direct".into(),
+                tag: Some("direct".into()),
+                ..Default::default()
+            },
+            Outbound {
+                r#type: "selector".into(),
+                tag: Some("proxy".into()),
+                outbounds: vec!["direct".into()],
+                default: Some("direct".into()),
+                ..Default::default()
+            },
+        ];
+        let route = crate::singbox::RouteConfig {
+            final_outbound: Some("proxy".into()),
+            ..Default::default()
+        };
+        let task = tokio::spawn(run_socks(inbound, outbounds, Some(route), None));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut hello = [0; 2];
+        client.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend(target.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        client.write_all(b"via-selector").await.unwrap();
+        let mut data = [0; 12];
+        client.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"via-selector");
         task.abort();
     }
     #[tokio::test]
