@@ -3,7 +3,7 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, VecDeque},
     net::IpAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
@@ -13,14 +13,14 @@ use super::message::age_response_ttls;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum CacheKey {
     Lookup {
-        name: String,
+        name: Arc<str>,
         qtype: u16,
-        server: Option<String>,
-        client_subnet: Option<String>,
+        server: Option<Arc<str>>,
+        client_subnet: Option<Arc<str>>,
     },
     Wire {
-        query: Vec<u8>,
-        server: String,
+        query: Arc<[u8]>,
+        server: Arc<str>,
     },
 }
 #[derive(Clone)]

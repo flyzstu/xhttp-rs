@@ -223,8 +223,8 @@ impl DnsResolver {
             request.to_vec()
         };
         let key = CacheKey::Wire {
-            query: canonical_query(&wire),
-            server: server_tag.to_owned(),
+            query: canonical_query(&wire).into(),
+            server: server_tag.into(),
         };
         let load = || async {
             let mut response = if server.config.r#type == "local" {
@@ -314,10 +314,10 @@ impl DnsResolver {
             .or_else(|| rule.and_then(|rule| rule.rewrite_ttl));
         let disable_cache = options.disable_cache || rule.is_some_and(|rule| rule.disable_cache);
         let key = CacheKey::Lookup {
-            name: name.to_owned(),
+            name: name.into(),
             qtype,
-            server: server_tag.map(str::to_owned),
-            client_subnet: client_subnet.clone(),
+            server: server_tag.map(Into::into),
+            client_subnet: client_subnet.as_deref().map(Into::into),
         };
         let load = || async {
             let server = match server_tag {
