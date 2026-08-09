@@ -15,7 +15,14 @@ use uuid::Uuid;
 pub struct Client {
     config: ClientConfig,
     xmux: Arc<crate::xmux::Manager>,
+    request_base: Arc<RequestBase>,
 }
+
+struct RequestBase {
+    url: url::Url,
+    headers: HeaderMap,
+}
+
 impl Client {
     pub fn new(mut config: ClientConfig) -> Result<Self> {
         crate::install_crypto_provider();
@@ -36,7 +43,12 @@ impl Client {
         let build_config = config.clone();
         let xmux =
             crate::xmux::Manager::new(xmux_config, move || build_http_client(&build_config))?;
-        Ok(Self { config, xmux })
+        let request_base = Arc::new(build_request_base(&config)?);
+        Ok(Self {
+            config,
+            xmux,
+            request_base,
+        })
     }
     pub async fn connect(&self) -> Result<DuplexStream> {
         let lease = self.xmux.acquire_connection()?;
@@ -169,21 +181,8 @@ impl Client {
         session: Option<&str>,
         sequence: Option<u64>,
     ) -> Result<(url::Url, HeaderMap)> {
-        let mut url = url::Url::parse(&self.config.server).context("invalid server URL")?;
-        if url.path() == "/" {
-            url.set_path(&self.config.transport.path)
-        }
-        if !url.path().ends_with('/') {
-            let path = format!("{}/", url.path());
-            url.set_path(&path);
-        }
-        if let Some(query) = &self.config.transport.query {
-            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                url.query_pairs_mut().append_pair(&key, &value);
-            }
-        }
-        let mut headers = HeaderMap::new();
-        protocol::add_common_headers(&self.config.transport, &mut headers)?;
+        let mut url = self.request_base.url.clone();
+        let mut headers = self.request_base.headers.clone();
         protocol::apply_padding(&self.config.transport, &mut url, &mut headers);
         protocol::apply_metadata(
             &self.config.transport,
@@ -192,9 +191,6 @@ impl Client {
             session,
             sequence,
         )?;
-        if let Some(host) = &self.config.transport.host {
-            headers.insert("host", host.parse()?);
-        }
         Ok((url, headers))
     }
     fn uplink_method(&self) -> Result<Method> {
@@ -214,6 +210,28 @@ impl Client {
             request
         }
     }
+}
+
+fn build_request_base(config: &ClientConfig) -> Result<RequestBase> {
+    let mut url = url::Url::parse(&config.server).context("invalid server URL")?;
+    if url.path() == "/" {
+        url.set_path(&config.transport.path)
+    }
+    if !url.path().ends_with('/') {
+        let path = format!("{}/", url.path());
+        url.set_path(&path);
+    }
+    if let Some(query) = &config.transport.query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            url.query_pairs_mut().append_pair(&key, &value);
+        }
+    }
+    let mut headers = HeaderMap::new();
+    protocol::add_common_headers(&config.transport, &mut headers)?;
+    if let Some(host) = &config.transport.host {
+        headers.insert("host", host.parse()?);
+    }
+    Ok(RequestBase { url, headers })
 }
 
 fn build_http_client(config: &ClientConfig) -> Result<HttpClient> {
