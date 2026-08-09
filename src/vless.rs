@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 use tokio::{
@@ -321,6 +321,9 @@ async fn run_xudp_session(
     idle_timeout: std::time::Duration,
 ) {
     let mut udp_buffer = vec![0; u16::MAX as usize];
+    // Resolve lazily and cache the target: the destination usually stays
+    // fixed across frames, so avoid a per-frame DNS lookup for domains.
+    let mut cached_target: Option<SocketAddr> = None;
     loop {
         let event = tokio::time::timeout(idle_timeout, async {
             tokio::select! {
@@ -336,9 +339,16 @@ async fn run_xudp_session(
             (Some(frame), None) => {
                 if let Some(value) = frame.destination {
                     destination = value;
+                    cached_target = None;
                 }
                 if let Some(payload) = frame.payload {
-                    let Ok(target) = resolve_destination(&destination).await else {
+                    if cached_target.is_none() {
+                        let Ok(target) = resolve_destination(&destination).await else {
+                            return;
+                        };
+                        cached_target = Some(target);
+                    }
+                    let Some(target) = cached_target else {
                         return;
                     };
                     if socket.send_to(&payload, target).await.is_err() {

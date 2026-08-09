@@ -89,7 +89,15 @@ impl DnsCache {
 
     pub(super) fn get(&mut self, key: &CacheKey) -> Option<CacheValue> {
         let now = Instant::now();
-        self.purge_expired(now);
+        if !self.disable_expire
+            && self
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.expires <= now)
+        {
+            self.entries.remove(key);
+            return None;
+        }
         let entry = self.entries.get_mut(key)?;
         self.clock = self.clock.wrapping_add(1);
         entry.last_access = self.clock;
