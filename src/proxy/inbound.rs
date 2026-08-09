@@ -1,5 +1,6 @@
 use crate::{
     dns::DnsResolver,
+    linux_route::LinuxRouteMetadata,
     routing::{RouteDecision, Router},
     singbox::{DnsConfig, Inbound, Outbound, RouteConfig, User},
     vless,
@@ -96,10 +97,16 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         dialers,
     } = runtime;
     let proxy_address = local.local_addr()?;
-    let linux_metadata =
-        tokio::task::spawn_blocking(move || crate::linux_route::collect_tcp(peer, proxy_address))
-            .await
-            .unwrap_or_default();
+    let linux_metadata = {
+        let scope = router.linux_metadata_scope();
+        if scope.is_empty() {
+            LinuxRouteMetadata::default()
+        } else {
+            tokio::task::spawn_blocking(move || crate::linux_route::collect_tcp(peer, proxy_address, scope))
+                .await
+                .unwrap_or_default()
+        }
+    };
     let handshake = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         client_handshake(&mut local, protocol, users),

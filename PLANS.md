@@ -208,6 +208,13 @@ Implemented match fields:
 - nested logical `and`/`or`
 - inversion
 
+Linux route metadata (process, user, network, interface, MAC and hostname) is
+collected lazily: the compiled router reports which fields its rules reference,
+and the SOCKS/HTTP inbound skips the `/proc` scan and subprocess probes entirely
+when no rule needs them. Interface and default-interface information is cached
+for a short TTL, so a per-connection full `/proc` walk is never performed unless
+a rule actually matches on those fields.
+
 Implemented actions:
 
 - route to outbound, direct, and bypass

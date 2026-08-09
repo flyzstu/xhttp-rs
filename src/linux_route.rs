@@ -4,7 +4,38 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
     process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
+
+const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinuxMetadataScope {
+    pub process: bool,
+    pub user: bool,
+    pub interface: bool,
+    pub network: bool,
+    pub mac: bool,
+    pub hostname: bool,
+}
+
+impl LinuxMetadataScope {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            process: self.process || other.process,
+            user: self.user || other.user,
+            interface: self.interface || other.interface,
+            network: self.network || other.network,
+            mac: self.mac || other.mac,
+            hostname: self.hostname || other.hostname,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LinuxRouteMetadata {
@@ -24,22 +55,26 @@ pub struct LinuxRouteMetadata {
     pub default_interface_addresses: Vec<IpAddr>,
 }
 
-pub fn collect_tcp(peer: SocketAddr, proxy: SocketAddr) -> LinuxRouteMetadata {
-    let mut metadata = LinuxRouteMetadata {
-        interface_addresses: all_interface_addresses(),
-        ..Default::default()
-    };
-    for (interface, addresses) in &metadata.interface_addresses {
-        metadata
-            .network_interface_addresses
-            .entry(interface_type(interface))
-            .or_default()
-            .extend(addresses);
+pub fn collect_tcp(peer: SocketAddr, proxy: SocketAddr, scope: LinuxMetadataScope) -> LinuxRouteMetadata {
+    let mut metadata = LinuxRouteMetadata::default();
+    if scope.interface {
+        metadata.interface_addresses = all_interface_addresses_cached();
+        for (interface, addresses) in &metadata.interface_addresses {
+            metadata
+                .network_interface_addresses
+                .entry(interface_type(interface))
+                .or_default()
+                .extend(addresses);
+        }
     }
-    if let Some((inode, uid)) = find_socket_owner(peer, proxy) {
+    if (scope.process || scope.user)
+        && let Some((inode, uid)) = find_socket_owner(peer, proxy)
+    {
         metadata.user_id = Some(uid);
         metadata.user = user_name(uid);
-        if let Some(pid) = find_inode_process(inode) {
+        if scope.process
+            && let Some(pid) = find_inode_process(inode)
+        {
             metadata.process_name = fs::read_to_string(format!("/proc/{pid}/comm"))
                 .ok()
                 .map(|value| value.trim().to_owned())
@@ -49,14 +84,16 @@ pub fn collect_tcp(peer: SocketAddr, proxy: SocketAddr) -> LinuxRouteMetadata {
                 .map(|value| value.to_string_lossy().into_owned());
         }
     }
-    if let Some(interface) = default_interface() {
+    if scope.network
+        && let Some(interface) = default_interface_cached()
+    {
         metadata.network_type = Some(interface_type(&interface));
         metadata.network_is_expensive = command_line(
             "nmcli",
             &["-g", "GENERAL.METERED", "device", "show", &interface],
         )
         .is_some_and(|value| matches!(value.as_str(), "yes" | "guess-yes"));
-        metadata.default_interface_addresses = interface_addresses(&interface);
+        metadata.default_interface_addresses = interface_addresses_cached(&interface);
         if metadata.network_type.as_deref() == Some("wifi") {
             metadata.wifi_ssid = command_line("iwgetid", &["-r"]);
             metadata.wifi_bssid =
@@ -70,8 +107,12 @@ pub fn collect_tcp(peer: SocketAddr, proxy: SocketAddr) -> LinuxRouteMetadata {
                 });
         }
     }
-    metadata.source_mac_address = arp_value(peer.ip(), 3);
-    metadata.source_hostname = hosts_name(peer.ip());
+    if scope.mac {
+        metadata.source_mac_address = arp_value(peer.ip(), 3);
+    }
+    if scope.hostname {
+        metadata.source_hostname = hosts_name(peer.ip());
+    }
     metadata
 }
 
@@ -169,23 +210,53 @@ fn interface_type(interface: &str) -> String {
     }
 }
 
-fn interface_addresses(interface: &str) -> Vec<IpAddr> {
-    command_output("ip", &["-o", "addr", "show", "dev", interface])
-        .into_iter()
-        .flat_map(|output| {
-            output
-                .lines()
-                .filter_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    fields.find_map(|field| {
-                        field
-                            .split_once('/')
-                            .and_then(|(address, _)| address.parse().ok())
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+fn interface_addresses_cached(interface: &str) -> Vec<IpAddr> {
+    all_interface_addresses_cached()
+        .get(&interface.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_default()
+}
+
+struct Cached<T> {
+    value: T,
+    captured: Instant,
+}
+
+type InterfaceCache = Mutex<Option<Cached<HashMap<String, Vec<IpAddr>>>>>;
+type DefaultInterfaceCache = Mutex<Option<Cached<Option<String>>>>;
+
+fn all_interface_addresses_cached() -> HashMap<String, Vec<IpAddr>> {
+    static CACHE: OnceLock<InterfaceCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().expect("interface cache lock poisoned");
+    if let Some(cached) = guard.as_ref()
+        && cached.captured.elapsed() < INTERFACE_CACHE_TTL
+    {
+        return cached.value.clone();
+    }
+    let value = all_interface_addresses();
+    *guard = Some(Cached {
+        value: value.clone(),
+        captured: Instant::now(),
+    });
+    value
+}
+
+fn default_interface_cached() -> Option<String> {
+    static CACHE: OnceLock<DefaultInterfaceCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().expect("default interface cache lock poisoned");
+    if let Some(cached) = guard.as_ref()
+        && cached.captured.elapsed() < INTERFACE_CACHE_TTL
+    {
+        return cached.value.clone();
+    }
+    let value = default_interface();
+    *guard = Some(Cached {
+        value: value.clone(),
+        captured: Instant::now(),
+    });
+    value
 }
 
 fn all_interface_addresses() -> HashMap<String, Vec<IpAddr>> {

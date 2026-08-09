@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 
+use crate::linux_route::LinuxMetadataScope;
 use crate::singbox::{RouteConfig, RouteRule};
 
 #[derive(Debug, Clone, Default)]
@@ -322,6 +323,50 @@ impl Router {
     pub(crate) fn rule_set_ip_cidrs(&self, tags: &[String]) -> Result<Vec<IpNet>> {
         let sets = self.rule_sets.read().expect("route rule-set lock poisoned");
         extract_rule_set_ip_cidrs(&sets, tags)
+    }
+}
+
+impl CompiledRule {
+    fn metadata_scope(&self) -> LinuxMetadataScope {
+        let mut scope = LinuxMetadataScope {
+            process: !self.process_names.is_empty()
+                || !self.process_paths.is_empty()
+                || !self.process_path_regexes.is_empty()
+                || !self.package_names.is_empty()
+                || !self.package_name_regexes.is_empty(),
+            user: !self.users.is_empty() || !self.user_ids.is_empty(),
+            interface: !self.interface_addresses.is_empty()
+                || !self.network_interface_addresses.is_empty(),
+            network: !self.network_types.is_empty()
+                || self.network_is_expensive
+                || self.network_is_constrained
+                || !self.wifi_ssids.is_empty()
+                || !self.wifi_bssids.is_empty()
+                || !self.default_interface_addresses.is_empty(),
+            mac: !self.source_mac_addresses.is_empty(),
+            hostname: !self.source_hostnames.is_empty(),
+        };
+        for nested in &self.logical_rules {
+            scope = scope.union(nested.metadata_scope());
+        }
+        for set in &self.rule_sets {
+            for rule in set {
+                scope = scope.union(rule.metadata_scope());
+            }
+        }
+        scope
+    }
+}
+
+impl Router {
+    pub(crate) fn linux_metadata_scope(&self) -> LinuxMetadataScope {
+        self.rules
+            .read()
+            .expect("route rule lock poisoned")
+            .iter()
+            .fold(LinuxMetadataScope::default(), |scope, rule| {
+                scope.union(rule.metadata_scope())
+            })
     }
 }
 
@@ -1173,5 +1218,101 @@ mod tests {
         assert_eq!(options.routing_mark, Some(123));
         assert_eq!(options.network_strategy.as_deref(), Some("prefer_ipv6"));
         assert_eq!(options.fallback_delay.as_deref(), Some("150ms"));
+    }
+
+    #[test]
+    fn linux_metadata_scope_tracks_rule_fields() {
+        let empty = Router::compile(&RouteConfig::default(), "direct").unwrap();
+        assert!(empty.linux_metadata_scope().is_empty());
+
+        let process = Router::compile(
+            &RouteConfig {
+                rules: vec![RouteRule {
+                    process_name: vec!["curl".into()],
+                    outbound: Some("proxy".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let scope = process.linux_metadata_scope();
+        assert!(scope.process);
+        assert!(!scope.user);
+        assert!(!scope.interface);
+        assert!(!scope.network);
+
+        let user = Router::compile(
+            &RouteConfig {
+                rules: vec![RouteRule {
+                    user_id: vec![1000],
+                    outbound: Some("proxy".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let scope = user.linux_metadata_scope();
+        assert!(scope.user);
+        assert!(!scope.process);
+
+        let network = Router::compile(
+            &RouteConfig {
+                rules: vec![RouteRule {
+                    network_type: vec!["wifi".into()],
+                    outbound: Some("proxy".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let scope = network.linux_metadata_scope();
+        assert!(scope.network);
+        assert!(!scope.process);
+        assert!(!scope.interface);
+
+        let interface = Router::compile(
+            &RouteConfig {
+                rules: vec![RouteRule {
+                    interface_address: HashMap::from([("eth0".into(), vec!["10.0.0.0/24".into()])]),
+                    outbound: Some("proxy".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let scope = interface.linux_metadata_scope();
+        assert!(scope.interface);
+        assert!(!scope.process);
+        assert!(!scope.network);
+
+        let logical = Router::compile(
+            &RouteConfig {
+                rules: vec![RouteRule {
+                    r#type: "logical".into(),
+                    mode: Some("and".into()),
+                    rules: vec![RouteRule {
+                        source_mac_address: vec!["aa:bb".into()],
+                        ..Default::default()
+                    }],
+                    outbound: Some("proxy".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let scope = logical.linux_metadata_scope();
+        assert!(scope.mac);
+        assert!(!scope.process);
+        assert!(!scope.network);
     }
 }
