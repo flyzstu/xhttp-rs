@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Uri};
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, HeaderName, HeaderValue, Uri},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use url::Url;
@@ -383,6 +386,17 @@ pub fn extract_payload(
     URL_SAFE_NO_PAD
         .decode(encoded)
         .context("invalid base64url packet payload")
+}
+
+pub fn extract_payload_bytes(
+    config: &TransportConfig,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Bytes> {
+    Ok(match config.data_placement {
+        Placement::Body => body,
+        _ => Bytes::from(extract_payload(config, headers, &body)?),
+    })
 }
 
 fn collect_numbered(

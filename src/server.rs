@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use dashmap::{DashMap, mapref::entry::Entry};
 use futures_util::StreamExt;
 use tokio::{
@@ -308,12 +308,13 @@ async fn download(state: Arc<ServerState>, id: String) -> Response {
         let _ = write.shutdown().await;
     });
     tokio::spawn(async move {
-        let mut b = vec![0; 32 * 1024];
+        let mut buffer = BytesMut::with_capacity(32 * 1024);
         loop {
-            match read.read(&mut b).await {
+            buffer.clear();
+            match read.read_buf(&mut buffer).await {
                 Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(Ok(Bytes::copy_from_slice(&b[..n]))).await.is_err() {
+                Ok(_) => {
+                    if tx.send(Ok(buffer.split().freeze())).await.is_err() {
                         break;
                     }
                 }
@@ -342,11 +343,10 @@ async fn packet_upload(
             Ok(v) => v,
             Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         };
-    let payload = match protocol::extract_payload(&state.config.transport, &headers, &body) {
-        Ok(v) => Bytes::from(v),
+    let payload = match protocol::extract_payload_bytes(&state.config.transport, &headers, body) {
+        Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-    if payload.len() > state.config.transport.max_packet_size {
+    };    if payload.len() > state.config.transport.max_packet_size {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     let Some(session) = get_session(&state, &id) else {
