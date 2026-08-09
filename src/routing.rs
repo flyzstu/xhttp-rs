@@ -257,11 +257,12 @@ impl Router {
     }
 
     pub fn route(&self, context: &RouteContext<'_>) -> RouteDecision {
+        let domain = context.domain.map(normalize_domain);
         self.rules
             .read()
             .expect("route rule lock poisoned")
             .iter()
-            .filter(|rule| rule.matches(context))
+            .filter(|rule| rule.matches(context, domain.as_deref()))
             .find_map(|rule| match &rule.action {
                 RuleAction::Route { decision, .. } => Some(decision.clone()),
                 _ => None,
@@ -274,13 +275,14 @@ impl Router {
         context: &RouteContext<'_>,
         from: usize,
     ) -> Option<(usize, RuleAction)> {
+        let domain = context.domain.map(normalize_domain);
         self.rules
             .read()
             .expect("route rule lock poisoned")
             .iter()
             .enumerate()
             .skip(from)
-            .find(|(_, rule)| rule.matches(context))
+            .find(|(_, rule)| rule.matches(context, domain.as_deref()))
             .map(|(index, rule)| (index, rule.action.clone()))
     }
 
@@ -537,30 +539,27 @@ impl CompiledRule {
             invert: rule.invert,
         })
     }
-    fn matches(&self, c: &RouteContext<'_>) -> bool {
+    fn matches(&self, c: &RouteContext<'_>, domain: Option<&str>) -> bool {
         if let Some(mode) = self.logical_mode {
             let matched = match mode {
-                LogicalMode::And => self.logical_rules.iter().all(|rule| rule.matches(c)),
-                LogicalMode::Or => self.logical_rules.iter().any(|rule| rule.matches(c)),
+                LogicalMode::And => self.logical_rules.iter().all(|rule| rule.matches(c, domain)),
+                LogicalMode::Or => self.logical_rules.iter().any(|rule| rule.matches(c, domain)),
             };
             return if self.invert { !matched } else { matched };
         }
-        let domain = c.domain.map(normalize_domain);
         let matched = (self.domains.is_empty()
-            || domain.as_ref().is_some_and(|d| self.domains.contains(d)))
+            || domain.is_some_and(|d| self.domains.iter().any(|s| s == d)))
             && (self.suffixes.is_empty()
-                || domain.as_ref().is_some_and(|d| {
+                || domain.is_some_and(|d| {
                     self.suffixes
                         .iter()
-                        .any(|s| d == s || d.ends_with(&format!(".{s}")))
+                        .any(|s| d == s || d.strip_suffix(s).is_some_and(|r| r.ends_with('.')))
                 }))
             && (self.keywords.is_empty()
                 || domain
-                    .as_ref()
                     .is_some_and(|d| self.keywords.iter().any(|value| d.contains(value))))
             && (self.regexes.is_empty()
                 || domain
-                    .as_ref()
                     .is_some_and(|d| self.regexes.iter().any(|value| value.is_match(d))))
             && (self.cidrs.is_empty()
                 || c.destination_ip
@@ -639,19 +638,16 @@ impl CompiledRule {
                 || c.preferred_by
                     .iter()
                     .any(|tag| self.preferred_by.contains(tag)))
-            && (self.rule_sets.is_empty() || {
-                let mut source_context = c.clone();
-                if self.rule_set_ip_cidr_match_source {
-                    source_context.destination_ip = c.source_ip;
-                }
-                self.rule_sets.iter().flatten().any(|rule| {
-                    rule.matches(if self.rule_set_ip_cidr_match_source {
-                        &source_context
+            && (self.rule_sets.is_empty()
+                || self.rule_sets.iter().flatten().any(|rule| {
+                    if self.rule_set_ip_cidr_match_source {
+                        let mut source_context = c.clone();
+                        source_context.destination_ip = c.source_ip;
+                        rule.matches(&source_context, domain)
                     } else {
-                        c
-                    })
-                })
-            });
+                        rule.matches(c, domain)
+                    }
+                }));
         if self.invert { !matched } else { matched }
     }
 }

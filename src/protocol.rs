@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Uri};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -244,18 +242,10 @@ pub fn extract_metadata(
         .trim_matches('/')
         .split('/')
         .filter(|v| !v.is_empty());
-    let query: HashMap<_, _> = uri
-        .query()
-        .map(|q| {
-            url::form_urlencoded::parse(q.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
     let mut read = |placement: Placement, key: &str| -> Option<String> {
         match placement {
             Placement::Path => path_values.next().map(str::to_owned),
-            Placement::Query => query.get(key).cloned(),
+            Placement::Query => query_value(uri, key),
             Placement::Header => headers
                 .get(key)
                 .and_then(|v| v.to_str().ok())
@@ -268,6 +258,16 @@ pub fn extract_metadata(
     let sequence =
         read(config.sequence_placement, &config.sequence_key).and_then(|v| v.parse().ok());
     (session, sequence)
+}
+
+fn query_value(uri: &Uri, key: &str) -> Option<String> {
+    let mut found = None;
+    for (name, value) in url::form_urlencoded::parse(uri.query()?.as_bytes()) {
+        if name == key {
+            found = Some(value.into_owned());
+        }
+    }
+    found
 }
 
 fn cookie_value(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -413,6 +413,37 @@ mod tests {
         assert_eq!(
             extract_metadata(&config, &uri, &headers),
             (Some("session-a".into()), Some(7))
+        );
+    }
+
+    #[test]
+    fn query_metadata_reads_lazily_and_preserves_duplicate_semantics() {
+        let config = TransportConfig {
+            session_placement: Placement::Query,
+            sequence_placement: Placement::Query,
+            ..Default::default()
+        };
+        let uri: Uri = "/xhttp?x_session=a&x_session=b&x_seq=42"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            extract_metadata(&config, &uri, &HeaderMap::new()),
+            (Some("b".into()), Some(42))
+        );
+        let encoded: Uri = "/xhttp?x_session=a%20b&x_seq=7".parse().unwrap();
+        assert_eq!(
+            extract_metadata(&config, &encoded, &HeaderMap::new()),
+            (Some("a b".into()), Some(7))
+        );
+        let empty: Uri = "/xhttp".parse().unwrap();
+        assert_eq!(
+            extract_metadata(&config, &empty, &HeaderMap::new()),
+            (None, None)
+        );
+        let partial: Uri = "/xhttp?x_session=only-session".parse().unwrap();
+        assert_eq!(
+            extract_metadata(&config, &partial, &HeaderMap::new()),
+            (Some("only-session".into()), None)
         );
     }
 
