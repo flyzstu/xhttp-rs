@@ -614,103 +614,7 @@ impl SingBoxConfig {
             )
         });
         for inbound in &self.inbounds {
-            match inbound.r#type.as_str() {
-                "socks" | "http" | "mixed" => {
-                    supported += 1;
-                    inbound
-                        .listen_port
-                        .context("proxy inbound requires listen_port")?;
-                    for user in &inbound.users {
-                        user.name
-                            .as_deref()
-                            .filter(|value| !value.is_empty())
-                            .context("proxy inbound user requires name")?;
-                        user.password
-                            .as_deref()
-                            .context("proxy inbound user requires password")?;
-                    }
-                    if inbound.tls.as_ref().is_some_and(|tls| tls.enabled) {
-                        bail!("TLS on proxy inbounds is not supported")
-                    }
-                }
-                "vless"
-                    if inbound
-                        .transport
-                        .as_ref()
-                        .is_some_and(|transport| transport.r#type == "xhttp") =>
-                {
-                    supported += 1;
-                    inbound
-                        .listen_port
-                        .context("VLESS XHTTP inbound requires listen_port")?;
-                    inbound.transport.as_ref().unwrap().build()?;
-                    if inbound.users.is_empty() {
-                        bail!("VLESS XHTTP inbound requires at least one user")
-                    }
-                    for user in &inbound.users {
-                        uuid::Uuid::parse_str(
-                            user.uuid
-                                .as_deref()
-                                .context("VLESS inbound user requires uuid")?,
-                        )
-                        .context("invalid VLESS inbound UUID")?;
-                        if user.flow.as_deref().is_some_and(|flow| !flow.is_empty()) {
-                            bail!("VLESS flow is not supported with XHTTP")
-                        }
-                    }
-                    if let Some(tls) = inbound.tls.as_ref().filter(|tls| tls.enabled)
-                        && (tls.certificate.is_empty() && tls.certificate_path.is_none()
-                            || tls.key.is_empty() && tls.key_path.is_none())
-                    {
-                        bail!("TLS inbound requires certificate/key or certificate_path/key_path")
-                    }
-                }
-                "anytls" => {
-                    supported += 1;
-                    inbound
-                        .listen_port
-                        .context("AnyTLS inbound requires listen_port")?;
-                    if inbound.users.is_empty() {
-                        bail!("AnyTLS inbound requires at least one user")
-                    }
-                    for user in &inbound.users {
-                        user.password
-                            .as_deref()
-                            .filter(|password| !password.is_empty())
-                            .context("AnyTLS inbound user requires password")?;
-                    }
-                    if !inbound.padding_scheme.is_empty() {
-                        anytls::PaddingScheme::parse(inbound.padding_scheme.join("\n").as_bytes())
-                            .context("invalid AnyTLS padding_scheme")?;
-                    }
-                    if let Some(tls) = inbound.tls.as_ref().filter(|tls| tls.enabled) {
-                        if tls.certificate.is_empty() && tls.certificate_path.is_none()
-                            || tls.key.is_empty() && tls.key_path.is_none()
-                        {
-                            bail!("AnyTLS TLS inbound requires certificate and key")
-                        }
-                        crate::anytls::validate_server_tls(tls)?;
-                    }
-                    if let Some(ech) = inbound
-                        .tls
-                        .as_ref()
-                        .and_then(|tls| tls.ech.as_ref())
-                        .filter(|ech| ech.enabled)
-                    {
-                        if !ech.key.is_empty() && ech.key_path.is_some() {
-                            bail!("ECH key and key_path are mutually exclusive")
-                        }
-                        if ech.key.is_empty() && ech.key_path.is_none() {
-                            bail!("AnyTLS ECH inbound requires key or key_path")
-                        }
-                    }
-                }
-                "tun" => {
-                    supported += 1;
-                    crate::tun::TunConfig::from_inbound(inbound)?;
-                }
-                _ => {}
-            }
+            supported += self.validate_inbound(inbound)?;
         }
         if supported == 0 {
             bail!("no supported inbound found")
@@ -722,94 +626,7 @@ impl SingBoxConfig {
                 bail!("duplicate outbound tag: {tag}")
             }
             if has_proxy_inbound {
-                match outbound.r#type.as_str() {
-                    "direct" | "block" => {}
-                    "vless" => {
-                        outbound
-                            .server
-                            .as_ref()
-                            .context("VLESS outbound requires server")?;
-                        uuid::Uuid::parse_str(
-                            outbound
-                                .uuid
-                                .as_deref()
-                                .context("VLESS outbound requires uuid")?,
-                        )
-                        .context("invalid VLESS outbound UUID")?;
-                        if outbound
-                            .flow
-                            .as_deref()
-                            .is_some_and(|flow| !flow.is_empty())
-                        {
-                            bail!("VLESS flow is not supported with XHTTP")
-                        }
-                        outbound
-                            .transport
-                            .as_ref()
-                            .context("VLESS outbound requires XHTTP transport")?
-                            .build()?;
-                        if let Some(ech) = outbound.tls.as_ref().and_then(|tls| tls.ech.as_ref())
-                            && ech.enabled
-                        {
-                            if !ech.config.is_empty() && ech.config_path.is_some() {
-                                bail!("ECH config and config_path are mutually exclusive")
-                            }
-                            let pem = if !ech.config.is_empty() {
-                                ech.config.join("\n").into_bytes()
-                            } else if let Some(path) = &ech.config_path {
-                                std::fs::read(path).context("read ECH config")?
-                            } else if self.dns.is_none() {
-                                bail!("DNS-discovered ECH requires a DNS configuration")
-                            } else {
-                                Vec::new()
-                            };
-                            if !pem.is_empty() {
-                                crate::tls::parse_ech_config(&pem)?;
-                            }
-                        }
-                        if !matches!(
-                            outbound.packet_encoding.as_deref(),
-                            None | Some("") | Some("xudp")
-                        ) {
-                            bail!("unsupported VLESS packet_encoding")
-                        }
-                    }
-                    "anytls" => {
-                        outbound
-                            .server
-                            .as_ref()
-                            .context("AnyTLS outbound requires server")?;
-                        outbound
-                            .password
-                            .as_deref()
-                            .filter(|password| !password.is_empty())
-                            .context("AnyTLS outbound requires password")?;
-                        if !outbound.tls.as_ref().is_some_and(|tls| tls.enabled) {
-                            bail!("AnyTLS outbound requires TLS")
-                        }
-                        if let Some(ech) = outbound
-                            .tls
-                            .as_ref()
-                            .and_then(|tls| tls.ech.as_ref())
-                            .filter(|ech| ech.enabled)
-                        {
-                            if !ech.config.is_empty() && ech.config_path.is_some() {
-                                bail!("ECH config and config_path are mutually exclusive")
-                            }
-                            if !ech.config.is_empty() {
-                                crate::tls::parse_ech_config(ech.config.join("\n").as_bytes())?;
-                            } else if let Some(path) = &ech.config_path {
-                                crate::tls::parse_ech_config(
-                                    &std::fs::read(path).context("read ECH config")?,
-                                )?;
-                            } else if self.dns.is_none() {
-                                bail!("DNS-discovered ECH requires a DNS configuration")
-                            }
-                        }
-                        crate::anytls::validate_outbound(outbound)?;
-                    }
-                    value => bail!("unsupported outbound type for proxy inbound: {value}"),
-                }
+                self.validate_outbound(outbound)?;
             }
         }
         if let Some(route) = &self.route {
@@ -838,6 +655,198 @@ impl SingBoxConfig {
                     bail!("DNS rule references unknown server: {tag}")
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_inbound(&self, inbound: &Inbound) -> Result<usize> {
+        match inbound.r#type.as_str() {
+            "socks" | "http" | "mixed" => {
+                inbound
+                    .listen_port
+                    .context("proxy inbound requires listen_port")?;
+                for user in &inbound.users {
+                    user.name
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .context("proxy inbound user requires name")?;
+                    user.password
+                        .as_deref()
+                        .context("proxy inbound user requires password")?;
+                }
+                if inbound.tls.as_ref().is_some_and(|tls| tls.enabled) {
+                    bail!("TLS on proxy inbounds is not supported")
+                }
+                Ok(1)
+            }
+            "vless"
+                if inbound
+                    .transport
+                    .as_ref()
+                    .is_some_and(|transport| transport.r#type == "xhttp") =>
+            {
+                inbound
+                    .listen_port
+                    .context("VLESS XHTTP inbound requires listen_port")?;
+                inbound.transport.as_ref().unwrap().build()?;
+                if inbound.users.is_empty() {
+                    bail!("VLESS XHTTP inbound requires at least one user")
+                }
+                for user in &inbound.users {
+                    uuid::Uuid::parse_str(
+                        user.uuid
+                            .as_deref()
+                            .context("VLESS inbound user requires uuid")?,
+                    )
+                    .context("invalid VLESS inbound UUID")?;
+                    if user.flow.as_deref().is_some_and(|flow| !flow.is_empty()) {
+                        bail!("VLESS flow is not supported with XHTTP")
+                    }
+                }
+                if let Some(tls) = inbound.tls.as_ref().filter(|tls| tls.enabled)
+                    && (tls.certificate.is_empty() && tls.certificate_path.is_none()
+                        || tls.key.is_empty() && tls.key_path.is_none())
+                {
+                    bail!("TLS inbound requires certificate/key or certificate_path/key_path")
+                }
+                Ok(1)
+            }
+            "anytls" => {
+                inbound
+                    .listen_port
+                    .context("AnyTLS inbound requires listen_port")?;
+                if inbound.users.is_empty() {
+                    bail!("AnyTLS inbound requires at least one user")
+                }
+                for user in &inbound.users {
+                    user.password
+                        .as_deref()
+                        .filter(|password| !password.is_empty())
+                        .context("AnyTLS inbound user requires password")?;
+                }
+                if !inbound.padding_scheme.is_empty() {
+                    anytls::PaddingScheme::parse(inbound.padding_scheme.join("\n").as_bytes())
+                        .context("invalid AnyTLS padding_scheme")?;
+                }
+                if let Some(tls) = inbound.tls.as_ref().filter(|tls| tls.enabled) {
+                    if tls.certificate.is_empty() && tls.certificate_path.is_none()
+                        || tls.key.is_empty() && tls.key_path.is_none()
+                    {
+                        bail!("AnyTLS TLS inbound requires certificate and key")
+                    }
+                    crate::anytls::validate_server_tls(tls)?;
+                }
+                if let Some(ech) = inbound
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.ech.as_ref())
+                    .filter(|ech| ech.enabled)
+                {
+                    if !ech.key.is_empty() && ech.key_path.is_some() {
+                        bail!("ECH key and key_path are mutually exclusive")
+                    }
+                    if ech.key.is_empty() && ech.key_path.is_none() {
+                        bail!("AnyTLS ECH inbound requires key or key_path")
+                    }
+                }
+                Ok(1)
+            }
+            "tun" => {
+                crate::tun::TunConfig::from_inbound(inbound)?;
+                Ok(1)
+            }
+            _ => Ok(0),
+        }
+    }
+
+    fn validate_outbound(&self, outbound: &Outbound) -> Result<()> {
+        match outbound.r#type.as_str() {
+            "direct" | "block" => {}
+            "vless" => {
+                outbound
+                    .server
+                    .as_ref()
+                    .context("VLESS outbound requires server")?;
+                uuid::Uuid::parse_str(
+                    outbound
+                        .uuid
+                        .as_deref()
+                        .context("VLESS outbound requires uuid")?,
+                )
+                .context("invalid VLESS outbound UUID")?;
+                if outbound
+                    .flow
+                    .as_deref()
+                    .is_some_and(|flow| !flow.is_empty())
+                {
+                    bail!("VLESS flow is not supported with XHTTP")
+                }
+                outbound
+                    .transport
+                    .as_ref()
+                    .context("VLESS outbound requires XHTTP transport")?
+                    .build()?;
+                if let Some(ech) = outbound.tls.as_ref().and_then(|tls| tls.ech.as_ref())
+                    && ech.enabled
+                {
+                    if !ech.config.is_empty() && ech.config_path.is_some() {
+                        bail!("ECH config and config_path are mutually exclusive")
+                    }
+                    let pem = if !ech.config.is_empty() {
+                        ech.config.join("\n").into_bytes()
+                    } else if let Some(path) = &ech.config_path {
+                        std::fs::read(path).context("read ECH config")?
+                    } else if self.dns.is_none() {
+                        bail!("DNS-discovered ECH requires a DNS configuration")
+                    } else {
+                        Vec::new()
+                    };
+                    if !pem.is_empty() {
+                        crate::tls::parse_ech_config(&pem)?;
+                    }
+                }
+                if !matches!(
+                    outbound.packet_encoding.as_deref(),
+                    None | Some("") | Some("xudp")
+                ) {
+                    bail!("unsupported VLESS packet_encoding")
+                }
+            }
+            "anytls" => {
+                outbound
+                    .server
+                    .as_ref()
+                    .context("AnyTLS outbound requires server")?;
+                outbound
+                    .password
+                    .as_deref()
+                    .filter(|password| !password.is_empty())
+                    .context("AnyTLS outbound requires password")?;
+                if !outbound.tls.as_ref().is_some_and(|tls| tls.enabled) {
+                    bail!("AnyTLS outbound requires TLS")
+                }
+                if let Some(ech) = outbound
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.ech.as_ref())
+                    .filter(|ech| ech.enabled)
+                {
+                    if !ech.config.is_empty() && ech.config_path.is_some() {
+                        bail!("ECH config and config_path are mutually exclusive")
+                    }
+                    if !ech.config.is_empty() {
+                        crate::tls::parse_ech_config(ech.config.join("\n").as_bytes())?;
+                    } else if let Some(path) = &ech.config_path {
+                        crate::tls::parse_ech_config(
+                            &std::fs::read(path).context("read ECH config")?,
+                        )?;
+                    } else if self.dns.is_none() {
+                        bail!("DNS-discovered ECH requires a DNS configuration")
+                    }
+                }
+                crate::anytls::validate_outbound(outbound)?;
+            }
+            value => bail!("unsupported outbound type for proxy inbound: {value}"),
         }
         Ok(())
     }
