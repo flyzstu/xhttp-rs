@@ -75,7 +75,9 @@ impl Manager {
     fn pick(&self, connection: bool) -> Result<Arc<Mutex<Pool>>> {
         let mut state = self.state.lock().expect("XMUX manager lock poisoned");
         let now = Instant::now();
-        state.pools.retain(|entry| {
+        let mut active = Vec::new();
+        let mut active_count = 0;
+        for entry in &state.pools {
             let mut pool = entry.lock().expect("XMUX pool lock poisoned");
             if !pool.retired
                 && (pool.remaining_reuse == Some(0)
@@ -84,30 +86,25 @@ impl Manager {
             {
                 pool.retired = true;
             }
-            !(pool.retired && pool.running == 0)
-        });
-
-        let active = state
-            .pools
-            .iter()
-            .filter(|entry| {
-                let pool = entry.lock().expect("XMUX pool lock poisoned");
-                !pool.retired
-                    && (!connection
-                        || state.max_concurrency == 0
-                        || pool.running < state.max_concurrency)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let active_count = state
-            .pools
-            .iter()
-            .filter(|entry| !entry.lock().expect("XMUX pool lock poisoned").retired)
-            .count();
+            if pool.retired {
+                continue;
+            }
+            active_count += 1;
+            if !connection
+                || state.max_concurrency == 0
+                || pool.running < state.max_concurrency
+            {
+                active.push(entry.clone());
+            }
+        }
 
         let pool = if active.is_empty()
             || (state.max_connections > 0 && active_count < state.max_connections)
         {
+            state.pools.retain(|entry| {
+                let pool = entry.lock().expect("XMUX pool lock poisoned");
+                !(pool.retired && pool.running == 0)
+            });
             let pool = Arc::new(Mutex::new(Pool {
                 http: self
                     .initial
