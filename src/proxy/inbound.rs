@@ -1,14 +1,12 @@
 use crate::{
-    dns::DnsResolver,
     linux_route::LinuxRouteMetadata,
-    routing::{RouteDecision, Router},
+    routing::RouteDecision,
     singbox::{DnsConfig, Inbound, Outbound, RouteConfig, User},
     vless,
 };
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use std::{
-    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
@@ -17,29 +15,26 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use super::{BoxIo, Dialer, Group, ProxyRuntime, build_runtime, parse_duration, resolve_dialer, socket};
+use super::{BoxIo, Dialer, ProxyRuntime, build_runtime, parse_duration, socket};
 use super::direct::connect_direct;
 use super::relay::write_first_packet;
 use super::route::{RouteEvaluation, RouteInput, evaluate_tcp_route};
 use super::udp::{UdpAssociateRuntime, relay_dns_tcp, to_anytls_destination, udp_associate};
 
 pub async fn run_socks(
-
     inbound: Inbound,
     outbounds: Vec<Outbound>,
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
 ) -> Result<()> {
+    let runtime = Arc::new(build_runtime(outbounds, route, dns).await?);
+    run_socks_with_runtime(inbound, runtime).await
+}
+
+pub async fn run_socks_with_runtime(inbound: Inbound, runtime: Arc<ProxyRuntime>) -> Result<()> {
     if !matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
         bail!("unsupported proxy inbound: {}", inbound.r#type)
     }
-    let ProxyRuntime {
-        dialers,
-        groups,
-        router,
-        resolver,
-        ..
-    } = build_runtime(outbounds, route, dns).await?;
     let listen = socket(
         inbound.listen.as_deref().unwrap_or("127.0.0.1"),
         inbound
@@ -53,10 +48,7 @@ pub async fn run_socks(
     loop {
         let (stream, peer) = listener.accept().await?;
         crate::anytls::configure_tcp(&stream).context("enable TCP_NODELAY on proxy inbound")?;
-        let router = router.clone();
-        let resolver = resolver.clone();
-        let dialers = dialers.clone();
-        let groups = groups.clone();
+        let runtime = runtime.clone();
         let tag = tag.clone();
         let protocol = protocol.clone();
         let users = users.clone();
@@ -68,10 +60,7 @@ pub async fn run_socks(
                     inbound: tag.as_str(),
                     protocol: protocol.as_str(),
                     users: &users,
-                    router: &router,
-                    resolver: resolver.as_deref(),
-                    dialers: &dialers,
-                    groups: &groups,
+                    runtime: &runtime,
                 },
             )
             .await
@@ -86,24 +75,18 @@ struct HandleRuntime<'a> {
     inbound: &'a str,
     protocol: &'a str,
     users: &'a [User],
-    router: &'a Router,
-    resolver: Option<&'a DnsResolver>,
-    dialers: &'a HashMap<String, Dialer>,
-    groups: &'a HashMap<String, Arc<Group>>,
+    runtime: &'a ProxyRuntime,
 }
 async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'_>) -> Result<()> {
     let HandleRuntime {
         inbound,
         protocol,
         users,
-        router,
-        resolver,
-        dialers,
-        groups,
+        runtime,
     } = runtime;
     let proxy_address = local.local_addr()?;
     let linux_metadata = {
-        let scope = router.linux_metadata_scope();
+        let scope = runtime.router.linux_metadata_scope();
         if scope.is_empty() {
             LinuxRouteMetadata::default()
         } else {
@@ -131,10 +114,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
                 peer,
                 UdpAssociateRuntime {
                     inbound,
-                    router,
-                    resolver,
-                    dialers,
-                    groups,
+                    runtime,
                     linux_metadata,
                     auth_user,
                 },
@@ -150,10 +130,11 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         RouteInput {
             peer,
             inbound,
-            router,
-            resolver,
+            router: &runtime.router,
+            resolver: runtime.resolver.as_deref(),
             linux: &linux_metadata,
             auth_user: auth_user.as_deref(),
+            clash_mode: runtime.clash_mode().as_deref(),
         },
     )
     .await?;
@@ -163,7 +144,10 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         options: route_options,
     } = evaluation;
     if decision == RouteDecision::HijackDns {
-        let resolver = resolver.context("DNS hijack requires a DNS configuration")?;
+        let resolver = runtime
+            .resolver
+            .as_deref()
+            .context("DNS hijack requires a DNS configuration")?;
         if !initial.is_empty() {
             bail!("DNS hijack is only supported for SOCKS connections")
         }
@@ -195,7 +179,8 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         }
         RouteDecision::HijackDns => unreachable!(),
     };
-    let dialer = resolve_dialer(dialers, groups, &tag)
+    let dialer = runtime
+        .dialer_for(&tag)
         .with_context(|| format!("unknown outbound: {tag}"))?;
     if matches!(&dialer, Dialer::Block) {
         bail!("connection blocked by outbound")
@@ -237,7 +222,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         )?;
     } else {
         let mut remote: BoxIo =
-            Box::new(connect_direct(&destination, resolver, &route_options).await?);
+            Box::new(connect_direct(&destination, runtime.resolver.as_deref(), &route_options).await?);
         if let Some(reply) = &reply {
             local.write_all(reply).await?
         }

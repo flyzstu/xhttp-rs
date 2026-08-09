@@ -26,6 +26,7 @@ pub(super) struct RouteInput<'a> {
     pub(super) resolver: Option<&'a DnsResolver>,
     pub(super) linux: &'a LinuxRouteMetadata,
     pub(super) auth_user: Option<&'a str>,
+    pub(super) clash_mode: Option<&'a str>,
 }
 pub(super) async fn evaluate_tcp_route(
     local: &TcpStream,
@@ -40,6 +41,7 @@ pub(super) async fn evaluate_tcp_route(
         resolver,
         linux,
         auth_user,
+        clash_mode,
     } = input;
     let mut domain = match &destination {
         vless::Destination::Domain(value, _) => Some(value.clone()),
@@ -60,7 +62,7 @@ pub(super) async fn evaluate_tcp_route(
     }
     let mut detected_protocol = None;
     let mut detected_client = None;
-    let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
+
     let mut options = router.default_options();
     let mut cursor = 0;
     let decision = loop {
@@ -79,7 +81,7 @@ pub(super) async fn evaluate_tcp_route(
             process_path: linux.process_path.as_deref(),
             user: linux.user.as_deref(),
             user_id: linux.user_id,
-            clash_mode: clash_mode.as_deref(),
+            clash_mode,
             network_type: linux.network_type.as_deref(),
             network_is_expensive: linux.network_is_expensive,
             network_is_constrained: linux.network_is_constrained,
@@ -173,6 +175,7 @@ where
         resolver,
         linux,
         auth_user,
+        clash_mode,
     } = input;
     let mut domain = match &destination {
         vless::Destination::Domain(value, _) => Some(value.clone()),
@@ -194,7 +197,7 @@ where
     let mut initial = Vec::new();
     let mut detected_protocol = None;
     let mut detected_client = None;
-    let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
+
     let mut options = router.default_options();
     let mut cursor = 0;
     let decision = loop {
@@ -213,7 +216,7 @@ where
             process_path: linux.process_path.as_deref(),
             user: linux.user.as_deref(),
             user_id: linux.user_id,
-            clash_mode: clash_mode.as_deref(),
+            clash_mode,
             network_type: linux.network_type.as_deref(),
             network_is_expensive: linux.network_is_expensive,
             network_is_constrained: linux.network_is_constrained,
@@ -312,6 +315,7 @@ pub(super) async fn evaluate_udp_route(
         resolver,
         linux,
         auth_user,
+        clash_mode,
     } = input;
     let mut domain = match &destination {
         vless::Destination::Domain(value, _) => Some(value.clone()),
@@ -332,7 +336,7 @@ pub(super) async fn evaluate_udp_route(
     }
     let mut detected_protocol = None;
     let mut detected_client = None;
-    let clash_mode = std::env::var("XHTTP_CLASH_MODE").ok();
+
     let mut options = router.default_options();
     let mut cursor = 0;
     let decision = loop {
@@ -351,7 +355,7 @@ pub(super) async fn evaluate_udp_route(
             process_path: linux.process_path.as_deref(),
             user: linux.user.as_deref(),
             user_id: linux.user_id,
-            clash_mode: clash_mode.as_deref(),
+            clash_mode,
             network_type: linux.network_type.as_deref(),
             network_is_expensive: linux.network_is_expensive,
             network_is_constrained: linux.network_is_constrained,

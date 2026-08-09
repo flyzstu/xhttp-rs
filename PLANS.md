@@ -243,6 +243,12 @@ Implemented rule-set sources:
   reference, DNS reference, and rule-set validation
 - configurable logging level and output
 - multiple supported inbounds in one process
+- `experimental.clash_api` with an `external_controller`, optional `secret`,
+  and an optional `external_ui` that auto-downloads the Yacd-meta dashboard.
+  The HTTP API exposes `/version`, `/configs` (rule/global/direct mode),
+  `/proxies` (selector/urltest groups plus leaf outbounds and a GLOBAL
+  selector), node switching, and per-node delay tests, so a Clash dashboard
+  can switch nodes and modes against the shared proxy runtime.
 
 ## Source map
 

@@ -84,6 +84,20 @@ pub struct SingBoxConfig {
     pub route: Option<RouteConfig>,
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
+    pub experimental: Option<ExperimentalConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    pub clash_api: Option<ClashApiConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ClashApiConfig {
+    pub external_controller: Option<String>,
+    pub external_ui: Option<String>,
+    pub external_ui_download_url: Option<String>,
+    pub secret: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -679,6 +693,19 @@ impl SingBoxConfig {
                     bail!("DNS rule references unknown server: {tag}")
                 }
             }
+        }
+        if self
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.clash_api.as_ref())
+            .is_some_and(|clash_api| {
+                clash_api
+                    .external_controller
+                    .as_deref()
+                    .is_none_or(|value| value.is_empty())
+            })
+        {
+            bail!("clash_api requires external_controller")
         }
         Ok(())
     }

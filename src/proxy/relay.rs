@@ -43,6 +43,7 @@ pub(crate) async fn relay_anytls_tcp(
             resolver: runtime.resolver.as_deref(),
             linux: &LinuxRouteMetadata::default(),
             auth_user: user,
+            clash_mode: runtime.clash_mode().as_deref(),
         },
     )
     .await?;
@@ -138,6 +139,7 @@ pub(crate) async fn relay_tun_tcp(
             resolver: runtime.resolver.as_deref(),
             linux: &LinuxRouteMetadata::default(),
             auth_user: None,
+            clash_mode: runtime.clash_mode().as_deref(),
         },
     )
     .await?;
@@ -235,6 +237,7 @@ pub(crate) async fn relay_anytls_udp(
             resolver: runtime.resolver.as_deref(),
             linux: &LinuxRouteMetadata::default(),
             auth_user: user,
+            clash_mode: runtime.clash_mode().as_deref(),
         },
     )
     .await?;
@@ -564,6 +567,7 @@ pub(crate) async fn relay_tun_udp(
             resolver: runtime.resolver.as_deref(),
             linux: &LinuxRouteMetadata::default(),
             auth_user: None,
+            clash_mode: runtime.clash_mode().as_deref(),
         },
     )
     .await?;

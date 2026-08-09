@@ -23,16 +23,17 @@ use url::Url;
 
 pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_tun_tcp, relay_tun_udp};
 pub use inbound::run_socks;
+pub use inbound::run_socks_with_runtime;
 #[cfg(feature = "fuzzing")]
 pub use udp::fuzz_socks_udp;
 pub(crate) use crate::util::socket;
 pub(crate) use crate::util::url_host;
 
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-type BoxIo = Box<dyn Io>;
+pub type BoxIo = Box<dyn Io>;
 #[derive(Clone)]
-pub(crate) enum Dialer {
+pub enum Dialer {
     Direct,
     Block,
     AnyTls {
@@ -47,7 +48,7 @@ pub(crate) enum Dialer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GroupKind {
+pub enum GroupKind {
     Selector,
     UrlTest,
 }
@@ -56,7 +57,7 @@ pub(crate) enum GroupKind {
 /// `UrlTest` periodically probes its members and auto-selects the fastest.
 /// The `selected` state is shared so a Clash API can switch nodes at runtime.
 #[derive(Clone)]
-pub(crate) struct Group {
+pub struct Group {
     kind: GroupKind,
     members: Vec<String>,
     selected: Arc<RwLock<String>>,
@@ -129,7 +130,7 @@ impl Group {
 
 impl Dialer {
     /// Probe latency through this dialer to a URL, returning milliseconds.
-    async fn probe_delay(&self, url: &str) -> Option<u16> {
+    pub(crate) async fn probe_delay(&self, url: &str) -> Option<u16> {
         let url = Url::parse(url).ok()?;
         let host = url.host_str()?.to_owned();
         let mut stream = self.connect_for_probe(&url, None).await.ok()?;
@@ -146,9 +147,20 @@ impl Dialer {
         Some(start.elapsed().as_millis().min(u16::MAX as u128) as u16)
     }
 
+    /// A Clash-style type name for this leaf dialer.
+    pub(crate) fn clash_type(&self) -> &'static str {
+        match self {
+            Self::Direct => "Direct",
+            Self::Block => "Reject",
+            Self::AnyTls { .. } => "AnyTLS",
+            Self::Vless { .. } => "VLESS",
+            Self::Group(_) => "Group",
+        }
+    }
+
     /// Establish a TCP stream through this dialer to a probe URL's host and
     /// port, returning the raw byte stream for a latency check.
-    async fn connect_for_probe(&self, url: &Url, resolver: Option<&DnsResolver>) -> Result<BoxIo> {
+    pub(crate) async fn connect_for_probe(&self, url: &Url, resolver: Option<&DnsResolver>) -> Result<BoxIo> {
         let host = url.host_str().context("probe URL has no host")?.to_owned();
         let port = url.port_or_known_default().context("probe URL has no port")?;
         match self {
@@ -188,15 +200,16 @@ impl Dialer {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProxyRuntime {
+pub struct ProxyRuntime {
     dialers: Arc<HashMap<String, Dialer>>,
     groups: Arc<HashMap<String, Arc<Group>>>,
     router: Arc<Router>,
     resolver: Option<Arc<DnsResolver>>,
     tun_output_mark: Option<u32>,
+    clash_mode: Arc<RwLock<Option<String>>>,
 }
 
-pub(crate) async fn build_runtime(
+pub async fn build_runtime(
     outbounds: Vec<Outbound>,
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
@@ -366,6 +379,7 @@ pub(crate) async fn build_runtime(
         router,
         resolver,
         tun_output_mark: None,
+        clash_mode: Arc::new(RwLock::new(std::env::var("XHTTP_CLASH_MODE").ok())),
     };
     runtime.start_url_tests();
     Ok(runtime)
@@ -399,9 +413,44 @@ impl ProxyRuntime {
         self.groups.get(tag)
     }
 
+    pub(crate) fn clash_mode(&self) -> Option<String> {
+        self.clash_mode
+            .read()
+            .expect("clash mode lock poisoned")
+            .clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_clash_mode(&self, mode: Option<String>) {
+        *self
+            .clash_mode
+            .write()
+            .expect("clash mode lock poisoned") = mode;
+    }
+
+    /// Set the route fallback outbound (the GLOBAL selection in a Clash API).
+    pub(crate) fn set_final_outbound(&self, tag: &str) {
+        self.router.set_final_outbound(tag);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn groups(&self) -> &HashMap<String, Arc<Group>> {
         &self.groups
+    }
+
+    /// All outbound tags in declaration-independent order: groups then leaves.
+    pub(crate) fn outbound_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self.groups.keys().cloned().collect();
+        for tag in self.dialers.keys() {
+            if !self.groups.contains_key(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        tags
+    }
+
+    pub(crate) fn is_group(&self, tag: &str) -> bool {
+        self.groups.contains_key(tag)
     }
 
     /// Spawn a background task for each `urltest` group that periodically
@@ -453,28 +502,6 @@ async fn run_url_test(
         let _ = group.select(&best_tag);
         tracing::debug!(%tag, %best_tag, "urltest group updated");
     }
-}
-
-/// Resolve a dialer by tag, following `selector`/`urltest` groups to their
-/// currently selected member. Used by paths that hold dialers and groups
-/// separately (SOCKS/HTTP inbound, UDP associate).
-pub(crate) fn resolve_dialer(
-    dialers: &HashMap<String, Dialer>,
-    groups: &HashMap<String, Arc<Group>>,
-    tag: &str,
-) -> Option<Dialer> {
-    let mut current = tag.to_owned();
-    for _ in 0..8 {
-        match dialers.get(&current) {
-            Some(Dialer::Group(group)) => {
-                current = group.now();
-                continue;
-            }
-            Some(dialer) => return Some(dialer.clone()),
-            None => return groups.get(&current).map(|group| Dialer::Group(group.clone())),
-        }
-    }
-    None
 }
 
 fn start_rule_set_updater(router: Arc<Router>, config: RouteConfig, default_outbound: String) {

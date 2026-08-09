@@ -163,7 +163,7 @@ pub enum RuleAction {
 pub struct Router {
     rules: Arc<RwLock<Vec<CompiledRule>>>,
     rule_sets: Arc<RwLock<HashMap<String, Vec<CompiledRule>>>>,
-    final_outbound: String,
+    final_outbound: Arc<RwLock<String>>,
     default_options: Arc<RwLock<RouteOptions>>,
 }
 
@@ -245,7 +245,7 @@ impl Router {
         Ok(Self {
             rules: Arc::new(RwLock::new(rules)),
             rule_sets: Arc::new(RwLock::new(rule_sets)),
-            final_outbound,
+            final_outbound: Arc::new(RwLock::new(final_outbound)),
             default_options: Arc::new(RwLock::new(RouteOptions {
                 bind_interface: config.default_interface.clone(),
                 routing_mark: config.default_mark,
@@ -267,7 +267,11 @@ impl Router {
                 RuleAction::Route { decision, .. } => Some(decision.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| RouteDecision::Outbound(self.final_outbound.clone()))
+            .unwrap_or_else(|| {
+                RouteDecision::Outbound(
+                    self.final_outbound.read().expect("final outbound lock poisoned").clone(),
+                )
+            })
     }
 
     pub fn next_action(
@@ -286,8 +290,18 @@ impl Router {
             .map(|(index, rule)| (index, rule.action.clone()))
     }
 
-    pub fn final_outbound(&self) -> &str {
-        &self.final_outbound
+    pub fn final_outbound(&self) -> String {
+        self.final_outbound
+            .read()
+            .expect("final outbound lock poisoned")
+            .clone()
+    }
+
+    pub fn set_final_outbound(&self, tag: &str) {
+        *self
+            .final_outbound
+            .write()
+            .expect("final outbound lock poisoned") = tag.to_owned();
     }
 
     pub fn default_options(&self) -> RouteOptions {

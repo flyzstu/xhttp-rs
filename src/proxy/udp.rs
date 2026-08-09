@@ -1,7 +1,7 @@
 use crate::{
     dns::DnsResolver,
     linux_route::LinuxRouteMetadata,
-    routing::{RouteDecision, RouteOptions, Router},
+    routing::{RouteDecision, RouteOptions},
     vless,
 };
 use anyhow::{Context, Result, bail};
@@ -16,16 +16,13 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{Dialer, Group, parse_duration, resolve_dialer};
+use super::{Dialer, ProxyRuntime, parse_duration};
 use super::direct::direct_udp_socket;
 use super::route::{RouteEvaluation, RouteInput, evaluate_udp_route};
 
 pub(super) struct UdpAssociateRuntime<'a> {
     pub(super) inbound: &'a str,
-    pub(super) router: &'a Router,
-    pub(super) resolver: Option<&'a DnsResolver>,
-    pub(super) dialers: &'a HashMap<String, Dialer>,
-    pub(super) groups: &'a HashMap<String, Arc<Group>>,
+    pub(super) runtime: &'a ProxyRuntime,
     pub(super) linux_metadata: LinuxRouteMetadata,
     pub(super) auth_user: Option<String>,
 }
@@ -36,10 +33,7 @@ pub(super) async fn udp_associate(
 ) -> Result<()> {
     let UdpAssociateRuntime {
         inbound,
-        router,
-        resolver,
-        dialers,
-        groups,
+        runtime,
         linux_metadata,
         auth_user,
     } = runtime;
@@ -79,10 +73,11 @@ pub(super) async fn udp_associate(
                     RouteInput {
                         peer: tcp_peer,
                         inbound,
-                        router,
-                        resolver,
+                        router: &runtime.router,
+                        resolver: runtime.resolver.as_deref(),
                         linux: &linux_metadata,
                         auth_user: auth_user.as_deref(),
+                        clash_mode: runtime.clash_mode().as_deref(),
                     },
                 )
                 .await?;
@@ -95,7 +90,7 @@ pub(super) async fn udp_associate(
                     RouteDecision::Outbound(value) => value,
                     RouteDecision::Reject => continue,
                     RouteDecision::HijackDns => {
-                        let Some(resolver) = resolver.cloned() else {
+                        let Some(resolver) = runtime.resolver.clone() else {
                             tracing::warn!("DNS hijack requires a DNS configuration");
                             continue;
                         };
@@ -115,7 +110,7 @@ pub(super) async fn udp_associate(
                         continue;
                     }
                 };
-                let Some(dialer) = resolve_dialer(dialers, groups, &tag) else {
+                let Some(dialer) = runtime.dialer_for(&tag) else {
                     tracing::warn!(outbound = %tag, "UDP route selected an unknown outbound");
                     continue;
                 };
@@ -129,7 +124,7 @@ pub(super) async fn udp_associate(
                     let (sender, receiver) = mpsc::channel(64);
                     sessions.insert(key, sender.clone());
                     let socket = socket.clone();
-                    let resolver = resolver.cloned();
+                    let resolver = runtime.resolver.as_deref().cloned();
                     tokio::spawn(async move {
                         if let Err(error) = udp_session(socket, peer, destination, dialer, resolver, options, receiver).await {
                             tracing::debug!(%error, "SOCKS UDP session closed");

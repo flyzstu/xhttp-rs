@@ -2,6 +2,7 @@
 //! wire formats used by Xray-core and sing-box.
 
 pub mod anytls;
+pub mod clash;
 pub mod client;
 pub mod config;
 pub mod dns;

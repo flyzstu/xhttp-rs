@@ -103,6 +103,22 @@ fn load(path: &str) -> Result<SingBoxConfig> {
 }
 async fn run(config: SingBoxConfig) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
+    let clash_api = config
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.clash_api.clone());
+    let shared_runtime = if clash_api.is_some() {
+        Some(std::sync::Arc::new(
+            xhttp::proxy::build_runtime(
+                config.outbounds.clone(),
+                config.route.clone(),
+                config.dns.clone(),
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
     for inbound in config.inbounds {
         if inbound.r#type == "tun" {
             let outbounds = config.outbounds.clone();
@@ -115,9 +131,13 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();
             let dns = config.dns.clone();
-            tasks.spawn(
-                async move { xhttp::proxy::run_socks(inbound, outbounds, route, dns).await },
-            );
+            if let Some(runtime) = shared_runtime.clone() {
+                tasks.spawn(async move { xhttp::proxy::run_socks_with_runtime(inbound, runtime).await });
+            } else {
+                tasks.spawn(
+                    async move { xhttp::proxy::run_socks(inbound, outbounds, route, dns).await },
+                );
+            }
             continue;
         }
         if inbound.r#type == "anytls" {
@@ -161,6 +181,9 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             tls,
         })?;
         tasks.spawn(server.run());
+    }
+    if let (Some(clash_api), Some(runtime)) = (clash_api, shared_runtime) {
+        tasks.spawn(async move { xhttp::clash::run(clash_api, (*runtime).clone()).await });
     }
     if tasks.is_empty() {
         bail!("no supported inbound found")
