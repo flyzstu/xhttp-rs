@@ -639,7 +639,6 @@ struct UdpNatSession {
 }
 
 struct UdpNatTable {
-    mapping: UdpNatBehavior,
     filtering: UdpNatBehavior,
     max_sessions: usize,
     idle_timeout: std::time::Duration,
@@ -649,13 +648,11 @@ struct UdpNatTable {
 
 impl UdpNatTable {
     fn new(
-        mapping: UdpNatBehavior,
         filtering: UdpNatBehavior,
         max_sessions: usize,
         idle_timeout: std::time::Duration,
     ) -> Self {
         Self {
-            mapping,
             filtering,
             max_sessions,
             idle_timeout,
@@ -664,8 +661,8 @@ impl UdpNatTable {
         }
     }
 
-    fn key(&self, source: SocketAddr, destination: SocketAddr) -> UdpMappingKey {
-        match self.mapping {
+    fn key_for(mapping: UdpNatBehavior, source: SocketAddr, destination: SocketAddr) -> UdpMappingKey {
+        match mapping {
             UdpNatBehavior::EndpointIndependent => UdpMappingKey::Endpoint(source),
             UdpNatBehavior::AddressDependent => UdpMappingKey::Address(source, destination.ip()),
             UdpNatBehavior::AddressAndPortDependent => {
@@ -674,10 +671,12 @@ impl UdpNatTable {
         }
     }
 
-    fn touch_destination(&mut self, key: UdpMappingKey, destination: SocketAddr) {
-        self.expire();
-        if !self.sessions.contains_key(&key) && self.sessions.len() >= self.max_sessions {
-            self.evict_lru();
+
+    /// Combined touch-and-fetch for the hot packet path, avoiding a second
+    /// table lock and deferring expiry until the table is at capacity.
+    fn touch_and_sender(&mut self, key: UdpMappingKey, destination: SocketAddr) -> Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> {
+        if !self.sessions.contains_key(&key) {
+            self.reclaim_if_full();
         }
         self.generation = self.generation.wrapping_add(1);
         let session = self.sessions.entry(key).or_insert_with(|| UdpNatSession {
@@ -691,22 +690,27 @@ impl UdpNatTable {
         session.generation = self.generation;
         session.allowed_addresses.insert(destination.ip());
         session.allowed_endpoints.insert(destination);
-        if session
-            .sender
-            .as_ref()
-            .is_some_and(|sender| sender.is_closed())
-        {
-            session.sender = None;
-        }
-    }
-
-    fn sender(&self, key: UdpMappingKey) -> Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> {
-        self.sessions
-            .get(&key)?
+        session
             .sender
             .as_ref()
             .filter(|sender| !sender.is_closed())
             .cloned()
+    }
+
+    /// Only scan for idle entries when the table is at capacity and a new
+    /// session is about to be inserted; the hot packet path otherwise skips
+    /// the O(sessions) retain.
+    fn reclaim_if_full(&mut self) {
+        if self.sessions.len() < self.max_sessions {
+            return;
+        }
+        let timeout = self.idle_timeout;
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|_, session| session.last_used.elapsed() < timeout);
+        if self.sessions.len() == before && self.sessions.len() >= self.max_sessions {
+            self.evict_lru();
+        }
     }
 
     fn insert_sender(&mut self, key: UdpMappingKey, sender: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
@@ -763,7 +767,6 @@ async fn run_udp(
 ) -> Result<()> {
     let (mut reader, mut writer) = socket.split();
     let table = Arc::new(Mutex::new(UdpNatTable::new(
-        mapping,
         filtering,
         max_sessions,
         idle_timeout,
@@ -788,31 +791,28 @@ async fn run_udp(
         }
     });
     while let Some((payload, source, destination)) = reader.next().await {
-        let key = table
-            .lock()
-            .map_err(|_| anyhow::anyhow!("TUN UDP NAT lock poisoned"))?
-            .key(source, destination);
-        let sender = if let Some(sender) = {
+        let mapping_key = UdpNatTable::key_for(mapping, source, destination);
+        let sender = {
             let mut table = table
                 .lock()
                 .map_err(|_| anyhow::anyhow!("TUN UDP NAT lock poisoned"))?;
-            table.touch_destination(key, destination);
-            table.sender(key)
-        } {
+            table.touch_and_sender(mapping_key, destination)
+        };
+        let sender = if let Some(sender) = sender {
             sender
         } else {
             let (sender, receiver) = mpsc::channel(64);
             table
                 .lock()
                 .map_err(|_| anyhow::anyhow!("TUN UDP NAT lock poisoned"))?
-                .insert_sender(key, sender.clone());
+                .insert_sender(mapping_key, sender.clone());
             let runtime = runtime.clone();
             let inbound = inbound.clone();
             let responses = response_tx.clone();
             let (flow_response_tx, mut flow_response_rx) = mpsc::channel(64);
             tokio::spawn(async move {
                 while let Some(response) = flow_response_rx.recv().await {
-                    if responses.send((key, response)).await.is_err() {
+                    if responses.send((mapping_key, response)).await.is_err() {
                         break;
                     }
                 }
@@ -836,7 +836,7 @@ async fn run_udp(
         };
         if sender.send((payload, destination)).await.is_err()
             && let Ok(mut table) = table.lock()
-            && let Some(session) = table.sessions.get_mut(&key)
+            && let Some(session) = table.sessions.get_mut(&mapping_key)
         {
             session.sender = None;
         }
@@ -992,52 +992,38 @@ mod tests {
         let same_address = "192.0.2.1:5353".parse().unwrap();
         let second = "198.51.100.1:53".parse().unwrap();
 
-        let endpoint = UdpNatTable::new(
-            UdpNatBehavior::EndpointIndependent,
-            UdpNatBehavior::AddressDependent,
-            2,
-            std::time::Duration::from_secs(300),
-        );
-        assert_eq!(endpoint.key(source, first), endpoint.key(source, second));
-        let address = UdpNatTable::new(
-            UdpNatBehavior::AddressDependent,
-            UdpNatBehavior::EndpointIndependent,
-            2,
-            std::time::Duration::from_secs(300),
-        );
+        assert_eq!(UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first), UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, second));
         assert_eq!(
-            address.key(source, first),
-            address.key(source, same_address)
+            UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, first),
+            UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, same_address)
         );
-        assert_ne!(address.key(source, first), address.key(source, second));
+        assert_ne!(UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, first), UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, second));
 
         let mut table = UdpNatTable::new(
-            UdpNatBehavior::EndpointIndependent,
             UdpNatBehavior::AddressAndPortDependent,
             1,
             std::time::Duration::from_secs(300),
         );
-        let key = table.key(source, first);
-        table.touch_destination(key, first);
+        let key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first);
+        table.touch_and_sender(key, first);
         assert!(table.allow_response(key, first));
         assert!(!table.allow_response(key, same_address));
         let (sender, mut receiver) = mpsc::channel(1);
         table.insert_sender(key, sender);
 
         let other_source = "172.19.0.3:53000".parse().unwrap();
-        let other_key = table.key(other_source, second);
-        table.touch_destination(other_key, second);
+        let other_key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, other_source, second);
+        table.touch_and_sender(other_key, second);
         assert!(!table.sessions.contains_key(&key));
         assert!(receiver.recv().await.is_none());
 
         let mut expiring = UdpNatTable::new(
             UdpNatBehavior::EndpointIndependent,
-            UdpNatBehavior::EndpointIndependent,
             2,
             std::time::Duration::from_millis(1),
         );
-        let expiring_key = expiring.key(source, first);
-        expiring.touch_destination(expiring_key, first);
+        let expiring_key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first);
+        expiring.touch_and_sender(expiring_key, first);
         expiring.sessions.get_mut(&expiring_key).unwrap().last_used -=
             std::time::Duration::from_secs(1);
         expiring.expire();
