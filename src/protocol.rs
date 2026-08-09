@@ -103,7 +103,10 @@ pub fn valid_padding(config: &TransportConfig, uri: &Uri, headers: &HeaderMap) -
     };
     let Some(value) = value else { return false };
     let length = if config.padding_method == "tokenish" {
-        huffman_length(value.as_bytes())
+        HUFFMAN_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            huffman_length(value.as_bytes(), &mut scratch)
+        })
     } else {
         value.len()
     };
@@ -148,17 +151,23 @@ fn padding_value(method: &str, length: usize) -> String {
     }
     const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut value = Vec::with_capacity(length + length / 2 + 8);
-    for index in 0..value.capacity() {
-        value.push(ALPHABET[(index * 37 + length * 17) % ALPHABET.len()]);
-        if huffman_length(&value) >= length {
-            break;
+    HUFFMAN_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        for index in 0..value.capacity() {
+            value.push(ALPHABET[(index * 37 + length * 17) % ALPHABET.len()]);
+            if huffman_length(&value, &mut scratch) >= length {
+                break;
+            }
         }
-    }
+    });
     String::from_utf8(value).unwrap_or_default()
 }
-fn huffman_length(value: &[u8]) -> usize {
-    let mut encoded = Vec::new();
-    if httlib_huffman::encode(value, &mut encoded).is_ok() {
+thread_local! {
+    static HUFFMAN_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn huffman_length(value: &[u8], encoded: &mut Vec<u8>) -> usize {
+    encoded.clear();
+    if httlib_huffman::encode(value, encoded).is_ok() {
         encoded.len()
     } else {
         value.len()
