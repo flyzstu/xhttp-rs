@@ -244,12 +244,21 @@ Implemented rule-set sources:
 | `src/xmux.rs` | XHTTP HTTP-client pool selection, reuse, and request budgets |
 | `src/server.rs` | XHTTP server, HTTP/3 server, sessions, ordering, and limits |
 | `src/vless.rs` | VLESS handshake, TCP, classic UDP, and XUDP |
-| `src/proxy.rs` | SOCKS/HTTP/mixed/TUN flow dispatch, outbound dispatch, and UDP relay |
+| `src/proxy/mod.rs` | Proxy runtime, outbound dialer construction, and flow dispatch |
+| `src/proxy/relay.rs` | AnyTLS/TUN TCP and UDP relay entry points and first-packet writing |
+| `src/proxy/inbound.rs` | SOCKS/HTTP/mixed inbound listener, handshakes, and authentication |
+| `src/proxy/route.rs` | Route evaluation, sniffing, and destination override |
+| `src/proxy/udp.rs` | SOCKS UDP associate, UDP sessions, DNS relay, and UDP destination mapping |
+| `src/proxy/direct.rs` | Direct TCP/UDP connection helpers and Linux socket options |
+| `src/dns/mod.rs` | DNS resolver, lookup, exchange, ECH, rule selection, and singleflight |
+| `src/dns/cache.rs` | DNS cache entries, LRU/expiry eviction, and flight coordination |
+| `src/dns/transport.rs` | DNS UDP multiplexer, TCP/DoT pools, and HTTPS transport |
+| `src/dns/message.rs` | DNS message parsing, query building, TTL rewriting, and ECH parsing |
 | `src/tun.rs` | Linux TUN device, Tokio packet pumps, smoltcp TCP/UDP lifecycle |
 | `src/tun_route_linux.rs` | Transactional Linux auto-route/strict-route policy rules |
 | `src/anytls.rs` | AnyTLS TLS setup, sing-box client conversion, and inbound runtime |
-| `src/dns.rs` | DNS transports, parsing, lookup, selection, and caching |
 | `src/routing.rs` | Rule compilation, rule-set loading, matching, and actions |
+| `src/util.rs` | Shared duration/address-string helpers |
 | `src/main.rs` | CLI, logging, config loading, and task lifecycle |
 | `tests/interop.sh` | sing-box/Xray end-to-end compatibility matrix |
 | `fuzz/` | cargo-fuzz targets for six untrusted parser surfaces |

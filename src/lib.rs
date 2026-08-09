@@ -18,6 +18,7 @@ pub mod tun;
 mod tun_redirect_linux;
 #[cfg(target_os = "linux")]
 mod tun_route_linux;
+pub(crate) mod util;
 pub mod vless;
 mod xmux;
 

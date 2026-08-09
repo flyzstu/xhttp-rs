@@ -698,22 +698,7 @@ fn load_static_ech(tls: &TlsConfig) -> Result<Option<Vec<u8>>> {
 }
 
 fn parse_duration(value: Option<&str>, default: Duration) -> Result<Duration> {
-    let Some(value) = value else {
-        return Ok(default);
-    };
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
-        (number, Duration::from_millis(1))
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, Duration::from_secs(1))
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, Duration::from_secs(60))
-    } else if let Some(number) = value.strip_suffix('h') {
-        (number, Duration::from_secs(3600))
-    } else {
-        bail!("invalid AnyTLS duration: {value}")
-    };
-    let count: u32 = number.parse().context("parse AnyTLS duration")?;
-    Ok(multiplier * count)
+    crate::util::parse_duration_or(value, default).context("invalid AnyTLS duration")
 }
 
 #[cfg(test)]
