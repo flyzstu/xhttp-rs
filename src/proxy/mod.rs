@@ -229,15 +229,7 @@ impl DetourProvider {
     }
 
     fn resolve(&self, tag: &str) -> Option<Dialer> {
-        let mut current = tag.to_owned();
-        for _ in 0..8 {
-            if let Dialer::Group(group) = self.dialers.get(&current)? {
-                current = group.now();
-                continue;
-            }
-            return self.dialers.get(&current).cloned();
-        }
-        None
+        resolve_grouped_dialer(&self.dialers, tag)
     }
 }
 
@@ -752,9 +744,24 @@ pub async fn build_runtime(
         resolver,
         tun_output_mark: None,
         clash_mode: Arc::new(RwLock::new(std::env::var("XHTTP_CLASH_MODE").ok())),
+        provider,
     };
     runtime.start_url_tests();
     Ok(runtime)
+}
+
+/// Resolve an outbound tag to a leaf dialer, following selector/urltest
+/// groups to their currently selected member.
+fn resolve_grouped_dialer(dialers: &HashMap<String, Dialer>, tag: &str) -> Option<Dialer> {
+    let mut current = tag.to_owned();
+    for _ in 0..8 {
+        if let Dialer::Group(group) = dialers.get(&current)? {
+            current = group.now();
+            continue;
+        }
+        return dialers.get(&current).cloned();
+    }
+    None
 }
 
 impl ProxyRuntime {

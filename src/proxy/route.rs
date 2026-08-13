@@ -31,6 +31,149 @@ pub(super) struct RouteInput<'a> {
     pub(super) auth_user: Option<&'a str>,
     pub(super) clash_mode: Option<&'a str>,
 }
+
+/// Mutable state shared by route evaluation loops: the candidate destination
+/// addresses and the lazy-resolution bookkeeping.
+struct RouteState {
+    domain: Option<String>,
+    destination_ip: Option<IpAddr>,
+    destination_ips: Vec<IpAddr>,
+    cursor: usize,
+    resolved: bool,
+}
+
+impl RouteState {
+    fn new(destination: &vless::Destination) -> Self {
+        let (domain, destination_ip) = match destination {
+            vless::Destination::Domain(value, _) => (Some(value.clone()), None),
+            vless::Destination::Ip(value, _) => (None, Some(*value)),
+        };
+        Self {
+            domain,
+            destination_ip,
+            destination_ips: Vec::new(),
+            cursor: 0,
+            resolved: false,
+        }
+    }
+
+    fn context<'a>(&'a self, input: &'a RouteInput<'_>, destination: &'a vless::Destination, network: &'a str, detected_protocol: Option<&'a str>, detected_client: Option<&'a str>) -> RouteContext<'a> {
+        RouteContext {
+            domain: self.domain.as_deref(),
+            destination_ip: self.destination_ip,
+            destination_ips: &self.destination_ips,
+            destination_port: Some(destination.port()),
+            source_ip: Some(input.peer.ip()),
+            source_port: Some(input.peer.port()),
+            network: Some(network),
+            protocol: detected_protocol,
+            client: detected_client,
+            inbound: Some(input.inbound),
+            auth_user: input.auth_user,
+            process_name: input.linux.process_name.as_deref(),
+            process_path: input.linux.process_path.as_deref(),
+            user: input.linux.user.as_deref(),
+            user_id: input.linux.user_id,
+            clash_mode: input.clash_mode,
+            network_type: input.linux.network_type.as_deref(),
+            network_is_expensive: input.linux.network_is_expensive,
+            network_is_constrained: input.linux.network_is_constrained,
+            wifi_ssid: input.linux.wifi_ssid.as_deref(),
+            wifi_bssid: input.linux.wifi_bssid.as_deref(),
+            interface_addresses: Some(&input.linux.interface_addresses),
+            network_interface_addresses: Some(&input.linux.network_interface_addresses),
+            source_mac_address: input.linux.source_mac_address.as_deref(),
+            source_hostname: input.linux.source_hostname.as_deref(),
+            default_interface_addresses: &input.linux.default_interface_addresses,
+            ..Default::default()
+        }
+    }
+
+    /// Apply a `resolve` route action: resolve the domain (via the action's
+    /// server or the router's default_domain_resolver) into candidate
+    /// addresses.
+    async fn resolve_action(
+        &mut self,
+        router: &Router,
+        resolver: Option<&DnsResolver>,
+        action: RuleAction,
+    ) -> Result<()> {
+        let RuleAction::Resolve {
+            server,
+            timeout,
+            strategy,
+            disable_cache,
+            rewrite_ttl,
+            client_subnet,
+        } = action
+        else {
+            return Ok(());
+        };
+        let (Some(name), Some(resolver)) = (self.domain.as_deref(), resolver) else {
+            return Ok(());
+        };
+        self.destination_ips = resolve_for_route(
+            resolver,
+            name,
+            crate::dns::LookupOptions {
+                server: server
+                    .as_deref()
+                    .or(router.default_domain_resolver().as_deref()),
+                disable_cache,
+                rewrite_ttl,
+                timeout: timeout.as_deref().map(|value| parse_duration(Some(value))),
+                strategy: strategy.as_deref(),
+                client_subnet: client_subnet.as_deref(),
+            },
+        )
+        .await?;
+        self.destination_ip = select_address(self.destination_ips.clone(), strategy.as_deref());
+        self.resolved = true;
+        Ok(())
+    }
+
+    /// Handle a `NeedResolve` result: resolve the domain once through the
+    /// router's default_domain_resolver, retrying the rule on success or
+    /// skipping it when resolution yields nothing.
+    async fn need_resolve(
+        &mut self,
+        router: &Router,
+        resolver: Option<&DnsResolver>,
+        index: usize,
+    ) {
+        let (Some(name), Some(resolver)) = (self.domain.as_deref(), resolver) else {
+            self.cursor = index + 1;
+            return;
+        };
+        let server = router.default_domain_resolver();
+        self.destination_ips = resolve_for_route(
+            resolver,
+            name,
+            crate::dns::LookupOptions {
+                server: server.as_deref(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_default();
+        self.resolved = true;
+        if self.destination_ips.is_empty() {
+            self.cursor = index + 1;
+        } else {
+            self.destination_ip = self.destination_ips.first().copied();
+            self.cursor = index;
+        }
+    }
+
+    fn resolved_addresses(&self) -> Vec<IpAddr> {
+        if self.resolved {
+            self.destination_ips.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 pub(super) async fn evaluate_tcp_route(
     local: &TcpStream,
     initial: &[u8],
@@ -38,63 +181,24 @@ pub(super) async fn evaluate_tcp_route(
     input: RouteInput<'_>,
 ) -> Result<RouteEvaluation> {
     let RouteInput {
-        peer,
-        inbound,
+        peer: _,
+        inbound: _,
         router,
         resolver,
-        linux,
-        auth_user,
-        clash_mode,
+        linux: _,
+        auth_user: _,
+        clash_mode: _,
     } = input;
-    let mut domain = match &destination {
-        vless::Destination::Domain(value, _) => Some(value.clone()),
-        vless::Destination::Ip(_, _) => None,
-    };
-    let mut destination_ip = match destination {
-        vless::Destination::Ip(value, _) => Some(value),
-        vless::Destination::Domain(_, _) => None,
-    };
-    let mut destination_ips: Vec<IpAddr> = Vec::new();
+    let mut state = RouteState::new(&destination);
     let mut detected_protocol = None;
     let mut detected_client = None;
-
     let mut options = router.default_options();
-    let mut cursor = 0;
-    let mut resolved = false;
     let decision = loop {
-        let context = RouteContext {
-            domain: domain.as_deref(),
-            destination_ip,
-            destination_ips: &destination_ips,
-            destination_port: Some(destination.port()),
-            source_ip: Some(peer.ip()),
-            source_port: Some(peer.port()),
-            network: Some("tcp"),
-            protocol: detected_protocol.as_deref(),
-            client: detected_client.as_deref(),
-            inbound: Some(inbound),
-            auth_user,
-            process_name: linux.process_name.as_deref(),
-            process_path: linux.process_path.as_deref(),
-            user: linux.user.as_deref(),
-            user_id: linux.user_id,
-            clash_mode,
-            network_type: linux.network_type.as_deref(),
-            network_is_expensive: linux.network_is_expensive,
-            network_is_constrained: linux.network_is_constrained,
-            wifi_ssid: linux.wifi_ssid.as_deref(),
-            wifi_bssid: linux.wifi_bssid.as_deref(),
-            interface_addresses: Some(&linux.interface_addresses),
-            network_interface_addresses: Some(&linux.network_interface_addresses),
-            source_mac_address: linux.source_mac_address.as_deref(),
-            source_hostname: linux.source_hostname.as_deref(),
-            default_interface_addresses: &linux.default_interface_addresses,
-            ..Default::default()
-        };
-        match router.next_action_lazy(&context, cursor) {
+        let context = state.context(&input, &destination, "tcp", detected_protocol.as_deref(), detected_client.as_deref());
+        match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
-                cursor = index + 1;
+                state.cursor = index + 1;
                 match action {
                     RuleAction::Route {
                         decision,
@@ -104,35 +208,8 @@ pub(super) async fn evaluate_tcp_route(
                         break decision;
                     }
                     RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-                    RuleAction::Resolve {
-                        server,
-                        timeout,
-                        strategy,
-                        disable_cache,
-                        rewrite_ttl,
-                        client_subnet,
-                    } => {
-                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                            destination_ips = resolve_for_route(
-                                resolver,
-                                name,
-                                crate::dns::LookupOptions {
-                                    server: server
-                                        .as_deref()
-                                        .or(router.default_domain_resolver().as_deref()),
-                                    disable_cache,
-                                    rewrite_ttl,
-                                    timeout: timeout
-                                        .as_deref()
-                                        .map(|value| parse_duration(Some(value))),
-                                    strategy: strategy.as_deref(),
-                                    client_subnet: client_subnet.as_deref(),
-                                },
-                            )
-                            .await?;
-                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
-                            resolved = true;
-                        }
+                    RuleAction::Resolve { .. } => {
+                        state.resolve_action(router, resolver, action).await?;
                     }
                     RuleAction::Sniff { sniffers, timeout } => {
                         let sniffed = sniff_tcp(
@@ -146,47 +223,25 @@ pub(super) async fn evaluate_tcp_route(
                             detected_protocol = Some(sniffed.protocol);
                             detected_client = sniffed.client;
                             if sniffed.domain.is_some() {
-                                domain = sniffed.domain;
+                                state.domain = sniffed.domain;
                             }
                         }
                     }
                 }
             }
             ActionLookup::NeedResolve { index } => {
-                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
-                    cursor = index + 1;
-                    continue;
-                };
-                let server = router.default_domain_resolver();
-                destination_ips = resolve_for_route(
-                    resolver,
-                    name,
-                    crate::dns::LookupOptions {
-                        server: server.as_deref(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap_or_default();
-                resolved = true;
-                if destination_ips.is_empty() {
-                    cursor = index + 1;
-                    continue;
-                }
-                destination_ip = destination_ips.first().copied();
-                cursor = index;
+                state.need_resolve(router, resolver, index).await;
             }
             ActionLookup::None => {
                 break RouteDecision::Outbound(router.final_outbound().to_owned());
             }
         }
     };
-    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok(RouteEvaluation {
         decision,
         destination: override_destination(destination, &options)?,
         options,
-        resolved_addresses,
+        resolved_addresses: state.resolved_addresses(),
     })
 }
 pub(super) async fn evaluate_stream_tcp_route<S>(
@@ -198,64 +253,25 @@ where
     S: AsyncRead + Unpin,
 {
     let RouteInput {
-        peer,
-        inbound,
+        peer: _,
+        inbound: _,
         router,
         resolver,
-        linux,
-        auth_user,
-        clash_mode,
+        linux: _,
+        auth_user: _,
+        clash_mode: _,
     } = input;
-    let mut domain = match &destination {
-        vless::Destination::Domain(value, _) => Some(value.clone()),
-        vless::Destination::Ip(_, _) => None,
-    };
-    let mut destination_ip = match &destination {
-        vless::Destination::Ip(value, _) => Some(*value),
-        vless::Destination::Domain(_, _) => None,
-    };
-    let mut destination_ips: Vec<IpAddr> = Vec::new();
+    let mut state = RouteState::new(&destination);
     let mut initial = Vec::new();
     let mut detected_protocol = None;
     let mut detected_client = None;
-
     let mut options = router.default_options();
-    let mut cursor = 0;
-    let mut resolved = false;
     let decision = loop {
-        let context = RouteContext {
-            domain: domain.as_deref(),
-            destination_ip,
-            destination_ips: &destination_ips,
-            destination_port: Some(destination.port()),
-            source_ip: Some(peer.ip()),
-            source_port: Some(peer.port()),
-            network: Some("tcp"),
-            protocol: detected_protocol.as_deref(),
-            client: detected_client.as_deref(),
-            inbound: Some(inbound),
-            auth_user,
-            process_name: linux.process_name.as_deref(),
-            process_path: linux.process_path.as_deref(),
-            user: linux.user.as_deref(),
-            user_id: linux.user_id,
-            clash_mode,
-            network_type: linux.network_type.as_deref(),
-            network_is_expensive: linux.network_is_expensive,
-            network_is_constrained: linux.network_is_constrained,
-            wifi_ssid: linux.wifi_ssid.as_deref(),
-            wifi_bssid: linux.wifi_bssid.as_deref(),
-            interface_addresses: Some(&linux.interface_addresses),
-            network_interface_addresses: Some(&linux.network_interface_addresses),
-            source_mac_address: linux.source_mac_address.as_deref(),
-            source_hostname: linux.source_hostname.as_deref(),
-            default_interface_addresses: &linux.default_interface_addresses,
-            ..Default::default()
-        };
-        match router.next_action_lazy(&context, cursor) {
+        let context = state.context(&input, &destination, "tcp", detected_protocol.as_deref(), detected_client.as_deref());
+        match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
-                cursor = index + 1;
+                state.cursor = index + 1;
                 match action {
                     RuleAction::Route {
                         decision,
@@ -265,35 +281,8 @@ where
                         break decision;
                     }
                     RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-                    RuleAction::Resolve {
-                        server,
-                        timeout,
-                        strategy,
-                        disable_cache,
-                        rewrite_ttl,
-                        client_subnet,
-                    } => {
-                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                            destination_ips = resolve_for_route(
-                                resolver,
-                                name,
-                                crate::dns::LookupOptions {
-                                    server: server
-                                        .as_deref()
-                                        .or(router.default_domain_resolver().as_deref()),
-                                    disable_cache,
-                                    rewrite_ttl,
-                                    timeout: timeout
-                                        .as_deref()
-                                        .map(|value| parse_duration(Some(value))),
-                                    strategy: strategy.as_deref(),
-                                    client_subnet: client_subnet.as_deref(),
-                                },
-                            )
-                            .await?;
-                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
-                            resolved = true;
-                        }
+                    RuleAction::Resolve { .. } => {
+                        state.resolve_action(router, resolver, action).await?;
                     }
                     RuleAction::Sniff { sniffers, timeout } => {
                         if initial.is_empty() {
@@ -312,48 +301,26 @@ where
                             detected_protocol = Some(sniffed.protocol);
                             detected_client = sniffed.client;
                             if sniffed.domain.is_some() {
-                                domain = sniffed.domain;
+                                state.domain = sniffed.domain;
                             }
                         }
                     }
                 }
             }
             ActionLookup::NeedResolve { index } => {
-                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
-                    cursor = index + 1;
-                    continue;
-                };
-                let server = router.default_domain_resolver();
-                destination_ips = resolve_for_route(
-                    resolver,
-                    name,
-                    crate::dns::LookupOptions {
-                        server: server.as_deref(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap_or_default();
-                resolved = true;
-                if destination_ips.is_empty() {
-                    cursor = index + 1;
-                    continue;
-                }
-                destination_ip = destination_ips.first().copied();
-                cursor = index;
+                state.need_resolve(router, resolver, index).await;
             }
             ActionLookup::None => {
                 break RouteDecision::Outbound(router.final_outbound().to_owned());
             }
         }
     };
-    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok((
         RouteEvaluation {
             decision,
             destination: override_destination(destination, &options)?,
             options,
-            resolved_addresses,
+            resolved_addresses: state.resolved_addresses(),
         },
         initial,
     ))
@@ -364,63 +331,24 @@ pub(super) async fn evaluate_udp_route(
     input: RouteInput<'_>,
 ) -> Result<RouteEvaluation> {
     let RouteInput {
-        peer,
-        inbound,
+        peer: _,
+        inbound: _,
         router,
         resolver,
-        linux,
-        auth_user,
-        clash_mode,
+        linux: _,
+        auth_user: _,
+        clash_mode: _,
     } = input;
-    let mut domain = match &destination {
-        vless::Destination::Domain(value, _) => Some(value.clone()),
-        vless::Destination::Ip(_, _) => None,
-    };
-    let mut destination_ip = match &destination {
-        vless::Destination::Ip(value, _) => Some(*value),
-        vless::Destination::Domain(_, _) => None,
-    };
-    let mut destination_ips: Vec<IpAddr> = Vec::new();
+    let mut state = RouteState::new(&destination);
     let mut detected_protocol = None;
     let mut detected_client = None;
-
     let mut options = router.default_options();
-    let mut cursor = 0;
-    let mut resolved = false;
     let decision = loop {
-        let context = RouteContext {
-            domain: domain.as_deref(),
-            destination_ip,
-            destination_ips: &destination_ips,
-            destination_port: Some(destination.port()),
-            source_ip: Some(peer.ip()),
-            source_port: Some(peer.port()),
-            network: Some("udp"),
-            protocol: detected_protocol.as_deref(),
-            client: detected_client.as_deref(),
-            inbound: Some(inbound),
-            auth_user,
-            process_name: linux.process_name.as_deref(),
-            process_path: linux.process_path.as_deref(),
-            user: linux.user.as_deref(),
-            user_id: linux.user_id,
-            clash_mode,
-            network_type: linux.network_type.as_deref(),
-            network_is_expensive: linux.network_is_expensive,
-            network_is_constrained: linux.network_is_constrained,
-            wifi_ssid: linux.wifi_ssid.as_deref(),
-            wifi_bssid: linux.wifi_bssid.as_deref(),
-            interface_addresses: Some(&linux.interface_addresses),
-            network_interface_addresses: Some(&linux.network_interface_addresses),
-            source_mac_address: linux.source_mac_address.as_deref(),
-            source_hostname: linux.source_hostname.as_deref(),
-            default_interface_addresses: &linux.default_interface_addresses,
-            ..Default::default()
-        };
-        match router.next_action_lazy(&context, cursor) {
+        let context = state.context(&input, &destination, "udp", detected_protocol.as_deref(), detected_client.as_deref());
+        match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
-                cursor = index + 1;
+                state.cursor = index + 1;
                 match action {
                     RuleAction::Route {
                         decision,
@@ -430,35 +358,8 @@ pub(super) async fn evaluate_udp_route(
                         break decision;
                     }
                     RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-                    RuleAction::Resolve {
-                        server,
-                        timeout,
-                        strategy,
-                        disable_cache,
-                        rewrite_ttl,
-                        client_subnet,
-                    } => {
-                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                            destination_ips = resolve_for_route(
-                                resolver,
-                                name,
-                                crate::dns::LookupOptions {
-                                    server: server
-                                        .as_deref()
-                                        .or(router.default_domain_resolver().as_deref()),
-                                    disable_cache,
-                                    rewrite_ttl,
-                                    timeout: timeout
-                                        .as_deref()
-                                        .map(|value| parse_duration(Some(value))),
-                                    strategy: strategy.as_deref(),
-                                    client_subnet: client_subnet.as_deref(),
-                                },
-                            )
-                            .await?;
-                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
-                            resolved = true;
-                        }
+                    RuleAction::Resolve { .. } => {
+                        state.resolve_action(router, resolver, action).await?;
                     }
                     RuleAction::Sniff {
                         sniffers,
@@ -468,47 +369,25 @@ pub(super) async fn evaluate_udp_route(
                             detected_protocol = Some(sniffed.protocol);
                             detected_client = sniffed.client;
                             if sniffed.domain.is_some() {
-                                domain = sniffed.domain;
+                                state.domain = sniffed.domain;
                             }
                         }
                     }
                 }
             }
             ActionLookup::NeedResolve { index } => {
-                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
-                    cursor = index + 1;
-                    continue;
-                };
-                let server = router.default_domain_resolver();
-                destination_ips = resolve_for_route(
-                    resolver,
-                    name,
-                    crate::dns::LookupOptions {
-                        server: server.as_deref(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap_or_default();
-                resolved = true;
-                if destination_ips.is_empty() {
-                    cursor = index + 1;
-                    continue;
-                }
-                destination_ip = destination_ips.first().copied();
-                cursor = index;
+                state.need_resolve(router, resolver, index).await;
             }
             ActionLookup::None => {
                 break RouteDecision::Outbound(router.final_outbound().to_owned());
             }
         }
     };
-    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok(RouteEvaluation {
         decision,
         destination: override_destination(destination, &options)?,
         options,
-        resolved_addresses,
+        resolved_addresses: state.resolved_addresses(),
     })
 }
 async fn resolve_for_route(
