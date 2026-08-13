@@ -50,8 +50,9 @@ pub async fn run_inbound(
     outbounds: Vec<Outbound>,
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
+    http_clients: Vec<crate::singbox::HttpClientConfig>,
 ) -> Result<()> {
-    let runtime = Arc::new(crate::proxy::build_runtime(outbounds, route, dns).await?);
+    let runtime = Arc::new(crate::proxy::build_runtime(outbounds, route, dns, http_clients).await?);
     let listen = socket(
         inbound.listen.as_deref().unwrap_or("::"),
         inbound

@@ -51,6 +51,7 @@ pub(crate) async fn relay_anytls_tcp(
         decision,
         destination,
         options,
+        resolved_addresses,
     } = evaluation;
     if decision == RouteDecision::HijackDns {
         let resolver = runtime
@@ -83,7 +84,7 @@ pub(crate) async fn relay_anytls_tcp(
                     .as_deref()
                     .map(|value| parse_duration(Some(value)))
                     .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-                connect_direct(&destination, runtime.resolver.as_deref(), &options),
+                connect_direct(&destination, runtime.resolver.as_deref(), &options, &resolved_addresses),
             )
             .await
             .context("AnyTLS target connect timeout")??;
@@ -147,6 +148,7 @@ pub(crate) async fn relay_tun_tcp(
         decision,
         destination,
         mut options,
+        resolved_addresses,
     } = evaluation;
     if let Some(mark) = runtime.tun_output_mark {
         options.routing_mark = Some(mark);
@@ -178,7 +180,7 @@ pub(crate) async fn relay_tun_tcp(
                     .as_deref()
                     .map(|value| parse_duration(Some(value)))
                     .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-                connect_direct(&destination, runtime.resolver.as_deref(), &options),
+                connect_direct(&destination, runtime.resolver.as_deref(), &options, &resolved_addresses),
             )
             .await
             .context("TUN target connect timeout")??;
@@ -245,6 +247,7 @@ pub(crate) async fn relay_anytls_udp(
         decision,
         destination,
         options,
+        resolved_addresses: _,
     } = evaluation;
     let routed_destination = to_anytls_destination(&destination);
     if decision == RouteDecision::HijackDns {
@@ -575,6 +578,7 @@ pub(crate) async fn relay_tun_udp(
         decision,
         destination,
         mut options,
+        resolved_addresses: _,
     } = evaluation;
     if let Some(mark) = runtime.tun_output_mark {
         options.routing_mark = Some(mark);

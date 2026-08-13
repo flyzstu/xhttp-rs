@@ -14,6 +14,7 @@ pub(super) async fn connect_direct(
     destination: &vless::Destination,
     resolver: Option<&DnsResolver>,
     options: &RouteOptions,
+    prefer_resolved: &[IpAddr],
 ) -> Result<TcpStream> {
     let timeout_duration = options
         .connect_timeout
@@ -23,7 +24,12 @@ pub(super) async fn connect_direct(
     let mut addresses = match destination {
         vless::Destination::Ip(ip, port) => vec![SocketAddr::new(*ip, *port)],
         vless::Destination::Domain(host, p) => {
-            if let Some(r) = resolver {
+            if !prefer_resolved.is_empty() {
+                prefer_resolved
+                    .iter()
+                    .map(|address| SocketAddr::new(*address, *p))
+                    .collect()
+            } else if let Some(r) = resolver {
                 r.lookup(host)
                     .await?
                     .into_iter()

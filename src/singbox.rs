@@ -85,6 +85,13 @@ pub struct SingBoxConfig {
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
     pub experimental: Option<ExperimentalConfig>,
+    pub http_clients: Vec<HttpClientConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct HttpClientConfig {
+    pub tag: String,
+    pub detour: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -131,6 +138,7 @@ pub struct DnsServer {
     pub server: Option<String>,
     pub server_port: Option<u16>,
     pub path: Option<String>,
+    pub detour: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -148,6 +156,8 @@ pub struct DnsRule {
     pub domain_keyword: Vec<String>,
     #[serde(deserialize_with = "one_or_many")]
     pub domain_regex: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub rule_set: Vec<String>,
     pub server: Option<String>,
     pub action: Option<String>,
     pub outbound: Option<String>,
@@ -160,6 +170,13 @@ pub struct DnsRule {
     pub client_subnet: Option<String>,
     pub method: Option<String>,
     pub no_drop: bool,
+    pub rcode: Option<serde_json::Value>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub answer: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub ns: Vec<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub extra: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -173,6 +190,8 @@ pub struct RouteConfig {
     pub default_mark: Option<u32>,
     pub default_network_strategy: Option<String>,
     pub default_fallback_delay: Option<String>,
+    pub default_http_client: Option<String>,
+    pub default_domain_resolver: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -667,6 +686,28 @@ impl SingBoxConfig {
                 }
             }
         }
+        let http_client_tags: std::collections::HashSet<_> =
+            self.http_clients.iter().map(|client| &client.tag).collect();
+        for client in &self.http_clients {
+            if client.tag.is_empty() {
+                bail!("http_client requires a tag")
+            }
+            if let Some(detour) = &client.detour
+                && !detour.is_empty()
+                && !outbound_tags.contains(detour)
+            {
+                bail!("http_client {} detour references unknown outbound: {detour}", client.tag)
+            }
+        }
+        if let Some(default_http_client) = self
+            .route
+            .as_ref()
+            .and_then(|route| route.default_http_client.as_deref())
+            .filter(|tag| !tag.is_empty())
+            && !http_client_tags.iter().any(|tag| tag.as_str() == default_http_client)
+        {
+            bail!("route default_http_client references unknown http_client: {default_http_client}")
+        }
         if let Some(route) = &self.route {
             crate::routing::Router::compile(
                 route,
@@ -685,6 +726,28 @@ impl SingBoxConfig {
             }
         }
         if let Some(dns) = &self.dns {
+            let rule_set_tags: std::collections::HashSet<_> = self
+                .route
+                .as_ref()
+                .map(|route| route.rule_set.iter().map(|set| &set.tag))
+                .into_iter()
+                .flatten()
+                .collect();
+            for rule in &dns.rules {
+                for tag in &rule.rule_set {
+                    if !rule_set_tags.contains(tag) {
+                        bail!("DNS rule references unknown rule-set: {tag}")
+                    }
+                }
+            }
+            for server in &dns.servers {
+                if let Some(detour) = &server.detour
+                    && !detour.is_empty()
+                    && !outbound_tags.contains(detour)
+                {
+                    bail!("DNS server {} detour references unknown outbound: {detour}", server.tag)
+                }
+            }
             crate::dns::DnsResolver::new(dns)?;
             let tags: std::collections::HashSet<_> =
                 dns.servers.iter().map(|server| &server.tag).collect();
@@ -692,6 +755,15 @@ impl SingBoxConfig {
                 if !tags.contains(tag) {
                     bail!("DNS rule references unknown server: {tag}")
                 }
+            }
+            if let Some(resolver_tag) = self
+                .route
+                .as_ref()
+                .and_then(|route| route.default_domain_resolver.as_deref())
+                .filter(|tag| !tag.is_empty())
+                && !tags.iter().any(|tag| tag.as_str() == resolver_tag)
+            {
+                bail!("route default_domain_resolver references unknown DNS server: {resolver_tag}")
             }
         }
         if self

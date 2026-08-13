@@ -85,6 +85,7 @@ pub(super) async fn udp_associate(
                     decision,
                     destination,
                     options,
+                    resolved_addresses: _,
                 } = evaluation;
                 let tag = match decision {
                     RouteDecision::Outbound(value) => value,

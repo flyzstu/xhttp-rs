@@ -322,7 +322,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        build_runtime(outbounds, Some(RouteConfig::default()), None)
+        build_runtime(outbounds, Some(RouteConfig::default()), None, Vec::new())
             .await
             .unwrap()
     }

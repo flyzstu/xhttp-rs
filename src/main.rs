@@ -113,6 +113,7 @@ async fn run(config: SingBoxConfig) -> Result<()> {
                 config.outbounds.clone(),
                 config.route.clone(),
                 config.dns.clone(),
+                config.http_clients.clone(),
             )
             .await?,
         ))
@@ -124,18 +125,20 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();
             let dns = config.dns.clone();
-            tasks.spawn(async move { xhttp::tun::run(inbound, outbounds, route, dns).await });
+            let http_clients = config.http_clients.clone();
+            tasks.spawn(async move { xhttp::tun::run(inbound, outbounds, route, dns, http_clients).await });
             continue;
         }
         if matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();
             let dns = config.dns.clone();
+            let http_clients = config.http_clients.clone();
             if let Some(runtime) = shared_runtime.clone() {
                 tasks.spawn(async move { xhttp::proxy::run_socks_with_runtime(inbound, runtime).await });
             } else {
                 tasks.spawn(
-                    async move { xhttp::proxy::run_socks(inbound, outbounds, route, dns).await },
+                    async move { xhttp::proxy::run_socks(inbound, outbounds, route, dns, http_clients).await },
                 );
             }
             continue;
@@ -144,8 +147,9 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();
             let dns = config.dns.clone();
+            let http_clients = config.http_clients.clone();
             tasks.spawn(
-                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns).await },
+                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns, http_clients).await },
             );
             continue;
         }

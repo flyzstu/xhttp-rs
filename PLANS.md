@@ -190,6 +190,16 @@ Rust smoltcp data plane; the native `system` stack is not implemented.
 - bounded O(1)-amortized LRU eviction and an expiry heap
 - per-domain upstream selection by exact domain, suffix, or keyword
 - raw DNS message exchange for DNS hijacking
+- per-server `detour` outbound: UDP servers query through the outbound's UDP
+  session (VLESS XUDP, AnyTLS UoT, or a direct socket), TCP/DoT servers use a
+  tunneled TCP stream, and groups are followed to their current member
+- DNS rules can reference route rule-sets by tag: geosite-style (domain)
+  rule-sets match the query name directly, while geoip-style (CIDR) sets are
+  skipped during name matching and enforced after resolution as an address
+  limit, mirroring sing-box `IgnoreDestinationIPCIDRMatch`/`WithAddressLimit`
+- the `predefined` rule action answers from configured `rcode` and
+  answer/ns/extra text records without touching an upstream; `*`-prefixed
+  record owners are rewritten to the query name, matching sing-box
 
 ### Routing
 
@@ -219,6 +229,17 @@ when no rule needs them. Interface and default-interface information is cached
 for a short TTL, so a per-connection full `/proc` walk is never performed unless
 a rule actually matches on those fields.
 
+Domain resolution in routing is lazy: a domain flow is not resolved during rule
+matching unless a rule actually needs a destination address (`ip_cidr`,
+`ip_version`, `ip_is_private`, or a rule-set containing such rules). When such
+a rule's domain fields match, the router resolves the domain once — through
+`route.default_domain_resolver` when configured — and retries that rule with
+the full multi-address set (any address matching a CIDR/version/private check
+matches the rule). The resolved addresses are reused by direct dialers so a
+routed direct connection performs no second lookup. This avoids the sing-box
+behavior of resolving the same domain twice (once for routing, once for the
+direct dial).
+
 Implemented actions:
 
 - route to outbound, direct, and bypass
@@ -232,6 +253,10 @@ Implemented rule-set sources:
 - local source JSON and binary SRS
 - remote source JSON and binary SRS with size limits, cache fallback, and
   periodic atomic refresh
+- remote rule-sets can be downloaded through an `http_clients` detour via
+  `route.default_http_client`, so rule-set hosts behind the proxy are fetched
+  over a tunneled HTTP/1.1 connection (TLS for https, redirects followed,
+  64 MiB cap), with direct-download and disk-cache fallbacks
 
 ### Configuration and CLI
 

@@ -1,7 +1,7 @@
 use crate::{
     dns::DnsResolver,
     linux_route::LinuxRouteMetadata,
-    routing::{RouteContext, RouteDecision, RouteOptions, Router, RuleAction},
+    routing::{ActionLookup, RouteContext, RouteDecision, RouteOptions, Router, RuleAction},
     vless,
 };
 use anyhow::{Context, Result};
@@ -17,6 +17,9 @@ pub(super) struct RouteEvaluation {
     pub(super) decision: RouteDecision,
     pub(super) destination: vless::Destination,
     pub(super) options: RouteOptions,
+    /// Addresses resolved during route evaluation, reused by direct dialers
+    /// to avoid a second DNS lookup.
+    pub(super) resolved_addresses: Vec<IpAddr>,
 }
 #[derive(Clone, Copy)]
 pub(super) struct RouteInput<'a> {
@@ -51,24 +54,18 @@ pub(super) async fn evaluate_tcp_route(
         vless::Destination::Ip(value, _) => Some(value),
         vless::Destination::Domain(_, _) => None,
     };
-    if destination_ip.is_none()
-        && let (Some(name), Some(resolver)) = (domain.as_deref(), resolver)
-    {
-        destination_ip = resolver
-            .lookup(name)
-            .await
-            .ok()
-            .and_then(|values| values.into_iter().next());
-    }
+    let mut destination_ips: Vec<IpAddr> = Vec::new();
     let mut detected_protocol = None;
     let mut detected_client = None;
 
     let mut options = router.default_options();
     let mut cursor = 0;
+    let mut resolved = false;
     let decision = loop {
         let context = RouteContext {
             domain: domain.as_deref(),
             destination_ip,
+            destination_ips: &destination_ips,
             destination_port: Some(destination.port()),
             source_ip: Some(peer.ip()),
             source_port: Some(peer.port()),
@@ -94,70 +91,102 @@ pub(super) async fn evaluate_tcp_route(
             default_interface_addresses: &linux.default_interface_addresses,
             ..Default::default()
         };
-        let Some((index, action)) = router.next_action(&context, cursor) else {
-            break RouteDecision::Outbound(router.final_outbound().to_owned());
-        };
-        cursor = index + 1;
-        match action {
-            RuleAction::Route {
-                decision,
-                options: action_options,
-            } => {
-                options.merge(&action_options);
-                break decision;
-            }
-            RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-            RuleAction::Resolve {
-                server,
-                timeout,
-                strategy,
-                disable_cache,
-                rewrite_ttl,
-                client_subnet,
-            } => {
-                if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                    destination_ip = select_address(
-                        resolve_for_route(
-                            resolver,
-                            name,
-                            crate::dns::LookupOptions {
-                                server: server.as_deref(),
-                                disable_cache,
-                                rewrite_ttl,
-                                timeout: timeout
-                                    .as_deref()
-                                    .map(|value| parse_duration(Some(value))),
-                                strategy: strategy.as_deref(),
-                                client_subnet: client_subnet.as_deref(),
-                            },
+        match router.next_action_lazy(&context, cursor) {
+            ActionLookup::Action { index, action } => {
+                let action = *action;
+                cursor = index + 1;
+                match action {
+                    RuleAction::Route {
+                        decision,
+                        options: action_options,
+                    } => {
+                        options.merge(&action_options);
+                        break decision;
+                    }
+                    RuleAction::RouteOptions(action_options) => options.merge(&action_options),
+                    RuleAction::Resolve {
+                        server,
+                        timeout,
+                        strategy,
+                        disable_cache,
+                        rewrite_ttl,
+                        client_subnet,
+                    } => {
+                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
+                            destination_ips = resolve_for_route(
+                                resolver,
+                                name,
+                                crate::dns::LookupOptions {
+                                    server: server
+                                        .as_deref()
+                                        .or(router.default_domain_resolver().as_deref()),
+                                    disable_cache,
+                                    rewrite_ttl,
+                                    timeout: timeout
+                                        .as_deref()
+                                        .map(|value| parse_duration(Some(value))),
+                                    strategy: strategy.as_deref(),
+                                    client_subnet: client_subnet.as_deref(),
+                                },
+                            )
+                            .await?;
+                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
+                            resolved = true;
+                        }
+                    }
+                    RuleAction::Sniff { sniffers, timeout } => {
+                        let sniffed = sniff_tcp(
+                            local,
+                            initial,
+                            &sniffers,
+                            parse_duration(timeout.as_deref()),
                         )
-                        .await?,
-                        strategy.as_deref(),
-                    );
-                }
-            }
-            RuleAction::Sniff { sniffers, timeout } => {
-                let sniffed = sniff_tcp(
-                    local,
-                    initial,
-                    &sniffers,
-                    parse_duration(timeout.as_deref()),
-                )
-                .await;
-                if let Some(sniffed) = sniffed {
-                    detected_protocol = Some(sniffed.protocol);
-                    detected_client = sniffed.client;
-                    if sniffed.domain.is_some() {
-                        domain = sniffed.domain;
+                        .await;
+                        if let Some(sniffed) = sniffed {
+                            detected_protocol = Some(sniffed.protocol);
+                            detected_client = sniffed.client;
+                            if sniffed.domain.is_some() {
+                                domain = sniffed.domain;
+                            }
+                        }
                     }
                 }
             }
+            ActionLookup::NeedResolve { index } => {
+                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
+                    cursor = index + 1;
+                    continue;
+                };
+                let server = router.default_domain_resolver();
+                destination_ips = resolve_for_route(
+                    resolver,
+                    name,
+                    crate::dns::LookupOptions {
+                        server: server.as_deref(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_or_default();
+                resolved = true;
+                if destination_ips.is_empty() {
+                    cursor = index + 1;
+                    continue;
+                }
+                destination_ip = destination_ips.first().copied();
+                cursor = index;
+            }
+            ActionLookup::None => {
+                break RouteDecision::Outbound(router.final_outbound().to_owned());
+            }
         }
     };
+    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok(RouteEvaluation {
         decision,
         destination: override_destination(destination, &options)?,
         options,
+        resolved_addresses,
     })
 }
 pub(super) async fn evaluate_stream_tcp_route<S>(
@@ -185,25 +214,19 @@ where
         vless::Destination::Ip(value, _) => Some(*value),
         vless::Destination::Domain(_, _) => None,
     };
-    if destination_ip.is_none()
-        && let (Some(name), Some(resolver)) = (domain.as_deref(), resolver)
-    {
-        destination_ip = resolver
-            .lookup(name)
-            .await
-            .ok()
-            .and_then(|values| values.into_iter().next());
-    }
+    let mut destination_ips: Vec<IpAddr> = Vec::new();
     let mut initial = Vec::new();
     let mut detected_protocol = None;
     let mut detected_client = None;
 
     let mut options = router.default_options();
     let mut cursor = 0;
+    let mut resolved = false;
     let decision = loop {
         let context = RouteContext {
             domain: domain.as_deref(),
             destination_ip,
+            destination_ips: &destination_ips,
             destination_port: Some(destination.port()),
             source_ip: Some(peer.ip()),
             source_port: Some(peer.port()),
@@ -229,76 +252,108 @@ where
             default_interface_addresses: &linux.default_interface_addresses,
             ..Default::default()
         };
-        let Some((index, action)) = router.next_action(&context, cursor) else {
-            break RouteDecision::Outbound(router.final_outbound().to_owned());
-        };
-        cursor = index + 1;
-        match action {
-            RuleAction::Route {
-                decision,
-                options: action_options,
-            } => {
-                options.merge(&action_options);
-                break decision;
-            }
-            RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-            RuleAction::Resolve {
-                server,
-                timeout,
-                strategy,
-                disable_cache,
-                rewrite_ttl,
-                client_subnet,
-            } => {
-                if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                    destination_ip = select_address(
-                        resolve_for_route(
-                            resolver,
-                            name,
-                            crate::dns::LookupOptions {
-                                server: server.as_deref(),
-                                disable_cache,
-                                rewrite_ttl,
-                                timeout: timeout
-                                    .as_deref()
-                                    .map(|value| parse_duration(Some(value))),
-                                strategy: strategy.as_deref(),
-                                client_subnet: client_subnet.as_deref(),
-                            },
-                        )
-                        .await?,
-                        strategy.as_deref(),
-                    );
-                }
-            }
-            RuleAction::Sniff { sniffers, timeout } => {
-                if initial.is_empty() {
-                    let mut buffer = vec![0; 8192];
-                    if let Ok(Ok(length)) = tokio::time::timeout(
-                        parse_duration(timeout.as_deref()),
-                        stream.read(&mut buffer),
-                    )
-                    .await
-                    {
-                        buffer.truncate(length);
-                        initial = buffer;
+        match router.next_action_lazy(&context, cursor) {
+            ActionLookup::Action { index, action } => {
+                let action = *action;
+                cursor = index + 1;
+                match action {
+                    RuleAction::Route {
+                        decision,
+                        options: action_options,
+                    } => {
+                        options.merge(&action_options);
+                        break decision;
+                    }
+                    RuleAction::RouteOptions(action_options) => options.merge(&action_options),
+                    RuleAction::Resolve {
+                        server,
+                        timeout,
+                        strategy,
+                        disable_cache,
+                        rewrite_ttl,
+                        client_subnet,
+                    } => {
+                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
+                            destination_ips = resolve_for_route(
+                                resolver,
+                                name,
+                                crate::dns::LookupOptions {
+                                    server: server
+                                        .as_deref()
+                                        .or(router.default_domain_resolver().as_deref()),
+                                    disable_cache,
+                                    rewrite_ttl,
+                                    timeout: timeout
+                                        .as_deref()
+                                        .map(|value| parse_duration(Some(value))),
+                                    strategy: strategy.as_deref(),
+                                    client_subnet: client_subnet.as_deref(),
+                                },
+                            )
+                            .await?;
+                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
+                            resolved = true;
+                        }
+                    }
+                    RuleAction::Sniff { sniffers, timeout } => {
+                        if initial.is_empty() {
+                            let mut buffer = vec![0; 8192];
+                            if let Ok(Ok(length)) = tokio::time::timeout(
+                                parse_duration(timeout.as_deref()),
+                                stream.read(&mut buffer),
+                            )
+                            .await
+                            {
+                                buffer.truncate(length);
+                                initial = buffer;
+                            }
+                        }
+                        if let Some(sniffed) = sniff_payload(&initial, false, &sniffers) {
+                            detected_protocol = Some(sniffed.protocol);
+                            detected_client = sniffed.client;
+                            if sniffed.domain.is_some() {
+                                domain = sniffed.domain;
+                            }
+                        }
                     }
                 }
-                if let Some(sniffed) = sniff_payload(&initial, false, &sniffers) {
-                    detected_protocol = Some(sniffed.protocol);
-                    detected_client = sniffed.client;
-                    if sniffed.domain.is_some() {
-                        domain = sniffed.domain;
-                    }
+            }
+            ActionLookup::NeedResolve { index } => {
+                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
+                    cursor = index + 1;
+                    continue;
+                };
+                let server = router.default_domain_resolver();
+                destination_ips = resolve_for_route(
+                    resolver,
+                    name,
+                    crate::dns::LookupOptions {
+                        server: server.as_deref(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_or_default();
+                resolved = true;
+                if destination_ips.is_empty() {
+                    cursor = index + 1;
+                    continue;
                 }
+                destination_ip = destination_ips.first().copied();
+                cursor = index;
+            }
+            ActionLookup::None => {
+                break RouteDecision::Outbound(router.final_outbound().to_owned());
             }
         }
     };
+    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok((
         RouteEvaluation {
             decision,
             destination: override_destination(destination, &options)?,
             options,
+            resolved_addresses,
         },
         initial,
     ))
@@ -325,24 +380,18 @@ pub(super) async fn evaluate_udp_route(
         vless::Destination::Ip(value, _) => Some(*value),
         vless::Destination::Domain(_, _) => None,
     };
-    if destination_ip.is_none()
-        && let (Some(name), Some(resolver)) = (domain.as_deref(), resolver)
-    {
-        destination_ip = resolver
-            .lookup(name)
-            .await
-            .ok()
-            .and_then(|values| values.into_iter().next());
-    }
+    let mut destination_ips: Vec<IpAddr> = Vec::new();
     let mut detected_protocol = None;
     let mut detected_client = None;
 
     let mut options = router.default_options();
     let mut cursor = 0;
+    let mut resolved = false;
     let decision = loop {
         let context = RouteContext {
             domain: domain.as_deref(),
             destination_ip,
+            destination_ips: &destination_ips,
             destination_port: Some(destination.port()),
             source_ip: Some(peer.ip()),
             source_port: Some(peer.port()),
@@ -368,66 +417,98 @@ pub(super) async fn evaluate_udp_route(
             default_interface_addresses: &linux.default_interface_addresses,
             ..Default::default()
         };
-        let Some((index, action)) = router.next_action(&context, cursor) else {
-            break RouteDecision::Outbound(router.final_outbound().to_owned());
-        };
-        cursor = index + 1;
-        match action {
-            RuleAction::Route {
-                decision,
-                options: action_options,
-            } => {
-                options.merge(&action_options);
-                break decision;
-            }
-            RuleAction::RouteOptions(action_options) => options.merge(&action_options),
-            RuleAction::Resolve {
-                server,
-                timeout,
-                strategy,
-                disable_cache,
-                rewrite_ttl,
-                client_subnet,
-            } => {
-                if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
-                    destination_ip = select_address(
-                        resolve_for_route(
-                            resolver,
-                            name,
-                            crate::dns::LookupOptions {
-                                server: server.as_deref(),
-                                disable_cache,
-                                rewrite_ttl,
-                                timeout: timeout
-                                    .as_deref()
-                                    .map(|value| parse_duration(Some(value))),
-                                strategy: strategy.as_deref(),
-                                client_subnet: client_subnet.as_deref(),
-                            },
-                        )
-                        .await?,
-                        strategy.as_deref(),
-                    );
-                }
-            }
-            RuleAction::Sniff {
-                sniffers,
-                timeout: _,
-            } => {
-                if let Some(sniffed) = sniff_payload(payload, true, &sniffers) {
-                    detected_protocol = Some(sniffed.protocol);
-                    detected_client = sniffed.client;
-                    if sniffed.domain.is_some() {
-                        domain = sniffed.domain;
+        match router.next_action_lazy(&context, cursor) {
+            ActionLookup::Action { index, action } => {
+                let action = *action;
+                cursor = index + 1;
+                match action {
+                    RuleAction::Route {
+                        decision,
+                        options: action_options,
+                    } => {
+                        options.merge(&action_options);
+                        break decision;
+                    }
+                    RuleAction::RouteOptions(action_options) => options.merge(&action_options),
+                    RuleAction::Resolve {
+                        server,
+                        timeout,
+                        strategy,
+                        disable_cache,
+                        rewrite_ttl,
+                        client_subnet,
+                    } => {
+                        if let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) {
+                            destination_ips = resolve_for_route(
+                                resolver,
+                                name,
+                                crate::dns::LookupOptions {
+                                    server: server
+                                        .as_deref()
+                                        .or(router.default_domain_resolver().as_deref()),
+                                    disable_cache,
+                                    rewrite_ttl,
+                                    timeout: timeout
+                                        .as_deref()
+                                        .map(|value| parse_duration(Some(value))),
+                                    strategy: strategy.as_deref(),
+                                    client_subnet: client_subnet.as_deref(),
+                                },
+                            )
+                            .await?;
+                            destination_ip = select_address(destination_ips.clone(), strategy.as_deref());
+                            resolved = true;
+                        }
+                    }
+                    RuleAction::Sniff {
+                        sniffers,
+                        timeout: _,
+                    } => {
+                        if let Some(sniffed) = sniff_payload(payload, true, &sniffers) {
+                            detected_protocol = Some(sniffed.protocol);
+                            detected_client = sniffed.client;
+                            if sniffed.domain.is_some() {
+                                domain = sniffed.domain;
+                            }
+                        }
                     }
                 }
             }
+            ActionLookup::NeedResolve { index } => {
+                let (Some(name), Some(resolver)) = (domain.as_deref(), resolver) else {
+                    cursor = index + 1;
+                    continue;
+                };
+                let server = router.default_domain_resolver();
+                destination_ips = resolve_for_route(
+                    resolver,
+                    name,
+                    crate::dns::LookupOptions {
+                        server: server.as_deref(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_or_default();
+                resolved = true;
+                if destination_ips.is_empty() {
+                    cursor = index + 1;
+                    continue;
+                }
+                destination_ip = destination_ips.first().copied();
+                cursor = index;
+            }
+            ActionLookup::None => {
+                break RouteDecision::Outbound(router.final_outbound().to_owned());
+            }
         }
     };
+    let resolved_addresses = if resolved { destination_ips } else { Vec::new() };
     Ok(RouteEvaluation {
         decision,
         destination: override_destination(destination, &options)?,
         options,
+        resolved_addresses,
     })
 }
 async fn resolve_for_route(

@@ -1,6 +1,6 @@
 mod cache;
 mod message;
-mod transport;
+pub(crate) mod transport;
 
 use anyhow::{Context, Result, bail};
 use rand::Rng;
@@ -8,11 +8,12 @@ use std::{
     collections::HashMap,
     future::Future,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use tokio_rustls::TlsConnector;
 
+use crate::routing::CompiledRuleSetMap;
 use crate::singbox::{DnsConfig, DnsRule};
 use crate::util::parse_duration;
 
@@ -20,8 +21,9 @@ use self::cache::{CacheKey, CacheValue, DnsCache, Flight};
 use self::message::{
     add_client_subnet, build_query, build_query_with_subnet, canonical_query, dns_id,
     dns_rule_matches, local_response, normalize, optimistic_enabled, parse_client_subnet,
-    parse_https_ech, parse_question, parse_response, refused_response, response_ttl,
-    rewrite_response_ttls, validate_dns_rule, validate_response, validate_strategy,
+    parse_https_ech, parse_question, parse_response, predefined_response, refused_response,
+    response_ttl, rewrite_response_ttls, validate_dns_rule, validate_response,
+    validate_strategy,
 };
 use self::transport::Upstream;
 
@@ -49,6 +51,8 @@ struct Inner {
     timeout: Duration,
     client_subnet: Option<String>,
     http: reqwest::Client,
+    rule_sets: Option<Arc<RwLock<CompiledRuleSetMap>>>,
+    detour: std::sync::RwLock<Option<Arc<dyn transport::DnsUdpDetour>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +67,13 @@ pub struct LookupOptions<'a> {
 
 impl DnsResolver {
     pub fn new(config: &DnsConfig) -> Result<Self> {
+        Self::with_rule_sets(config, None)
+    }
+
+    pub(crate) fn with_rule_sets(
+        config: &DnsConfig,
+        rule_sets: Option<Arc<RwLock<CompiledRuleSetMap>>>,
+    ) -> Result<Self> {
         crate::install_crypto_provider();
         validate_strategy(config.strategy.as_deref())?;
         if let Some(subnet) = &config.client_subnet {
@@ -136,8 +147,23 @@ impl DnsResolver {
                             .map_or(HTTP_TIMEOUT, |_| dns_timeout),
                     )
                     .build()?,
+                rule_sets,
+                detour: std::sync::RwLock::new(None),
             }),
         })
+    }
+
+    /// Install the outbound provider used for `detour` DNS servers. Called
+    /// once the proxy runtime has built its dialers.
+    pub(crate) fn set_detour(&self, detour: Arc<dyn transport::DnsUdpDetour>) {
+        for server in self.inner.servers.values() {
+            server.set_detour(detour.clone());
+        }
+        *self
+            .inner
+            .detour
+            .write()
+            .expect("DNS detour lock poisoned") = Some(detour);
     }
     pub async fn lookup(&self, domain: &str) -> Result<Vec<IpAddr>> {
         self.lookup_with_options(domain, &LookupOptions::default())
@@ -181,8 +207,25 @@ impl DnsResolver {
             Some("ipv6_only") => (Ok(Vec::new()), query(28).await),
             _ => tokio::join!(query(1), query(28)),
         };
-        let mut result = a.unwrap_or_default();
-        result.extend(aaaa.unwrap_or_default());
+        let mut result = match (a, aaaa) {
+            (Ok(a), Ok(aaaa)) => {
+                let mut result = a;
+                result.extend(aaaa);
+                result
+            }
+            (Ok(a), Err(error)) => {
+                tracing::debug!(%error, %name, "DNS AAAA lookup failed, using A");
+                a
+            }
+            (Err(error), Ok(aaaa)) => {
+                tracing::debug!(%error, %name, "DNS A lookup failed, using AAAA");
+                aaaa
+            }
+            (Err(a_error), Err(aaaa_error)) => {
+                tracing::debug!(a_error = %a_error, aaaa_error = %aaaa_error, %name, "DNS A and AAAA lookups failed");
+                Vec::new()
+            }
+        };
         result.sort();
         result.dedup();
         match strategy {
@@ -204,6 +247,17 @@ impl DnsResolver {
                 bail!("DNS query dropped by rule")
             }
             return refused_response(request, question_end);
+        }
+        if let Some(rule) = rule.filter(|rule| rule.action.as_deref() == Some("predefined")) {
+            let rcode = self::message::parse_rcode(rule.rcode.as_ref())?;
+            let records = rule
+                .answer
+                .iter()
+                .chain(&rule.ns)
+                .chain(&rule.extra)
+                .map(|record| self::message::parse_dns_record(record))
+                .collect::<Result<Vec<_>>>()?;
+            return predefined_response(request, question_end, rcode, &records);
         }
         let server_tag = rule
             .and_then(|rule| rule.server.as_deref())
@@ -288,6 +342,32 @@ impl DnsResolver {
         if rule.is_some_and(|rule| rule.action.as_deref() == Some("reject")) {
             bail!("DNS lookup rejected by rule")
         }
+        if let Some(rule) = rule.filter(|rule| rule.action.as_deref() == Some("predefined")) {
+            let rcode = self::message::parse_rcode(rule.rcode.as_ref())?;
+            if rcode != 0 {
+                bail!("DNS lookup rejected by rule with rcode {rcode}")
+            }
+            let mut addresses = Vec::new();
+            for record in rule.answer.iter().chain(&rule.ns).chain(&rule.extra) {
+                let record = self::message::parse_dns_record(record)?;
+                match (qtype, record.kind) {
+                    (1, 1) => {
+                        let [a, b, c, d] = record.rdata[..] else {
+                            continue;
+                        };
+                        addresses.push(IpAddr::from([a, b, c, d]));
+                    }
+                    (28, 28) => {
+                        let bytes: [u8; 16] = record.rdata[..].try_into().ok().context("invalid AAAA record")?;
+                        addresses.push(IpAddr::from(bytes));
+                    }
+                    _ => {}
+                }
+            }
+            addresses.sort();
+            addresses.dedup();
+            return Ok(addresses);
+        }
         let server_tag = options
             .server
             .or_else(|| rule.and_then(|rule| rule.server.as_deref()));
@@ -357,10 +437,31 @@ impl DnsResolver {
         } else {
             self.cached(key, load).await?
         };
-        match value {
-            CacheValue::Addresses(addresses) => Ok(addresses),
+        let addresses = match value {
+            CacheValue::Addresses(addresses) => addresses,
             CacheValue::Wire(_) => bail!("invalid DNS address cache entry"),
+        };
+        let rule_sets_guard = self
+            .inner
+            .rule_sets
+            .as_ref()
+            .map(|sets| sets.read().expect("DNS rule-set lock poisoned"));
+        let Some(rule) = rule else {
+            return Ok(addresses);
+        };
+        let has_limit = self::message::dns_rule_has_address_limit(rule, rule_sets_guard.as_deref());
+        if has_limit
+            && !self::message::dns_rule_address_limit_matches(
+                rule,
+                name,
+                &addresses,
+                rule_sets_guard.as_deref(),
+            )
+        {
+            tracing::debug!(%name, %qtype, "DNS response addresses rejected by rule-set address limit");
+            bail!("DNS response rejected by rule-set address limit for {name}")
         }
+        Ok(addresses)
     }
     async fn cached<F, Fut>(&self, key: CacheKey, load: F) -> Result<CacheValue>
     where
@@ -413,10 +514,15 @@ impl DnsResolver {
         shared.map_err(anyhow::Error::msg)
     }
     fn select_rule(&self, name: &str, qtype: u16) -> Option<&DnsRule> {
+        let rule_sets = self
+            .inner
+            .rule_sets
+            .as_ref()
+            .map(|sets| sets.read().expect("DNS rule-set lock poisoned"));
         self.inner
             .rules
             .iter()
-            .find(|rule| dns_rule_matches(rule, name, qtype))
+            .find(|rule| dns_rule_matches(rule, name, qtype, rule_sets.as_deref()))
     }
 
     fn select_server(&self, name: &str, qtype: u16) -> Result<&Arc<Upstream>> {
@@ -449,6 +555,7 @@ mod tests {
                 server: Some(address.ip().to_string()),
                 server_port: Some(address.port()),
                 path: None,
+                detour: None,
             }],
             final_server: Some("test".into()),
             ..Default::default()
@@ -498,16 +605,17 @@ mod tests {
             domain_regex: vec![r"^api\d+\.example$".into()],
             ..Default::default()
         };
-        assert!(dns_rule_matches(&rule, "api12.example", 65));
-        assert!(!dns_rule_matches(&rule, "api12.example", 1));
-        assert!(!dns_rule_matches(&rule, "www.example", 65));
+        assert!(dns_rule_matches(&rule, "api12.example", 65, None));
+        assert!(!dns_rule_matches(&rule, "api12.example", 1, None));
+        assert!(!dns_rule_matches(&rule, "www.example", 65, None));
         assert!(dns_rule_matches(
             &DnsRule {
                 invert: true,
                 ..rule
             },
             "www.example",
-            65
+            65,
+            None
         ));
     }
 
@@ -567,8 +675,8 @@ mod tests {
             domain_suffix: vec!["example.com".into()],
             ..Default::default()
         };
-        assert!(dns_rule_matches(&r, "www.example.com", 1));
-        assert!(!dns_rule_matches(&r, "badexample.com", 1));
+        assert!(dns_rule_matches(&r, "www.example.com", 1, None));
+        assert!(!dns_rule_matches(&r, "badexample.com", 1, None));
     }
     #[tokio::test]
     async fn udp_lookup_and_ttl_cache() {
@@ -762,5 +870,212 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn dns_rules_match_rule_set_tags() {
+        use crate::routing::CompiledRule;
+        use crate::singbox::RouteRule;
+        use std::collections::HashMap;
+        use std::sync::{Arc, RwLock};
+
+        let set = vec![CompiledRule::compile(
+            &RouteRule {
+                domain_suffix: vec!["example.com".into()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+            false,
+        )
+        .unwrap()];
+        let mut sets = HashMap::new();
+        sets.insert("geosite-cn".into(), set);
+        let rule_sets = Arc::new(RwLock::new(sets));
+
+        let rule = DnsRule {
+            rule_set: vec!["geosite-cn".into()],
+            server: Some("dns_local".into()),
+            ..Default::default()
+        };
+        let unlocked = rule_sets.read().unwrap();
+        assert!(super::dns_rule_matches(&rule, "www.example.com", 1, Some(&unlocked)));
+        assert!(!super::dns_rule_matches(&rule, "www.elsewhere.net", 1, Some(&unlocked)));
+        assert!(!super::dns_rule_matches(&rule, "www.example.com", 1, None));
+    }
+
+    #[tokio::test]
+    async fn exchange_serves_predefined_answers_via_rule_set() {
+        use crate::routing::CompiledRule;
+        use crate::singbox::RouteRule;
+        use std::collections::HashMap;
+        use std::sync::{Arc, RwLock};
+
+        let set = vec![CompiledRule::compile(
+            &RouteRule {
+                domain_suffix: vec!["ads.example".into()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+            false,
+        )
+        .unwrap()];
+        let mut sets = HashMap::new();
+        sets.insert("geosite-ads".into(), set);
+        let config = DnsConfig {
+            servers: vec![DnsServer {
+                r#type: "udp".into(),
+                tag: "unused".into(),
+                server: Some("127.0.0.1".into()),
+                server_port: Some(1),
+                path: None,
+                detour: None,
+            }],
+            final_server: Some("unused".into()),
+            disable_cache: Some(true),
+            rules: vec![DnsRule {
+                rule_set: vec!["geosite-ads".into()],
+                action: Some("predefined".into()),
+                answer: vec![". 2147483647 IN A 0.0.0.0".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolver =
+            DnsResolver::with_rule_sets(&config, Some(Arc::new(RwLock::new(sets)))).unwrap();
+        let response = resolver
+            .exchange(&build_query(9, "banner.ads.example", 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response[3] & 0x0f, 0);
+        let (addresses, _) = parse_response(9, 1, &response).unwrap();
+        assert_eq!(addresses, vec![IpAddr::from([0, 0, 0, 0])]);
+    }
+
+    #[tokio::test]
+    async fn exchange_serves_predefined_answers() {
+        let config = DnsConfig {
+            servers: vec![DnsServer {
+                r#type: "udp".into(),
+                tag: "unused".into(),
+                server: Some("127.0.0.1".into()),
+                server_port: Some(1),
+                path: None,
+                detour: None,
+            }],
+            final_server: Some("unused".into()),
+            disable_cache: Some(true),
+            rules: vec![DnsRule {
+                domain_suffix: vec!["ads.example".into()],
+                action: Some("predefined".into()),
+                rcode: Some(serde_json::json!("NOERROR")),
+                answer: vec![". 2147483647 IN A 0.0.0.0".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolver = DnsResolver::new(&config).unwrap();
+        let query = build_query(9, "banner.ads.example", 1).unwrap();
+        let response = resolver.exchange(&query).await.unwrap();
+        assert_eq!(&response[..2], &9u16.to_be_bytes());
+        assert_eq!(response[3] & 0x0f, 0);
+        let (addresses, _) = parse_response(9, 1, &response).unwrap();
+        assert_eq!(addresses, vec![IpAddr::from([0, 0, 0, 0])]);
+
+        let rejected = DnsConfig {
+            servers: vec![DnsServer {
+                r#type: "udp".into(),
+                tag: "unused".into(),
+                server: Some("127.0.0.1".into()),
+                server_port: Some(1),
+                path: None,
+                detour: None,
+            }],
+            final_server: Some("unused".into()),
+            disable_cache: Some(true),
+            rules: vec![DnsRule {
+                domain_suffix: vec!["nx.example".into()],
+                action: Some("predefined".into()),
+                rcode: Some(serde_json::json!("NXDOMAIN")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolver = DnsResolver::new(&rejected).unwrap();
+        let response = resolver
+            .exchange(&build_query(9, "missing.nx.example", 1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response[3] & 0x0f, 3);
+        assert!(resolver.lookup("missing.nx.example").await.is_err());
+    }
+
+    struct FakeDetour {
+        socket: UdpSocket,
+        target: std::net::SocketAddr,
+    }
+
+    impl super::transport::DnsUdpDetour for FakeDetour {
+        fn exchange_udp(
+            &self,
+            _tag: &str,
+            _destination: std::net::SocketAddr,
+            request: &[u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>,
+        > {
+            let request = request.to_vec();
+            let target = self.target;
+            Box::pin(async move {
+                self.socket.send_to(&request, target).await?;
+                let mut buffer = vec![0; 512];
+                let length = self.socket.recv(&mut buffer).await?;
+                buffer.truncate(length);
+                Ok(buffer)
+            })
+        }
+
+        fn connect_tcp(
+            &self,
+            _tag: &str,
+            _destination: std::net::SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Box<dyn super::transport::DnsIo>>> + Send + '_>,
+        > {
+            Box::pin(async move { bail!("fake detour does not support TCP") })
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_routes_udp_queries_through_detour() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..2 {
+                let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                observed.fetch_add(1, Ordering::Relaxed);
+                let response = answer_query(&buffer[..length]);
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let mut config = test_server("udp", address);
+        config.servers[0].detour = Some("proxy".into());
+        config.disable_cache = Some(true);
+        let detour_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = DnsResolver::new(&config).unwrap();
+        resolver.set_detour(Arc::new(FakeDetour {
+            socket: detour_socket,
+            target: address,
+        }));
+        let response = resolver
+            .exchange(&build_query(11, "detour.example", 1).unwrap())
+            .await
+            .expect("detour exchange");
+        assert_eq!(response[3] & 0x0f, 0);
+        let (addresses, _) = parse_response(11, 1, &response).unwrap();
+        assert_eq!(addresses, vec![IpAddr::from([1, 2, 3, 4])]);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 }

@@ -11,10 +11,14 @@ use ipnet::IpNet;
 use crate::linux_route::LinuxMetadataScope;
 use crate::singbox::{RouteConfig, RouteRule};
 
+/// Compiled rule-set storage shared between the router and the DNS resolver.
+pub(crate) type CompiledRuleSetMap = HashMap<String, Vec<CompiledRule>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct RouteContext<'a> {
     pub domain: Option<&'a str>,
     pub destination_ip: Option<IpAddr>,
+    pub destination_ips: &'a [IpAddr],
     pub destination_port: Option<u16>,
     pub source_ip: Option<IpAddr>,
     pub source_port: Option<u16>,
@@ -40,6 +44,17 @@ pub struct RouteContext<'a> {
     pub source_hostname: Option<&'a str>,
     pub default_interface_addresses: &'a [IpAddr],
     pub preferred_by: &'a [String],
+}
+
+impl<'a> RouteContext<'a> {
+    /// Iterate all candidate destination addresses: the explicitly resolved
+    /// multi-address set first, then the single `destination_ip`.
+    pub(crate) fn destination_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.destination_ips
+            .iter()
+            .copied()
+            .chain(self.destination_ip)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,14 +177,14 @@ pub enum RuleAction {
 #[derive(Debug, Clone)]
 pub struct Router {
     rules: Arc<RwLock<Vec<CompiledRule>>>,
-    rule_sets: Arc<RwLock<HashMap<String, Vec<CompiledRule>>>>,
+    rule_sets: Arc<RwLock<CompiledRuleSetMap>>,
     final_outbound: Arc<RwLock<String>>,
     default_options: Arc<RwLock<RouteOptions>>,
+    default_domain_resolver: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
-struct CompiledRule {
-    logical_mode: Option<LogicalMode>,
+pub(crate) struct CompiledRule {    logical_mode: Option<LogicalMode>,
     logical_rules: Vec<CompiledRule>,
     domains: Vec<String>,
     suffixes: Vec<String>,
@@ -210,6 +225,10 @@ struct CompiledRule {
     rule_set_ip_cidr_match_source: bool,
     action: RuleAction,
     invert: bool,
+    /// True when matching this rule needs a resolved destination address
+    /// (destination CIDR, IP version, private-IP checks, or a rule-set
+    /// containing such rules). Used for lazy DNS resolution.
+    requires_destination_ip: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -218,25 +237,45 @@ enum LogicalMode {
     Or,
 }
 
+/// Result of a lazy rule lookup.
+#[derive(Debug)]
+pub(crate) enum ActionLookup {
+    /// A rule matched and should be acted on.
+    Action {
+        index: usize,
+        action: Box<RuleAction>,
+    },
+    /// The rule's domain fields match but it needs a destination address;
+    /// resolve the domain and retry from `index`.
+    NeedResolve { index: usize },
+    /// No rule matched.
+    None,
+}
+
 impl Router {
     pub fn compile(config: &RouteConfig, default_outbound: impl Into<String>) -> Result<Self> {
-        Self::compile_inner(config, default_outbound.into(), false)
+        Self::compile_inner(config, default_outbound.into(), false, None)
     }
 
-    pub fn compile_runtime(
+    /// Compile with remote rule-set bytes prefetched through an http_client
+    /// detour. `prefetched` maps rule-set tag to fetched file bytes; tags
+    /// missing from it fall back to the direct download path.
+    pub(crate) fn compile_runtime_prefetched(
         config: &RouteConfig,
         default_outbound: impl Into<String>,
+        prefetched: &HashMap<String, Vec<u8>>,
     ) -> Result<Self> {
-        Self::compile_inner(config, default_outbound.into(), true)
+        Self::compile_inner(config, default_outbound.into(), true, Some(prefetched))
     }
 
     fn compile_inner(
         config: &RouteConfig,
         default_outbound: String,
         fetch_remote: bool,
+        prefetched: Option<&HashMap<String, Vec<u8>>>,
     ) -> Result<Self> {
         let final_outbound = config.final_outbound.clone().unwrap_or(default_outbound);
-        let rule_sets = load_rule_sets(config, fetch_remote)?;
+        let rule_sets = load_rule_sets(config, fetch_remote, prefetched)?;
         let rules = config
             .rules
             .iter()
@@ -253,7 +292,21 @@ impl Router {
                 fallback_delay: config.default_fallback_delay.clone(),
                 ..Default::default()
             })),
+            default_domain_resolver: Arc::new(RwLock::new(
+                config
+                    .default_domain_resolver
+                    .as_deref()
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned),
+            )),
         })
+    }
+
+    pub(crate) fn default_domain_resolver(&self) -> Option<String> {
+        self.default_domain_resolver
+            .read()
+            .expect("default domain resolver lock poisoned")
+            .clone()
     }
 
     pub fn route(&self, context: &RouteContext<'_>) -> RouteDecision {
@@ -288,6 +341,34 @@ impl Router {
             .skip(from)
             .find(|(_, rule)| rule.matches(context, domain.as_deref()))
             .map(|(index, rule)| (index, rule.action.clone()))
+    }
+
+    /// Lazy variant of [`Self::next_action`]. When a rule's domain fields
+    /// match but the rule needs a destination address that is not yet known,
+    /// `NeedResolve(index)` is returned so the caller can resolve the domain
+    /// (through `default_domain_resolver` when configured) and retry from
+    /// that rule. Rules whose domain fields do not match are skipped.
+    pub(crate) fn next_action_lazy(
+        &self,
+        context: &RouteContext<'_>,
+        from: usize,
+    ) -> ActionLookup {
+        let domain = context.domain.map(normalize_domain);
+        let needs_ip = context.destination_addresses().next().is_none()
+            && context.domain.is_some();
+        let rules = self.rules.read().expect("route rule lock poisoned");
+        for (index, rule) in rules.iter().enumerate().skip(from) {
+            if rule.matches(context, domain.as_deref()) {
+                return ActionLookup::Action {
+                    index,
+                    action: Box::new(rule.action.clone()),
+                };
+            }
+            if needs_ip && rule.requires_destination_ip && rule.domain_fields_match(domain.as_deref()) {
+                return ActionLookup::NeedResolve { index };
+            }
+        }
+        ActionLookup::None
     }
 
     pub fn final_outbound(&self) -> String {
@@ -340,9 +421,165 @@ impl Router {
         let sets = self.rule_sets.read().expect("route rule-set lock poisoned");
         extract_rule_set_ip_cidrs(&sets, tags)
     }
+
+    /// Shared handle to the compiled rule-sets, so DNS rules can match
+    /// `rule_set` tags against the same data the router refreshes.
+    pub(crate) fn rule_sets(&self) -> Arc<RwLock<CompiledRuleSetMap>> {
+        self.rule_sets.clone()
+    }
 }
 
 impl CompiledRule {
+    /// DNS-rule matching: only domain-based fields participate, mirroring
+    /// sing-box's `IgnoreDestinationIPCIDRMatch` DNS semantics. IP CIDR rules
+    /// never match a bare query name, so geoip rule-sets are skipped here.
+    pub(crate) fn dns_matches_domain(&self, domain: &str) -> bool {
+        if let Some(mode) = self.logical_mode {
+            let matched = match mode {
+                LogicalMode::And => self
+                    .logical_rules
+                    .iter()
+                    .all(|rule| rule.dns_matches_domain(domain)),
+                LogicalMode::Or => self
+                    .logical_rules
+                    .iter()
+                    .any(|rule| rule.dns_matches_domain(domain)),
+            };
+            return if self.invert { !matched } else { matched };
+        }
+        let domain_matches = (self.domains.is_empty()
+            || self.domains.iter().any(|s| s == domain))
+            && (self.suffixes.is_empty()
+                || self
+                    .suffixes
+                    .iter()
+                    .any(|s| domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'))))
+            && (self.keywords.is_empty()
+                || self.keywords.iter().any(|value| domain.contains(value)))
+            && (self.regexes.is_empty()
+                || self.regexes.iter().any(|value| value.is_match(domain)));
+        if !domain_matches {
+            return self.invert;
+        }
+        if !self.rule_sets.is_empty() {
+            let nested = self
+                .rule_sets
+                .iter()
+                .flatten()
+                .any(|rule| rule.dns_matches_domain(domain));
+            if !nested {
+                return self.invert;
+            }
+        }
+        !self.invert
+    }
+
+    /// Whether the rule's domain fields (exact/suffix/keyword/regex, plus
+    /// nested logical rules and rule-sets) match `domain`. Used to decide if
+    /// a rule that needs a destination address is worth resolving for.
+    fn domain_fields_match(&self, domain: Option<&str>) -> bool {
+        let Some(domain) = domain else {
+            return false;
+        };
+        if let Some(mode) = self.logical_mode {
+            let matched = match mode {
+                LogicalMode::And => self
+                    .logical_rules
+                    .iter()
+                    .all(|rule| rule.domain_fields_match(Some(domain))),
+                LogicalMode::Or => self
+                    .logical_rules
+                    .iter()
+                    .any(|rule| rule.domain_fields_match(Some(domain))),
+            };
+            return if self.invert { !matched } else { matched };
+        }
+        let matched = (self.domains.is_empty() || self.domains.iter().any(|s| s == domain))
+            && (self.suffixes.is_empty()
+                || self.suffixes.iter().any(|s| {
+                    domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'))
+                }))
+            && (self.keywords.is_empty()
+                || self.keywords.iter().any(|value| domain.contains(value)))
+            && (self.regexes.is_empty()
+                || self.regexes.iter().any(|value| value.is_match(domain)))
+            && (self.rule_sets.is_empty()
+                || self
+                    .rule_sets
+                    .iter()
+                    .flatten()
+                    .any(|rule| rule.domain_fields_match(Some(domain))));
+        if self.invert { !matched } else { matched }
+    }
+
+    pub(crate) fn dns_contains_ip_cidr(&self) -> bool {
+        if !self.cidrs.is_empty() {
+            return true;
+        }
+        if self
+            .rule_sets
+            .iter()
+            .flatten()
+            .any(|rule| rule.dns_contains_ip_cidr())
+        {
+            return true;
+        }
+        self.logical_rules
+            .iter()
+            .any(|rule| rule.dns_contains_ip_cidr())
+    }
+
+    /// Address-limit matching: true when the rule (or any nested rule-set
+    /// rule) contains `address`, mirroring sing-box `MatchAddressLimit` for
+    /// DNS responses. Domain fields participate when a domain is given.
+    pub(crate) fn dns_matches_address(&self, address: IpAddr, domain: Option<&str>) -> bool {
+        if let Some(mode) = self.logical_mode {
+            let matched = match mode {
+                LogicalMode::And => self
+                    .logical_rules
+                    .iter()
+                    .all(|rule| rule.dns_matches_address(address, domain)),
+                LogicalMode::Or => self
+                    .logical_rules
+                    .iter()
+                    .any(|rule| rule.dns_matches_address(address, domain)),
+            };
+            return if self.invert { !matched } else { matched };
+        }
+        let domain_matches = domain.is_none_or(|domain| {
+            (self.domains.is_empty() || self.domains.iter().any(|s| s == domain))
+                && (self.suffixes.is_empty()
+                    || self.suffixes.iter().any(|s| {
+                        domain == s
+                            || domain
+                                .strip_suffix(s)
+                                .is_some_and(|r| r.ends_with('.'))
+                    }))
+                && (self.keywords.is_empty()
+                    || self
+                        .keywords
+                        .iter()
+                        .any(|value| domain.contains(value)))
+                && (self.regexes.is_empty()
+                    || self.regexes.iter().any(|value| value.is_match(domain)))
+        });
+        let address_matches = (self.cidrs.is_empty() || self.cidrs.iter().any(|n| n.contains(&address)))
+            && (self.ip_versions.is_empty()
+                || self.ip_versions.iter().any(|version| {
+                    matches!((version, address), (4, IpAddr::V4(_)) | (6, IpAddr::V6(_)))
+                }))
+            && (!self.ip_private || is_private(address))
+            && (self.rule_sets.is_empty()
+                || self.rule_sets.iter().flatten().any(|rule| {
+                    rule.dns_matches_address(address, domain)
+                }));
+        if self.invert {
+            !(domain_matches && address_matches)
+        } else {
+            domain_matches && address_matches
+        }
+    }
+
     fn metadata_scope(&self) -> LinuxMetadataScope {
         let mut scope = LinuxMetadataScope {
             process: !self.process_names.is_empty()
@@ -387,7 +624,7 @@ impl Router {
 }
 
 impl CompiledRule {
-    fn compile(
+    pub(crate) fn compile(
         rule: &RouteRule,
         available_sets: &HashMap<String, Vec<CompiledRule>>,
         require_decision: bool,
@@ -478,13 +715,25 @@ impl CompiledRule {
                     .with_context(|| format!("unknown route rule-set: {tag}"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let logical_rules = rule
+            .rules
+            .iter()
+            .map(|nested| Self::compile(nested, available_sets, false))
+            .collect::<Result<Vec<_>>>()?;
+        let requires_destination_ip = {
+            let own = !rule.ip_cidr.is_empty()
+                || !rule.ip_version.is_empty()
+                || rule.ip_is_private
+                || rule_sets.iter().flatten().any(|nested| {
+                    nested.requires_destination_ip
+                });
+            own || logical_rules
+                .iter()
+                .any(|rule| rule.requires_destination_ip)
+        };
         Ok(Self {
             logical_mode,
-            logical_rules: rule
-                .rules
-                .iter()
-                .map(|nested| Self::compile(nested, available_sets, false))
-                .collect::<Result<_>>()?,
+            logical_rules,
             domains: rule.domain.iter().map(|v| normalize_domain(v)).collect(),
             suffixes: rule
                 .domain_suffix
@@ -551,6 +800,7 @@ impl CompiledRule {
             rule_set_ip_cidr_match_source: rule.rule_set_ip_cidr_match_source,
             action,
             invert: rule.invert,
+            requires_destination_ip,
         })
     }
     fn matches(&self, c: &RouteContext<'_>, domain: Option<&str>) -> bool {
@@ -576,18 +826,18 @@ impl CompiledRule {
                 || domain
                     .is_some_and(|d| self.regexes.iter().any(|value| value.is_match(d))))
             && (self.cidrs.is_empty()
-                || c.destination_ip
-                    .is_some_and(|ip| self.cidrs.iter().any(|n| n.contains(&ip))))
+                || c.destination_addresses()
+                    .any(|ip| self.cidrs.iter().any(|n| n.contains(&ip))))
             && (self.source_cidrs.is_empty()
                 || c.source_ip
                     .is_some_and(|ip| self.source_cidrs.iter().any(|n| n.contains(&ip))))
             && (self.ip_versions.is_empty()
-                || c.destination_ip.is_some_and(|ip| {
+                || c.destination_addresses().any(|ip| {
                     self.ip_versions.iter().any(|version| {
                         matches!((version, ip), (4, IpAddr::V4(_)) | (6, IpAddr::V6(_)))
                     })
                 }))
-            && (!self.ip_private || c.destination_ip.is_some_and(is_private))
+            && (!self.ip_private || c.destination_addresses().any(is_private))
             && (!self.source_private || c.source_ip.is_some_and(is_private))
             && (self.source_ports.is_empty()
                 || c.source_port.is_some_and(|port| {
@@ -674,6 +924,7 @@ struct SourceRuleSet {
 fn load_rule_sets(
     config: &RouteConfig,
     fetch_remote: bool,
+    prefetched: Option<&HashMap<String, Vec<u8>>>,
 ) -> Result<HashMap<String, Vec<CompiledRule>>> {
     let mut result = HashMap::new();
     for set in &config.rule_set {
@@ -695,6 +946,11 @@ fn load_rule_sets(
             "remote" => {
                 if !fetch_remote {
                     Vec::new()
+                } else if let Some(prefetched) = prefetched
+                    && let Some(data) = prefetched.get(&set.tag)
+                {
+                    decode_rule_set(data, rule_set_format(set, set.url.as_deref().unwrap_or(""))?)
+                        .with_context(|| format!("parse remote rule-set {}", set.tag))?
                 } else {
                     load_remote_rule_set(set)?
                 }
@@ -713,7 +969,7 @@ fn load_rule_sets(
 }
 
 pub(crate) fn load_rule_set_ip_cidrs(config: &RouteConfig, tags: &[String]) -> Result<Vec<IpNet>> {
-    let sets = load_rule_sets(config, true)?;
+    let sets = load_rule_sets(config, true, None)?;
     extract_rule_set_ip_cidrs(&sets, tags)
 }
 
@@ -1324,5 +1580,184 @@ mod tests {
         assert!(scope.mac);
         assert!(!scope.process);
         assert!(!scope.network);
+    }
+
+    #[test]
+    fn dns_matches_domain_ignores_ip_cidr_rules() {
+        let set = [
+            CompiledRule::compile(
+                &RouteRule {
+                    domain_suffix: ["example.com".into()].to_vec(),
+                    ..Default::default()
+                },
+                &HashMap::new(),
+                false,
+            )
+            .unwrap(),
+            CompiledRule::compile(
+                &RouteRule {
+                    ip_cidr: ["10.0.0.0/8".into()].to_vec(),
+                    ..Default::default()
+                },
+                &HashMap::new(),
+                false,
+            )
+            .unwrap(),
+        ];
+        let domain = &set[0];
+        assert!(domain.dns_matches_domain("www.example.com"));
+        assert!(!domain.dns_matches_domain("www.elsewhere.net"));
+        let cidr = &set[1];
+        // sing-box IgnoreDestinationIPCIDRMatch: pure-CIDR rules match any
+        // name during the domain phase; the address limit is enforced after
+        // resolution instead.
+        assert!(cidr.dns_matches_domain("www.example.com"));
+        assert!(cidr.dns_contains_ip_cidr());
+        assert!(!domain.dns_contains_ip_cidr());
+    }
+
+    #[test]
+    fn dns_matches_address_checks_cidr_rules() {
+        let cidr = CompiledRule::compile(
+            &RouteRule {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(cidr.dns_matches_address("10.1.2.3".parse().unwrap(), None));
+        assert!(!cidr.dns_matches_address("11.0.0.1".parse().unwrap(), None));
+        let mixed = CompiledRule::compile(
+            &RouteRule {
+                domain_suffix: vec!["example.com".into()],
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            &HashMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(mixed.dns_matches_address("10.1.2.3".parse().unwrap(), Some("www.example.com")));
+        assert!(!mixed.dns_matches_address("10.1.2.3".parse().unwrap(), Some("www.elsewhere.net")));
+        assert!(!mixed.dns_matches_address("11.1.2.3".parse().unwrap(), Some("www.example.com")));
+    }
+
+    #[test]
+    fn requires_destination_ip_detects_ip_dependent_rules() {
+        let compile = |rule: RouteRule| {
+            CompiledRule::compile(&rule, &HashMap::new(), true).unwrap()
+        };
+        assert!(!compile(RouteRule {
+            domain_suffix: vec!["example.com".into()],
+            outbound: Some("proxy".into()),
+            ..Default::default()
+        })
+        .requires_destination_ip);
+        assert!(compile(RouteRule {
+            ip_cidr: vec!["10.0.0.0/8".into()],
+            outbound: Some("proxy".into()),
+            ..Default::default()
+        })
+        .requires_destination_ip);
+        assert!(compile(RouteRule {
+            ip_version: vec![4],
+            outbound: Some("proxy".into()),
+            ..Default::default()
+        })
+        .requires_destination_ip);
+        assert!(compile(RouteRule {
+            ip_is_private: true,
+            outbound: Some("proxy".into()),
+            ..Default::default()
+        })
+        .requires_destination_ip);
+        let logical = compile(RouteRule {
+            r#type: "logical".into(),
+            mode: Some("or".into()),
+            rules: vec![RouteRule {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            }],
+            outbound: Some("proxy".into()),
+            ..Default::default()
+        });
+        assert!(logical.requires_destination_ip);
+    }
+
+    #[test]
+    fn next_action_lazy_requests_resolution_for_ip_rules() {
+        let router = Router::compile(
+            &RouteConfig {
+                rules: vec![
+                    RouteRule {
+                        domain_suffix: vec!["example.com".into()],
+                        ip_cidr: vec!["10.0.0.0/8".into()],
+                        outbound: Some("proxy".into()),
+                        ..Default::default()
+                    },
+                    RouteRule {
+                        domain_suffix: vec!["elsewhere.net".into()],
+                        outbound: Some("direct".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            "direct",
+        )
+        .unwrap();
+        let context = RouteContext {
+            domain: Some("www.example.com"),
+            destination_ips: &[],
+            ..Default::default()
+        };
+        match router.next_action_lazy(&context, 0) {
+            ActionLookup::NeedResolve { index } => assert_eq!(index, 0),
+            other => panic!("expected NeedResolve, got {other:?}"),
+        }
+        // A domain whose rule doesn't need an IP resolves to the action directly.
+        let context = RouteContext {
+            domain: Some("www.elsewhere.net"),
+            destination_ips: &[],
+            ..Default::default()
+        };
+        match router.next_action_lazy(&context, 0) {
+            ActionLookup::Action { action, .. } => {
+                assert!(matches!(*action, RuleAction::Route { .. }))
+            }
+            other => panic!("expected Action, got {other:?}"),
+        }
+        // Non-domain contexts never trigger resolution.
+        let context = RouteContext {
+            domain: Some("www.example.com"),
+            destination_ip: Some("10.1.2.3".parse().unwrap()),
+            destination_ips: &[],
+            ..Default::default()
+        };
+        match router.next_action_lazy(&context, 0) {
+            ActionLookup::Action { .. } => {}
+            other => panic!("expected Action with resolved IP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn domain_fields_match_only_checks_domain_conditions() {
+        let rule = CompiledRule::compile(
+            &RouteRule {
+                domain_suffix: vec!["example.com".into()],
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            },
+            &HashMap::new(),
+            true,
+        )
+        .unwrap();
+        assert!(rule.domain_fields_match(Some("www.example.com")));
+        assert!(!rule.domain_fields_match(Some("www.elsewhere.net")));
+        assert!(!rule.domain_fields_match(None));
     }
 }

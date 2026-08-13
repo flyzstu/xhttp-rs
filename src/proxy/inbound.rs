@@ -26,8 +26,9 @@ pub async fn run_socks(
     outbounds: Vec<Outbound>,
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
+    http_clients: Vec<crate::singbox::HttpClientConfig>,
 ) -> Result<()> {
-    let runtime = Arc::new(build_runtime(outbounds, route, dns).await?);
+    let runtime = Arc::new(build_runtime(outbounds, route, dns, http_clients).await?);
     run_socks_with_runtime(inbound, runtime).await
 }
 
@@ -142,6 +143,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         decision,
         destination,
         options: route_options,
+        resolved_addresses,
     } = evaluation;
     if decision == RouteDecision::HijackDns {
         let resolver = runtime
@@ -222,7 +224,7 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         )?;
     } else {
         let mut remote: BoxIo =
-            Box::new(connect_direct(&destination, runtime.resolver.as_deref(), &route_options).await?);
+            Box::new(connect_direct(&destination, runtime.resolver.as_deref(), &route_options, &resolved_addresses).await?);
         if let Some(reply) = &reply {
             local.write_all(reply).await?
         }

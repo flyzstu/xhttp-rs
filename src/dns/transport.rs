@@ -22,11 +22,35 @@ use crate::singbox::DnsServer;
 use super::message::dns_id;
 use super::{MAX_DNS_MESSAGE, STREAM_IDLE_TIMEOUT, STREAM_POOL_SIZE, DNS_TIMEOUT};
 
+pub(crate) type DetourUdpFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+pub(crate) type DetourTcpFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn DnsIo>>> + Send + 'a>>;
+
+/// A UDP datagram channel that can be relayed through a proxy outbound.
+pub(crate) trait DnsUdpDetour: Send + Sync {
+    /// Send one DNS wire query to `destination` through the outbound `tag`
+    /// and return the response wire bytes.
+    fn exchange_udp(
+        &self,
+        tag: &str,
+        destination: SocketAddr,
+        request: &[u8],
+    ) -> DetourUdpFuture<'_>;
+    /// Open a TCP stream through the outbound `tag` to `destination`.
+    fn connect_tcp(&self, tag: &str, destination: SocketAddr) -> DetourTcpFuture<'_>;
+}
+
+/// Shared handle to the detour outbound provider installed by the runtime.
+pub(crate) type DnsDetourHandle = std::sync::RwLock<Option<Arc<dyn DnsUdpDetour>>>;
+
 pub(super) struct Upstream {
     pub(super) config: DnsServer,
     endpoint: Option<Arc<Endpoint>>,
     udp: OnceCell<Arc<UdpMultiplexer>>,
     stream: Option<TcpPool>,
+    detour: DnsDetourHandle,
+    detour_tls: Option<TlsConnector>,
 }
 pub(super) struct Endpoint {
     host: String,
@@ -51,7 +75,10 @@ pub(super) struct IdleConnection {
     last_used: Instant,
 }
 impl Upstream {
-    pub(super) fn new(config: DnsServer, dot_tls: Option<TlsConnector>) -> Result<Self> {
+    pub(super) fn new(
+        config: DnsServer,
+        dot_tls: Option<TlsConnector>,
+    ) -> Result<Self> {
         let kind = config.r#type.as_str();
         if !matches!(kind, "" | "udp" | "tcp" | "tls" | "https" | "local") {
             bail!("unsupported DNS server type: {kind}")
@@ -78,7 +105,7 @@ impl Upstream {
             )),
             "tls" => Some(TcpPool::new(
                 endpoint.clone().expect("DoT endpoint"),
-                Some(dot_tls.context("DoT TLS configuration unavailable")?),
+                dot_tls.clone(),
             )),
             _ => None,
         };
@@ -87,10 +114,36 @@ impl Upstream {
             endpoint,
             udp: OnceCell::new(),
             stream,
+            detour: DnsDetourHandle::new(None),
+            detour_tls: dot_tls,
         })
     }
 
+    pub(super) fn set_detour(&self, detour: Arc<dyn DnsUdpDetour>) {
+        *self
+            .detour
+            .write()
+            .expect("DNS detour lock poisoned") = Some(detour);
+    }
+
     pub(super) async fn query(&self, http: &reqwest::Client, request: &[u8]) -> Result<Vec<u8>> {
+        let has_detour = self
+            .config
+            .detour
+            .as_deref()
+            .is_some_and(|tag| !tag.is_empty());
+        let detour = if has_detour {
+            self.detour
+                .read()
+                .expect("DNS detour lock poisoned")
+                .clone()
+        } else {
+            None
+        };
+        if let Some(detour) = detour {
+            let endpoint = self.endpoint.as_ref().context("detour DNS server missing address")?;
+            return query_via_detour(&detour, &self.config, endpoint, request, self.detour_tls.as_ref()).await;
+        }
         match self.config.r#type.as_str() {
             "" | "udp" => {
                 let endpoint = self.endpoint.as_ref().expect("UDP endpoint");
@@ -313,9 +366,57 @@ async fn exchange_stream(stream: &mut dyn DnsIo, q: &[u8]) -> Result<Vec<u8>> {
     Ok(response)
 }
 
-pub(super) trait DnsIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub(crate) trait DnsIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DnsIo for T {}
-async fn query_https(http: &reqwest::Client, s: &DnsServer, q: &[u8]) -> Result<Vec<u8>> {
+
+/// Run a DNS query through a detour outbound. UDP servers use the outbound's
+/// UDP session (XUDP or AnyTLS UoT); TCP/TLS servers use a TCP stream through
+/// the outbound, with TLS applied for `tls` servers. HTTPS DNS over a detour
+/// is not supported.
+async fn query_via_detour(
+    detour: &Arc<dyn DnsUdpDetour>,
+    config: &DnsServer,
+    endpoint: &Arc<Endpoint>,
+    request: &[u8],
+    dot_tls: Option<&TlsConnector>,
+) -> Result<Vec<u8>> {
+    let tag = config
+        .detour
+        .as_deref()
+        .context("DNS detour tag missing")?;
+    let address = endpoint.resolve().await?;
+    match config.r#type.as_str() {
+        "" | "udp" => {
+            let response = detour.exchange_udp(tag, address, request).await?;
+            if response.get(2).is_some_and(|flags| flags & 2 != 0) {
+                let mut stream = detour.connect_tcp(tag, address).await?;
+                exchange_stream(&mut *stream, request).await
+            } else {
+                Ok(response)
+            }
+        }
+        "tcp" => {
+            let mut stream = detour.connect_tcp(tag, address).await?;
+            exchange_stream(&mut *stream, request).await
+        }
+        "tls" => {
+            let tcp = detour.connect_tcp(tag, address).await?;
+            let connector = dot_tls.context("DoT detour TLS configuration unavailable")?;
+            let server_name = config
+                .server
+                .as_deref()
+                .unwrap_or_default()
+                .to_owned();
+            let name = rustls::pki_types::ServerName::try_from(server_name)
+                .context("invalid DoT server name")?;
+            let mut stream = connector.connect(name, tcp).await?;
+            exchange_stream(&mut stream, request).await
+        }
+        "https" => bail!("HTTPS DNS over a detour outbound is not supported"),
+        "local" => bail!("local DNS server cannot use a detour"),
+        other => bail!("unsupported DNS server type for detour: {other}"),
+    }
+}async fn query_https(http: &reqwest::Client, s: &DnsServer, q: &[u8]) -> Result<Vec<u8>> {
     let host = s
         .server
         .as_deref()

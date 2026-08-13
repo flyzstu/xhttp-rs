@@ -132,6 +132,7 @@ fn resolver(address: SocketAddr, disable_cache: bool) -> DnsResolver {
             server: Some(address.ip().to_string()),
             server_port: Some(address.port()),
             path: None,
+                detour: None,
         }],
         final_server: Some("benchmark".into()),
         disable_cache: Some(disable_cache),
