@@ -445,6 +445,9 @@ pub struct TlsConfig {
     pub enabled: bool,
     pub server_name: Option<String>,
     pub insecure: bool,
+    pub disable_sni: bool,
+    pub min_version: Option<String>,
+    pub max_version: Option<String>,
     pub certificate: Vec<String>,
     pub key: Vec<String>,
     pub certificate_path: Option<String>,
@@ -622,8 +625,23 @@ impl XHttpTransport {
         Ok(c)
     }
 }
-fn parse_placement(v: &str) -> Result<crate::config::Placement> {
-    Ok(match v {
+fn validate_tls_versions(tls: Option<&TlsConfig>) -> Result<()> {
+    let Some(tls) = tls else {
+        return Ok(());
+    };
+    for (name, value) in [
+        ("min_version", tls.min_version.as_deref()),
+        ("max_version", tls.max_version.as_deref()),
+    ] {
+        if let Some(value) = value {
+            crate::tls::parse_tls_version(value)
+                .with_context(|| format!("invalid TLS {name}: {value}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_placement(v: &str) -> Result<crate::config::Placement> {    Ok(match v {
         "path" => crate::config::Placement::Path,
         "query" => crate::config::Placement::Query,
         "header" => crate::config::Placement::Header,
@@ -883,6 +901,7 @@ impl SingBoxConfig {
     }
 
     fn validate_outbound(&self, outbound: &Outbound) -> Result<()> {
+        validate_tls_versions(outbound.tls.as_ref())?;
         match outbound.r#type.as_str() {
             "direct" | "block" | "selector" | "urltest" => {}
             "vless" => {

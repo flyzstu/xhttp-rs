@@ -613,6 +613,9 @@ pub async fn build_runtime(
                     transport,
                     tls: ClientTlsConfig {
                         insecure: tls.insecure,
+                        disable_sni: tls.disable_sni,
+                        min_version: tls.min_version.clone(),
+                        max_version: tls.max_version.clone(),
                         ca_certificate: tls.certificate_path,
                         ca_pem: if tls.certificate.is_empty() {
                             None

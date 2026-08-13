@@ -305,4 +305,7 @@ pub struct ClientTlsConfig {
     pub ech_config_path: Option<String>,
     #[serde(skip)]
     pub ech_config_bytes: Option<Vec<u8>>,
+    pub disable_sni: bool,
+    pub min_version: Option<String>,
+    pub max_version: Option<String>,
 }

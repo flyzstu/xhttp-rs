@@ -20,6 +20,49 @@ pub struct ClientOptions {
     pub certificate_public_key_sha256: Vec<[u8; 32]>,
     pub client_certificate: Option<Vec<u8>>,
     pub client_key: Option<Vec<u8>>,
+    pub disable_sni: bool,
+    pub min_version: Option<u16>,
+    pub max_version: Option<u16>,
+}
+
+/// Parse a sing-box TLS version string (`1.2` or `1.3`) into the wire
+/// protocol version number used by rustls.
+pub fn parse_tls_version(value: &str) -> Result<u16> {
+    match value {
+        "1.2" => Ok(0x0303),
+        "1.3" => Ok(0x0304),
+        value => bail!("unsupported TLS version: {value}"),
+    }
+}
+
+fn protocol_version_number(version: rustls::ProtocolVersion) -> u16 {
+    match version {
+        rustls::ProtocolVersion::SSLv2 => 0x0002,
+        rustls::ProtocolVersion::SSLv3 => 0x0300,
+        rustls::ProtocolVersion::TLSv1_0 => 0x0301,
+        rustls::ProtocolVersion::TLSv1_1 => 0x0302,
+        rustls::ProtocolVersion::TLSv1_2 => 0x0303,
+        rustls::ProtocolVersion::TLSv1_3 => 0x0304,
+        rustls::ProtocolVersion::DTLSv1_0 => 0xFEFF,
+        rustls::ProtocolVersion::DTLSv1_2 => 0xFEFD,
+        rustls::ProtocolVersion::DTLSv1_3 => 0xFEFC,
+        rustls::ProtocolVersion::Unknown(value) => value,
+        _ => 0,
+    }
+}
+
+fn select_protocol_versions(
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Vec<&'static rustls::SupportedProtocolVersion> {
+    let mut versions = Vec::new();
+    for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+        let number = protocol_version_number(version.version);
+        if min.is_none_or(|bound| number >= bound) && max.is_none_or(|bound| number <= bound) {
+            versions.push(version);
+        }
+    }
+    versions
 }
 
 pub fn build_client_config(options: &ClientOptions) -> Result<Arc<rustls::ClientConfig>> {
@@ -56,9 +99,11 @@ pub fn build_client_config(options: &ClientOptions) -> Result<Arc<rustls::Client
     let builder = if let Some(raw) = &options.ech_config {
         builder.with_ech(rustls::client::EchMode::Enable(parse_ech_config(raw)?))?
     } else {
-        builder
-            .with_safe_default_protocol_versions()
-            .context("select TLS protocol versions")?
+        let versions = select_protocol_versions(options.min_version, options.max_version);
+        if versions.is_empty() {
+            bail!("TLS min_version/max_version leave no supported protocol versions")
+        }
+        builder.with_protocol_versions(&versions)?
     };
     let builder = if options.insecure || !options.certificate_public_key_sha256.is_empty() {
         builder
@@ -78,6 +123,7 @@ pub fn build_client_config(options: &ClientOptions) -> Result<Arc<rustls::Client
         _ => unreachable!("client certificate/key pairing was validated"),
     };
     config.alpn_protocols = options.alpn.clone();
+    config.enable_sni = !options.disable_sni;
     Ok(Arc::new(config))
 }
 
@@ -245,5 +291,43 @@ mod tests {
             ..Default::default()
         };
         assert!(build_client_config(&options).is_err());
+    }
+
+    #[test]
+    fn protocol_version_selection_honors_min_and_max() {
+        let all = select_protocol_versions(None, None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(select_protocol_versions(Some(0x0304), None).len(), 1);
+        assert_eq!(select_protocol_versions(None, Some(0x0303)).len(), 1);
+        assert_eq!(
+            select_protocol_versions(Some(0x0304), Some(0x0303)).len(),
+            0
+        );
+        assert_eq!(select_protocol_versions(Some(0x0303), Some(0x0304)).len(), 2);
+    }
+
+    #[test]
+    fn parse_tls_version_accepts_12_and_13() {
+        assert_eq!(parse_tls_version("1.2").unwrap(), 0x0303);
+        assert_eq!(parse_tls_version("1.3").unwrap(), 0x0304);
+        assert!(parse_tls_version("1.1").is_err());
+        assert!(parse_tls_version("1.4").is_err());
+    }
+
+    #[test]
+    fn disable_sni_is_applied() {
+        let config = build_client_config(&ClientOptions {
+            insecure: true,
+            disable_sni: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!config.enable_sni);
+        let config = build_client_config(&ClientOptions {
+            insecure: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(config.enable_sni);
     }
 }

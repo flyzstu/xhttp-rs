@@ -688,6 +688,17 @@ fn build_client_tls(
         )?,
         client_certificate,
         client_key,
+        disable_sni: tls.disable_sni,
+        min_version: tls
+            .min_version
+            .as_deref()
+            .map(crate::tls::parse_tls_version)
+            .transpose()?,
+        max_version: tls
+            .max_version
+            .as_deref()
+            .map(crate::tls::parse_tls_version)
+            .transpose()?,
     })
 }
 

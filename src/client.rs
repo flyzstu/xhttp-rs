@@ -303,6 +303,19 @@ fn build_http_client(config: &ClientConfig) -> Result<HttpClient> {
         )?,
         client_certificate,
         client_key,
+        disable_sni: config.tls.disable_sni,
+        min_version: config
+            .tls
+            .min_version
+            .as_deref()
+            .map(crate::tls::parse_tls_version)
+            .transpose()?,
+        max_version: config
+            .tls
+            .max_version
+            .as_deref()
+            .map(crate::tls::parse_tls_version)
+            .transpose()?,
     })?;
     b = b.use_preconfigured_tls((*tls).clone());
     b.build().context("build XHTTP HTTP client")
