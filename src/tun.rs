@@ -344,6 +344,7 @@ pub async fn run(
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
     http_clients: Vec<crate::singbox::HttpClientConfig>,
+    dns_cache_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut config = TunConfig::from_inbound(&inbound)?;
     let static_route_addresses = config.route_addresses.clone();
@@ -385,7 +386,7 @@ pub async fn run(
         route.auto_detect_interface = Some(false);
     }
     let rule_set_route = route.clone();
-    let mut runtime = proxy::build_runtime(outbounds, Some(route), dns, http_clients).await?;
+    let mut runtime = proxy::build_runtime(outbounds, Some(route), dns, http_clients, dns_cache_path).await?;
     if config.auto_redirect {
         runtime.set_tun_output_mark(config.redirect_output_mark);
     }

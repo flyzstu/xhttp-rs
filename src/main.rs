@@ -109,6 +109,13 @@ async fn run(config: SingBoxConfig) -> Result<()> {
         .experimental
         .as_ref()
         .and_then(|experimental| experimental.clash_api.clone());
+    let dns_cache_path = config
+        .experimental
+        .as_ref()
+        .and_then(|experimental| experimental.cache_file.as_ref())
+        .filter(|cache_file| cache_file.enabled && cache_file.store_dns)
+        .and_then(|cache_file| cache_file.path.as_deref())
+        .map(std::path::PathBuf::from);
     let shared_runtime = if clash_api.is_some() {
         Some(std::sync::Arc::new(
             xhttp::proxy::build_runtime(
@@ -116,6 +123,7 @@ async fn run(config: SingBoxConfig) -> Result<()> {
                 config.route.clone(),
                 config.dns.clone(),
                 config.http_clients.clone(),
+                dns_cache_path.clone(),
             )
             .await?,
         ))
@@ -128,7 +136,10 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let route = config.route.clone();
             let dns = config.dns.clone();
             let http_clients = config.http_clients.clone();
-            tasks.spawn(async move { xhttp::tun::run(inbound, outbounds, route, dns, http_clients).await });
+            let dns_cache_path = dns_cache_path.clone();
+            tasks.spawn(async move {
+                xhttp::tun::run(inbound, outbounds, route, dns, http_clients, dns_cache_path).await
+            });
             continue;
         }
         if matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
@@ -139,8 +150,19 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             if let Some(runtime) = shared_runtime.clone() {
                 tasks.spawn(async move { xhttp::proxy::run_socks_with_runtime(inbound, runtime).await });
             } else {
+                let dns_cache_path = dns_cache_path.clone();
                 tasks.spawn(
-                    async move { xhttp::proxy::run_socks(inbound, outbounds, route, dns, http_clients).await },
+                    async move {
+                        xhttp::proxy::run_socks(
+                            inbound,
+                            outbounds,
+                            route,
+                            dns,
+                            http_clients,
+                            dns_cache_path,
+                        )
+                        .await
+                    },
                 );
             }
             continue;
@@ -150,8 +172,9 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let route = config.route.clone();
             let dns = config.dns.clone();
             let http_clients = config.http_clients.clone();
+            let dns_cache_path = dns_cache_path.clone();
             tasks.spawn(
-                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns, http_clients).await },
+                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns, http_clients, dns_cache_path).await },
             );
             continue;
         }

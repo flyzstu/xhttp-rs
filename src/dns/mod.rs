@@ -165,6 +165,60 @@ impl DnsResolver {
             .write()
             .expect("DNS detour lock poisoned") = Some(detour);
     }
+
+    /// Load persisted DNS cache entries from the `cache_file` path, and
+    /// spawn a periodic saver that writes back every 60 seconds.
+    pub(crate) fn start_persistence(&self, path: &std::path::Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<cache::PersistentCache>(&bytes) {
+                Ok(snapshot) => {
+                    self.inner
+                        .cache
+                        .lock()
+                        .expect("DNS cache lock poisoned")
+                        .restore(snapshot);
+                    tracing::info!("restored DNS cache from {}", path.display());
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "discarding unreadable persisted DNS cache at {}",
+                    path.display()
+                ),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to read persisted DNS cache at {}",
+                path.display()
+            ),
+        }
+        let resolver = self.clone();
+        let path = path.to_owned();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                resolver.save_cache(&path);
+            }
+        });
+    }
+
+    fn save_cache(&self, path: &std::path::Path) {
+        let snapshot = self
+            .inner
+            .cache
+            .lock()
+            .expect("DNS cache lock poisoned")
+            .snapshot();
+        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Err(error) = std::fs::write(path, bytes) {
+            tracing::warn!(%error, "failed to persist DNS cache");
+        }
+    }
     pub async fn lookup(&self, domain: &str) -> Result<Vec<IpAddr>> {
         self.lookup_with_options(domain, &LookupOptions::default())
             .await
@@ -1077,5 +1131,53 @@ mod tests {
         let (addresses, _) = parse_response(11, 1, &response).unwrap();
         assert_eq!(addresses, vec![IpAddr::from([1, 2, 3, 4])]);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_persistence_saves_and_restores_across_resolvers() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..2 {
+                let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                observed.fetch_add(1, Ordering::Relaxed);
+                let response = answer_query(&buffer[..length]);
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let mut config = test_server("udp", address);
+        config.disable_cache = Some(false);
+        let resolver = DnsResolver::new(&config).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "xhttp-rs-dns-cache-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        resolver
+            .lookup_with_options("persisted.example", &LookupOptions::default())
+            .await
+            .unwrap();
+        resolver.save_cache(&path);
+        assert!(std::fs::read(&path).unwrap().len() > 10);
+
+        // A fresh resolver restores the entry; the restored cache answers
+        // the second lookup without touching the upstream again.
+        let resolver = DnsResolver::new(&config).unwrap();
+        resolver.start_persistence(&path);
+        resolver
+            .lookup_with_options("persisted.example", &LookupOptions::default())
+            .await
+            .unwrap();
+        resolver
+            .lookup_with_options("persisted.example", &LookupOptions::default())
+            .await
+            .unwrap();
+        // 2 total upstream hits: first resolver, then the restored cache
+        // answers both lookups.
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }

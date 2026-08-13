@@ -553,6 +553,7 @@ pub async fn build_runtime(
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
     http_clients: Vec<crate::singbox::HttpClientConfig>,
+    dns_cache_path: Option<std::path::PathBuf>,
 ) -> Result<ProxyRuntime> {
     let mut route_config = route.unwrap_or_default();
     if route_config.auto_detect_interface == Some(true) {
@@ -571,6 +572,9 @@ pub async fn build_runtime(
         .map(|config| DnsResolver::with_rule_sets(config, Some(rule_set_slot.clone())))
         .transpose()?
         .map(Arc::new);
+    if let (Some(resolver), Some(path)) = (&resolver, dns_cache_path) {
+        resolver.start_persistence(&path);
+    }
     let mut dialers = HashMap::new();
     let mut groups = HashMap::new();
     for outbound in outbounds {
@@ -734,7 +738,13 @@ pub async fn build_runtime(
             .expect("route rule-set lock poisoned")
             .clone();
     }
-    start_rule_set_updater(router.clone(), route_config, default, http_clients, provider);
+    start_rule_set_updater(
+        router.clone(),
+        route_config,
+        default,
+        http_clients,
+        provider.clone(),
+    );
     let runtime = ProxyRuntime {
         dialers,
         groups: Arc::new(groups),
@@ -759,15 +769,7 @@ impl ProxyRuntime {
     /// Resolve a dialer by tag, following `selector`/`urltest` groups to their
     /// currently selected member.
     pub(crate) fn dialer_for(&self, tag: &str) -> Option<Dialer> {
-        let mut current = tag.to_owned();
-        for _ in 0..8 {
-            if let Dialer::Group(group) = self.dialers.get(&current)? {
-                current = group.now();
-                continue;
-            }
-            return self.dialers.get(&current).cloned();
-        }
-        None
+        resolve_grouped_dialer(&self.dialers, tag)
     }
 
     #[allow(dead_code)]
@@ -940,13 +942,36 @@ async fn prefetch_rule_sets(
         let Some(url) = set.url.as_deref() else {
             continue;
         };
-        match provider.fetch_url(detour, url).await {
-            Ok(data) => {
+        let Ok(format) = crate::routing::rule_set_format_for(set, url) else {
+            continue;
+        };
+        let cache_path = crate::routing::rule_set_cache_path(url, format);
+        let cached_etag = std::fs::read(cache_path.with_extension("etag"))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .filter(|value| !value.is_empty());
+        match provider.fetch_url_etag(detour, url, cached_etag.as_deref()).await {
+            Ok((data, new_etag, not_modified)) => {
+                if not_modified {
+                    tracing::debug!(tag = %set.tag, "remote rule-set not modified");
+                    if let Ok(data) = std::fs::read(&cache_path) {
+                        prefetched.insert(set.tag.clone(), data);
+                    }
+                    continue;
+                }
                 tracing::info!(
                     tag = %set.tag,
                     bytes = data.len(),
                     "prefetched remote rule-set through http_client"
                 );
+                if let Err(error) = crate::routing::write_rule_set_cache(&cache_path, &data) {
+                    tracing::warn!(%error, tag = %set.tag, "failed to write rule-set cache");
+                }
+                if let Some(etag) = new_etag
+                    && let Err(error) = std::fs::write(cache_path.with_extension("etag"), etag)
+                {
+                    tracing::warn!(%error, tag = %set.tag, "failed to write rule-set etag");
+                }
                 prefetched.insert(set.tag.clone(), data);
             }
             Err(error) => tracing::warn!(
@@ -1078,7 +1103,7 @@ mod tests {
             tag: Some("direct".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new()));
+        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
@@ -1133,7 +1158,7 @@ mod tests {
             final_outbound: Some("proxy".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, outbounds, Some(route), None, Vec::new()));
+        let task = tokio::spawn(run_socks(inbound, outbounds, Some(route), None, Vec::new(), None));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
@@ -1183,7 +1208,7 @@ mod tests {
             tag: Some("direct".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new()));
+        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client
@@ -1260,7 +1285,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let proxy_task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new()));
+        let proxy_task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut control = TcpStream::connect(proxy_addr).await.unwrap();

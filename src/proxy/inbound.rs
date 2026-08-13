@@ -27,8 +27,9 @@ pub async fn run_socks(
     route: Option<RouteConfig>,
     dns: Option<DnsConfig>,
     http_clients: Vec<crate::singbox::HttpClientConfig>,
+    dns_cache_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let runtime = Arc::new(build_runtime(outbounds, route, dns, http_clients).await?);
+    let runtime = Arc::new(build_runtime(outbounds, route, dns, http_clients, dns_cache_path).await?);
     run_socks_with_runtime(inbound, runtime).await
 }
 

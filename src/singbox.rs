@@ -97,6 +97,15 @@ pub struct HttpClientConfig {
 #[serde(default)]
 pub struct ExperimentalConfig {
     pub clash_api: Option<ClashApiConfig>,
+    pub cache_file: Option<CacheFileConfig>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CacheFileConfig {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub store_fakeip: bool,
+    pub store_dns: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -801,6 +810,33 @@ impl SingBoxConfig {
             })
         {
             bail!("clash_api requires external_controller")
+        }
+        if let Some(cache_file) = self
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.cache_file.as_ref())
+            .filter(|cache_file| cache_file.enabled)
+        {
+            if cache_file.store_fakeip {
+                bail!("cache_file store_fakeip requires fake-IP DNS and is not supported")
+            }
+            if cache_file.store_dns {
+                cache_file
+                    .path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .context("cache_file store_dns requires a path")?;
+            }
+        }
+        if let Some(detour) = self
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.clash_api.as_ref())
+            .and_then(|clash_api| clash_api.external_ui_download_detour.as_deref())
+            .filter(|tag| !tag.is_empty())
+            && !outbound_tags.contains(detour)
+        {
+            bail!("clash_api external_ui_download_detour references unknown outbound: {detour}")
         }
         Ok(())
     }

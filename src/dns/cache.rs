@@ -1,10 +1,11 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, VecDeque},
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
 
@@ -23,11 +24,44 @@ pub(super) enum CacheKey {
         server: Arc<str>,
     },
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum CacheValue {
     Addresses(Vec<IpAddr>),
     Wire(Vec<u8>),
 }
+
+/// Serializable snapshot of the cache for `cache_file` persistence.
+#[derive(Serialize, Deserialize)]
+pub(super) struct PersistentCache {
+    entries: Vec<PersistentEntry>,
+}
+#[derive(Serialize, Deserialize)]
+struct PersistentEntry {
+    key: PersistentKey,
+    value: PersistentValue,
+    /// Absolute expiry as seconds since the Unix epoch; entries already
+    /// expired are dropped on restore.
+    expires_at: u64,
+}
+#[derive(Serialize, Deserialize)]
+enum PersistentKey {
+    Lookup {
+        name: String,
+        qtype: u16,
+        server: Option<String>,
+        client_subnet: Option<String>,
+    },
+    Wire {
+        query: Vec<u8>,
+        server: String,
+    },
+}
+#[derive(Serialize, Deserialize)]
+enum PersistentValue {
+    Addresses(Vec<IpAddr>),
+    Wire(Vec<u8>),
+}
+
 pub(super) struct CacheEntry {
     value: CacheValue,
     expires: Instant,
@@ -180,6 +214,89 @@ impl DnsCache {
             .collect();
         self.lru.make_contiguous().sort_by_key(|entry| entry.0);
     }
+
+    /// Snapshot live entries with absolute expiry for disk persistence.
+    pub(super) fn snapshot(&self) -> PersistentCache {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let entries = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                let remaining = entry.expires.saturating_duration_since(Instant::now()).as_secs();
+                if remaining == 0 {
+                    return None;
+                }
+                Some(PersistentEntry {
+                    key: match key {
+                        CacheKey::Lookup {
+                            name,
+                            qtype,
+                            server,
+                            client_subnet,
+                        } => PersistentKey::Lookup {
+                            name: name.to_string(),
+                            qtype: *qtype,
+                            server: server.as_ref().map(|value| value.to_string()),
+                            client_subnet: client_subnet.as_ref().map(|value| value.to_string()),
+                        },
+                        CacheKey::Wire { query, server } => PersistentKey::Wire {
+                            query: query.to_vec(),
+                            server: server.to_string(),
+                        },
+                    },
+                    value: match &entry.value {
+                        CacheValue::Addresses(addresses) => {
+                            PersistentValue::Addresses(addresses.clone())
+                        }
+                        CacheValue::Wire(bytes) => PersistentValue::Wire(bytes.clone()),
+                    },
+                    expires_at: now + remaining,
+                })
+            })
+            .collect();
+        PersistentCache { entries }
+    }
+
+    /// Restore previously persisted entries that have not expired.
+    pub(super) fn restore(&mut self, snapshot: PersistentCache) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for entry in snapshot.entries {
+            let Some(remaining) = entry.expires_at.checked_sub(now) else {
+                continue;
+            };
+            if remaining == 0 {
+                continue;
+            }
+            let key = match entry.key {
+                PersistentKey::Lookup {
+                    name,
+                    qtype,
+                    server,
+                    client_subnet,
+                } => CacheKey::Lookup {
+                    name: name.into(),
+                    qtype,
+                    server: server.map(Into::into),
+                    client_subnet: client_subnet.map(Into::into),
+                },
+                PersistentKey::Wire { query, server } => CacheKey::Wire {
+                    query: query.into(),
+                    server: server.into(),
+                },
+            };
+            let value = match entry.value {
+                PersistentValue::Addresses(addresses) => CacheValue::Addresses(addresses),
+                PersistentValue::Wire(bytes) => CacheValue::Wire(bytes),
+            };
+            self.insert(key, value, Duration::from_secs(remaining));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +423,77 @@ mod tests {
         for key in &keys {
             assert!(cache.get(key).is_some());
         }
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip() {
+        let mut cache = DnsCache::new(16, false);
+        cache.insert(
+            CacheKey::Lookup {
+                name: "example.com".into(),
+                qtype: 1,
+                server: Some("main".into()),
+                client_subnet: None,
+            },
+            CacheValue::Addresses(vec![IpAddr::from([1, 2, 3, 4])]),
+            Duration::from_secs(3600),
+        );
+        cache.insert(
+            CacheKey::Wire {
+                query: vec![0x12, 0x34].into(),
+                server: "main".into(),
+            },
+            CacheValue::Wire(vec![0x81, 0x80]),
+            Duration::from_secs(60),
+        );
+        let snapshot = cache.snapshot();
+        let serialized = serde_json::to_vec(&snapshot).unwrap();
+        let restored: PersistentCache = serde_json::from_slice(&serialized).unwrap();
+        let mut target = DnsCache::new(16, false);
+        target.restore(restored);
+        assert_eq!(
+            target
+                .get(&CacheKey::Lookup {
+                    name: "example.com".into(),
+                    qtype: 1,
+                    server: Some("main".into()),
+                    client_subnet: None,
+                }),
+            Some(CacheValue::Addresses(vec![IpAddr::from([1, 2, 3, 4])]))
+        );
+        assert_eq!(
+            target.get(&CacheKey::Wire {
+                query: vec![0x12, 0x34].into(),
+                server: "main".into(),
+            }),
+            Some(CacheValue::Wire(vec![0x81, 0x80]))
+        );
+    }
+
+    #[test]
+    fn restore_drops_expired_entries() {
+        let mut cache = DnsCache::new(16, false);
+        cache.insert(
+            CacheKey::Lookup {
+                name: "expired.example".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            },
+            CacheValue::Addresses(vec![IpAddr::from([9, 9, 9, 9])]),
+            Duration::from_millis(1),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        let mut target = DnsCache::new(16, false);
+        target.restore(cache.snapshot());
+        assert_eq!(
+            target.get(&CacheKey::Lookup {
+                name: "expired.example".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            }),
+            None
+        );
     }
 }
