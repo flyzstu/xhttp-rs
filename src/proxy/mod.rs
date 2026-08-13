@@ -208,6 +208,7 @@ pub struct ProxyRuntime {
     resolver: Option<Arc<DnsResolver>>,
     tun_output_mark: Option<u32>,
     clash_mode: Arc<RwLock<Option<String>>>,
+    provider: Arc<DetourProvider>,
 }
 
 /// Resolves outbound tags to tunneled connections for `detour` DNS servers.
@@ -370,7 +371,32 @@ impl DetourProvider {
         self.fetch_url_inner(tag, url, 0).await
     }
 
-    async fn fetch_url_inner(&self, tag: &str, url: &str, redirects: u8) -> Result<Vec<u8>> {
+    /// Fetch a URL with conditional request support: `etag` is sent as
+    /// `If-None-Match`, and a 304 response yields `(empty, etag, true)`.
+    pub(crate) async fn fetch_url_etag(
+        &self,
+        tag: &str,
+        url: &str,
+        etag: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>, bool)> {
+        let (data, headers, status) = self
+            .fetch_url_with_etag(tag, url, etag, 0)
+            .await?;
+        let new_etag = headers
+            .iter()
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("etag").then(|| value.clone())
+            });
+        Ok((data, new_etag, status == 304))
+    }
+
+    async fn fetch_url_with_etag(
+        &self,
+        tag: &str,
+        url: &str,
+        etag: Option<&str>,
+        redirects: u8,
+    ) -> Result<(Vec<u8>, Vec<(String, String)>, u16)> {
         if redirects > 5 {
             bail!("HTTP redirect limit exceeded for {url}")
         }
@@ -414,8 +440,12 @@ impl DetourProvider {
         } else {
             tcp
         };
+        let conditional = etag
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("If-None-Match: {value}\r\n"))
+            .unwrap_or_default();
         let request = format!(
-            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: xhttp-rs\r\nConnection: close\r\nAccept: */*\r\n\r\n"
+            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: xhttp-rs\r\nConnection: close\r\nAccept: */*\r\n{conditional}\r\n"
         );
         stream.write_all(request.as_bytes()).await?;
         stream.flush().await?;
@@ -432,19 +462,28 @@ impl DetourProvider {
                 .join(&location)
                 .context("invalid redirect Location")?
                 .to_string();
-            return Box::pin(self.fetch_url_inner(tag, &next, redirects + 1)).await;
+            return Box::pin(self.fetch_url_with_etag(tag, &next, etag, redirects + 1)).await;
         }
-        if status != 200 {
+        if status != 200 && status != 304 {
             bail!("rule-set download returned HTTP {status}")
         }
         if body.len() > 64 * 1024 * 1024 {
             bail!("rule-set download exceeds 64 MiB")
+        }
+        Ok((body, headers, status))
+    }
+
+    async fn fetch_url_inner(&self, tag: &str, url: &str, redirects: u8) -> Result<Vec<u8>> {
+        let (body, _, status) = self.fetch_url_with_etag(tag, url, None, redirects).await?;
+        if status == 304 {
+            bail!("unexpected 304 response without a conditional request")
         }
         Ok(body)
     }
 }
 
 /// Read an HTTP/1.1 response: status line, headers, and body. Handles
+/// `Content-Length`, chunked transfer encoding, and close-delimited bodies./// Read an HTTP/1.1 response: status line, headers, and body. Handles
 /// `Content-Length`, chunked transfer encoding, and close-delimited bodies.
 async fn read_http_response(
     stream: &mut dyn crate::dns::transport::DnsIo,
@@ -754,6 +793,12 @@ impl ProxyRuntime {
     /// Set the route fallback outbound (the GLOBAL selection in a Clash API).
     pub(crate) fn set_final_outbound(&self, tag: &str) {
         self.router.set_final_outbound(tag);
+    }
+
+    /// Fetch a URL through the outbound `tag`, used for the Clash dashboard
+    /// `external_ui_download_detour`.
+    pub(crate) async fn fetch_url_via(&self, tag: &str, url: &str) -> Result<Vec<u8>> {
+        self.provider.fetch_url(tag, url).await
     }
 
     #[allow(dead_code)]
@@ -1304,5 +1349,92 @@ mod tests {
         let (status, _, body) = read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>)).await.unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"body until close");
+    }
+
+    #[tokio::test]
+    async fn fetch_url_etag_returns_body_then_not_modified() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+        });
+        let mut dialers = HashMap::new();
+        dialers.insert("direct".into(), Dialer::Direct);
+        let provider = DetourProvider::new(Arc::new(dialers), None);
+        let url = format!("http://{address}/rules.json");
+        let (body, etag, not_modified) = provider.fetch_url_etag("direct", &url, None).await.unwrap();
+        assert_eq!(body, b"hello");
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        assert!(!not_modified);
+
+        // Second request with the etag gets 304 from a conditional server.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let (body, etag, not_modified) = provider
+            .fetch_url_etag("direct", &format!("http://{address}/rules.json"), Some("\"v1\""))
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        assert!(not_modified);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_etag_follows_redirects() {
+        use tokio::net::TcpListener;
+        let first = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        let second_addr = second.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = first.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{second_addr}/final\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        tokio::spawn(async move {
+            let (mut stream, _) = second.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nfinal!")
+                .await
+                .unwrap();
+        });
+        let mut dialers = HashMap::new();
+        dialers.insert("direct".into(), Dialer::Direct);
+        let provider = DetourProvider::new(Arc::new(dialers), None);
+        let (body, _, not_modified) = provider
+            .fetch_url_etag("direct", &format!("http://{first_addr}/start"), None)
+            .await
+            .unwrap();
+        assert_eq!(body, b"final!");
+        assert!(!not_modified);
     }
 }

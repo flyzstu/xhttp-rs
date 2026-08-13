@@ -104,7 +104,11 @@ pub struct ClashApiConfig {
     pub external_controller: Option<String>,
     pub external_ui: Option<String>,
     pub external_ui_download_url: Option<String>,
+    pub external_ui_download_detour: Option<String>,
     pub secret: Option<String>,
+    #[serde(deserialize_with = "one_or_many")]
+    pub access_control_allow_origin: Vec<String>,
+    pub access_control_allow_private_network: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

@@ -39,15 +39,63 @@ pub async fn run(config: ClashApiConfig, runtime: ProxyRuntime) -> Result<()> {
         .route("/configs", get(get_configs).patch(patch_configs))
         .route("/proxies", get(get_proxies))
         .route("/proxies/{name}", get(get_proxy).put(update_proxy))
-        .route("/proxies/{name}/delay", get(proxy_delay))
-        .with_state(state);
+        .route("/proxies/{name}/delay", get(proxy_delay));
+    if !config.access_control_allow_origin.is_empty() {
+        let mut layer = tower_http::cors::CorsLayer::new().allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::PUT,
+            axum::http::Method::PATCH,
+            axum::http::Method::OPTIONS,
+        ]);
+        if config
+            .access_control_allow_origin
+            .iter()
+            .any(|origin| origin == "*")
+        {
+            layer = layer.allow_origin(tower_http::cors::Any);
+        } else {
+            layer = layer.allow_origin(
+                config
+                    .access_control_allow_origin
+                    .iter()
+                    .filter_map(|origin| origin.parse().ok())
+                    .collect::<Vec<axum::http::HeaderValue>>(),
+            );
+        }
+        if config.access_control_allow_private_network {
+            layer = layer.allow_headers([axum::http::header::CONTENT_TYPE]);
+        }
+        app = app.layer(layer);
+        if config.access_control_allow_private_network {
+            app = app.layer(axum::middleware::from_fn(
+                |request: axum::extract::Request,
+                 next: axum::middleware::Next| async move {
+                    let mut response = next.run(request).await;
+                    response.headers_mut().insert(
+                        axum::http::header::HeaderName::from_static(
+                            "access-control-allow-private-network",
+                        ),
+                        axum::http::HeaderValue::from_static("true"),
+                    );
+                    response
+                },
+            ));
+        }
+    }
     if let Some(ui_dir) = config.external_ui.filter(|value| !value.is_empty()) {
-        ensure_ui(&ui_dir, config.external_ui_download_url.as_deref()).await?;
+        ensure_ui(
+            &ui_dir,
+            config.external_ui_download_url.as_deref(),
+            config.external_ui_download_detour.as_deref(),
+            &state.runtime,
+        )
+        .await?;
         app = app.nest_service(
             "/ui",
             tower_http::services::ServeDir::new(&ui_dir).append_index_html_on_directories(true),
         );
     }
+    let app = app.with_state(state);
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .with_context(|| format!("bind clash API on {address}"))?;
@@ -55,7 +103,12 @@ pub async fn run(config: ClashApiConfig, runtime: ProxyRuntime) -> Result<()> {
 }
 
 /// Download and extract the Yacd-meta dashboard into `ui_dir` if it is empty.
-async fn ensure_ui(ui_dir: &str, download_url: Option<&str>) -> Result<()> {
+async fn ensure_ui(
+    ui_dir: &str,
+    download_url: Option<&str>,
+    detour: Option<&str>,
+    runtime: &ProxyRuntime,
+) -> Result<()> {
     if std::fs::read_dir(ui_dir).is_ok_and(|mut entries| entries.next().is_some()) {
         return Ok(());
     }
@@ -64,22 +117,26 @@ async fn ensure_ui(ui_dir: &str, download_url: Option<&str>) -> Result<()> {
         .unwrap_or("https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip")
         .to_owned();
     tracing::info!("downloading Yacd-meta dashboard from {url}");
-    let bytes = tokio::task::spawn_blocking(move || {
-        let response = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .context("build UI download client")?
-            .get(&url)
-            .send()
-            .context("download external UI")?
-            .error_for_status()
-            .context("external UI download failed")?
-            .bytes()
-            .context("read external UI archive")?;
-        Ok::<Vec<u8>, anyhow::Error>(response.to_vec())
-    })
-    .await
-    .context("external UI download task failed")??;
+    let bytes = if let Some(detour) = detour.filter(|tag| !tag.is_empty()) {
+        runtime.fetch_url_via(detour, &url).await.context("download external UI through detour")?
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let response = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .context("build UI download client")?
+                .get(&url)
+                .send()
+                .context("download external UI")?
+                .error_for_status()
+                .context("external UI download failed")?
+                .bytes()
+                .context("read external UI archive")?;
+            Ok::<Vec<u8>, anyhow::Error>(response.to_vec())
+        })
+        .await
+        .context("external UI download task failed")??
+    };
     tracing::info!("downloaded {} bytes of Yacd-meta dashboard", bytes.len());
     let cursor = std::io::Cursor::new(bytes);
     let mut archive =
@@ -322,7 +379,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        build_runtime(outbounds, Some(RouteConfig::default()), None, Vec::new())
+        build_runtime(outbounds, Some(RouteConfig::default()), None, Vec::new(), None)
             .await
             .unwrap()
     }
@@ -343,6 +400,9 @@ mod tests {
             secret: None,
             external_ui: None,
             external_ui_download_url: None,
+            external_ui_download_detour: None,
+            access_control_allow_origin: Vec::new(),
+            access_control_allow_private_network: false,
         };
         let server = tokio::spawn(run(config, runtime));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -404,6 +464,9 @@ mod tests {
             secret: None,
             external_ui: None,
             external_ui_download_url: None,
+            external_ui_download_detour: None,
+            access_control_allow_origin: Vec::new(),
+            access_control_allow_private_network: false,
         };
         let server = tokio::spawn(run(config, runtime));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -425,6 +488,60 @@ mod tests {
 
         let configs: Value = client.get(format!("{base}/configs")).send().await.unwrap().json().await.unwrap();
         assert_eq!(configs["mode"], "global");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clash_api_emits_cors_and_private_network_headers() {
+        let runtime = selector_runtime().await;
+        let port = free_port().await;
+        let config = ClashApiConfig {
+            external_controller: Some(format!("127.0.0.1:{port}")),
+            secret: None,
+            external_ui: None,
+            external_ui_download_url: None,
+            external_ui_download_detour: None,
+            access_control_allow_origin: vec!["*".into()],
+            access_control_allow_private_network: true,
+        };
+        let server = tokio::spawn(run(config, runtime));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/version"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        // A preflight OPTIONS request is answered with the CORS headers.
+        let response = client
+            .request(reqwest::Method::OPTIONS, format!("http://127.0.0.1:{port}/proxies"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
 
         server.abort();
     }
