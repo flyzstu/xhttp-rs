@@ -47,9 +47,11 @@ async fn main() -> Result<()> {
 fn init_logging(
     log: Option<&xhttp::singbox::LogConfig>,
 ) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    let level = log
-        .and_then(|value| value.level.as_deref())
-        .unwrap_or("info");
+    let level = if log.is_some_and(|value| value.disabled) {
+        "off"
+    } else {
+        log.and_then(|value| value.level.as_deref()).unwrap_or("info")
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     let timestamp = log.and_then(|value| value.timestamp).unwrap_or(true);

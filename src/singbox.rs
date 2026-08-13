@@ -109,6 +109,7 @@ pub struct ClashApiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LogConfig {
+    pub disabled: bool,
     pub level: Option<String>,
     pub output: Option<String>,
     pub timestamp: Option<bool>,
