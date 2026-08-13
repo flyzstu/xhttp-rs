@@ -269,11 +269,20 @@ Implemented rule-set sources:
 - configurable logging level and output
 - multiple supported inbounds in one process
 - `experimental.clash_api` with an `external_controller`, optional `secret`,
-  and an optional `external_ui` that auto-downloads the Yacd-meta dashboard.
+  and an optional `external_ui` that auto-downloads the Yacd-meta dashboard
+  (optionally through an `external_ui_download_detour` outbound). CORS can be
+  enabled with `access_control_allow_origin` and
+  `access_control_allow_private_network`.
   The HTTP API exposes `/version`, `/configs` (rule/global/direct mode),
   `/proxies` (selector/urltest groups plus leaf outbounds and a GLOBAL
   selector), node switching, and per-node delay tests, so a Clash dashboard
   can switch nodes and modes against the shared proxy runtime.
+- TLS outbound `min_version`/`max_version` (1.2/1.3) and `disable_sni`
+- `log.disabled` turns logging off
+- `experimental.cache_file` with `store_dns`: the DNS cache is persisted to
+  the configured path and restored on startup, with a periodic saver. Remote
+  rule-sets are cached on disk, loaded before any network round trip at
+  startup, and refreshed with `If-None-Match`/304 conditional requests.
 
 ## Source map
 
