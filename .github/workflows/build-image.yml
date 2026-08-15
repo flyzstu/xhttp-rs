@@ -37,9 +37,14 @@ jobs:
         id: meta
         run: |
           IMAGE="ghcr.io/${{ github.repository }}"
-          SHA_SHORT="${GITHUB_SHA::7}"
+          REF_NAME="${{ inputs.ref || github.ref_name }}"
+          if [ -n "${{ inputs.ref }}" ]; then
+            TAG="${REF_NAME}"
+          else
+            TAG="${GITHUB_SHA::7}"
+          fi
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "tags=${IMAGE}:${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "tags=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
