@@ -2,7 +2,24 @@
 
 All notable changes to xhttp-rs are documented in this file.
 
+## [0.1.2] - 2026-08-15
+
+### Added
+
+- Selector and urltest outbound groups: selector forwards to one manually
+  selected member, urltest periodically probes members and auto-selects the
+  fastest within a tolerance; both switchable at runtime.
+- Clash API server with the Yacd-meta dashboard: `/version`, `/configs`
+  (rule/global/direct mode), `/proxies` with selector/urltest groups, a
+  GLOBAL selector, node switching, and per-node delay tests. The shared
+  proxy runtime is used by all inbounds so switches take effect immediately.
+
 ## [0.1.1] - 2026-08-09
+
+### Performance
+
+- Collect Linux route metadata (process, user, network, interface, MAC,
+  hostname) lazily: the SOCKS/HTTP inbound skips the per-connection `/proc`
 
 ### Performance
 
