@@ -14,6 +14,32 @@ All notable changes to xhttp-rs are documented in this file.
   GLOBAL selector, node switching, and per-node delay tests. The shared
   proxy runtime is used by all inbounds so switches take effect immediately.
 
+## [0.1.3] - 2026-08-15
+
+### Added
+
+- DNS rules can reference route rule-sets (geosite domain matching, geoip
+  address limits) and the `predefined` action with `rcode` and
+  answer/ns/extra records.
+- DNS servers support `detour` through an outbound (VLESS XUDP, AnyTLS
+  UoT, direct), and remote rule-sets can be downloaded through
+  `http_clients`/`default_http_client` over a tunneled HTTP connection.
+- `experimental.cache_file` with `store_dns` persistence and on-disk
+  rule-set caching with `If-None-Match`/304 conditional refresh.
+- TLS outbound `min_version`/`max_version` and `disable_sni`; `log.disabled`.
+- Clash API `external_ui_download_detour` and CORS
+  (`access_control_allow_origin`, `access_control_allow_private_network`)
+  options.
+
+### Changed
+
+- Routing resolves domains lazily: a domain is only resolved when a rule
+  needs a destination address, through `route.default_domain_resolver` when
+  configured, with multi-address matching and reuse by direct dialers.
+- Precompile DNS rules at startup (regex, normalized domains, query types)
+  to avoid per-query regex compilation and allocations.
+
+
 ## [0.1.1] - 2026-08-09
 
 ### Performance
