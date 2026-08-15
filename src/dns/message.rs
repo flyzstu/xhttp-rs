@@ -70,74 +70,129 @@ pub(super) async fn local_response(
 pub(super) fn normalize(s: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
 }
+/// A DNS rule with its hot-path match fields precompiled: regexes are
+/// compiled once instead of per query, and domain strings are normalized
+/// (lowercased, trailing dot stripped) at build time.
+#[derive(Clone)]
+pub(super) struct CompiledDnsRule {
+    pub(super) raw: DnsRule,
+    query_type: Vec<u16>,
+    domains: Vec<String>,
+    suffixes: Vec<String>,
+    keywords: Vec<String>,
+    regexes: Vec<regex::Regex>,
+    logical: Option<(LogicalMode, Vec<CompiledDnsRule>)>,
+}
+
+#[derive(Clone, Copy)]
+enum LogicalMode {
+    And,
+    Or,
+}
+
+impl CompiledDnsRule {
+    pub(super) fn compile(rule: &DnsRule) -> Result<Self> {
+        let query_type = rule
+            .query_type
+            .iter()
+            .map(parse_query_type)
+            .collect::<Result<Vec<_>>>()?;
+        let domains = rule.domain.iter().map(|v| normalize(v)).collect();
+        let suffixes = rule.domain_suffix.iter().map(|v| normalize(v)).collect();
+        let keywords = rule
+            .domain_keyword
+            .iter()
+            .map(|v| v.to_ascii_lowercase())
+            .collect();
+        let regexes = rule
+            .domain_regex
+            .iter()
+            .map(|value| {
+                regex::Regex::new(value)
+                    .with_context(|| format!("invalid DNS domain_regex: {value}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let logical = if rule.r#type == "logical" {
+            let mode = match rule.mode.as_deref().unwrap_or("and") {
+                "and" => LogicalMode::And,
+                "or" => LogicalMode::Or,
+                _ => bail!("unsupported logical DNS mode"),
+            };
+            Some((
+                mode,
+                rule.rules
+                    .iter()
+                    .map(Self::compile)
+                    .collect::<Result<Vec<_>>>()?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            raw: rule.clone(),
+            query_type,
+            domains,
+            suffixes,
+            keywords,
+            regexes,
+            logical,
+        })
+    }
+
+    fn matches(&self, name: &str, qtype: u16, rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>) -> bool {
+        if let Some((mode, rules)) = &self.logical {
+            let matched = match mode {
+                LogicalMode::And => rules.iter().all(|rule| rule.matches(name, qtype, rule_sets)),
+                LogicalMode::Or => rules.iter().any(|rule| rule.matches(name, qtype, rule_sets)),
+            };
+            return if self.raw.invert { !matched } else { matched };
+        }
+        let query_type = self.query_type.is_empty() || self.query_type.contains(&qtype);
+        let exact = self.domains.is_empty() || self.domains.iter().any(|v| v == name);
+        let suffix = self.suffixes.is_empty()
+            || self.suffixes.iter().any(|v| {
+                name == v || name.strip_suffix(v).is_some_and(|r| r.ends_with('.'))
+            });
+        let keyword = self.keywords.is_empty()
+            || self.keywords.iter().any(|v| name.contains(v.as_str()));
+        let regex = self.regexes.is_empty() || self.regexes.iter().any(|v| v.is_match(name));
+        let rule_set = self.raw.rule_set.is_empty()
+            || rule_sets.is_some_and(|sets| {
+                self.raw.rule_set.iter().any(|tag| {
+                    sets.get(tag).is_some_and(|rules| {
+                        rules
+                            .iter()
+                            .any(|rule| rule.dns_matches_domain(name) || rule.dns_contains_ip_cidr())
+                    })
+                })
+            });
+        let matched = query_type && exact && suffix && keyword && regex && rule_set;
+        if self.raw.invert { !matched } else { matched }
+    }
+}
+
 pub(super) fn dns_rule_matches(
-    r: &DnsRule,
+    rule: &CompiledDnsRule,
     name: &str,
     qtype: u16,
     rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>,
 ) -> bool {
-    if r.r#type == "logical" {
-        let matched = match r.mode.as_deref().unwrap_or("and") {
-            "and" => r
-                .rules
-                .iter()
-                .all(|rule| dns_rule_matches(rule, name, qtype, rule_sets)),
-            "or" => r
-                .rules
-                .iter()
-                .any(|rule| dns_rule_matches(rule, name, qtype, rule_sets)),
-            _ => false,
-        };
-        return if r.invert { !matched } else { matched };
-    }
-    let query_type = r.query_type.is_empty()
-        || r.query_type
-            .iter()
-            .filter_map(|value| parse_query_type(value).ok())
-            .any(|value| value == qtype);
-    let exact = r.domain.is_empty() || r.domain.iter().any(|v| normalize(v) == name);
-    let suffix = r.domain_suffix.is_empty()
-        || r.domain_suffix.iter().any(|v| {
-            let v = normalize(v);
-            name == v || name.ends_with(&format!(".{v}"))
-        });
-    let keyword = r.domain_keyword.is_empty()
-        || r.domain_keyword
-            .iter()
-            .any(|v| name.contains(&v.to_ascii_lowercase()));
-    let regex = r.domain_regex.is_empty()
-        || r.domain_regex
-            .iter()
-            .filter_map(|value| regex::Regex::new(value).ok())
-            .any(|value| value.is_match(name));
-    let rule_set = r.rule_set.is_empty()
-        || rule_sets.is_some_and(|sets| {
-            r.rule_set.iter().any(|tag| {
-                sets.get(tag).is_some_and(|rules| {
-                    rules
-                        .iter()
-                        .any(|rule| rule.dns_matches_domain(name) || rule.dns_contains_ip_cidr())
-                })
-            })
-        });
-    let matched = query_type && exact && suffix && keyword && regex && rule_set;
-    if r.invert { !matched } else { matched }
+    rule.matches(name, qtype, rule_sets)
 }
 
 /// The IP CIDR constraints of a rule's rule-sets, used to reject DNS
 /// responses whose addresses fall outside them (sing-box `WithAddressLimit`).
 pub(super) fn dns_rule_has_address_limit(
-    r: &DnsRule,
+    rule: &CompiledDnsRule,
     rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>,
 ) -> bool {
-    if r.r#type == "logical" {
-        return r
-            .rules
+    if let Some((_, rules)) = &rule.logical {
+        return rules
             .iter()
             .any(|rule| dns_rule_has_address_limit(rule, rule_sets));
     }
     rule_sets.is_some_and(|sets| {
-        r.rule_set.iter().any(|tag| {
+        rule.raw.rule_set.iter().any(|tag| {
             sets.get(tag)
                 .is_some_and(|rules| rules.iter().any(|rule| rule.dns_contains_ip_cidr()))
         })
@@ -147,25 +202,24 @@ pub(super) fn dns_rule_has_address_limit(
 /// Post-resolution response check: every address in `addresses` must match
 /// the rule's address limits, mirroring sing-box `MatchAddressLimit`.
 pub(super) fn dns_rule_address_limit_matches(
-    r: &DnsRule,
+    rule: &CompiledDnsRule,
     name: &str,
     addresses: &[IpAddr],
     rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>,
 ) -> bool {
-    if r.r#type == "logical" {
-        let matched = match r.mode.as_deref().unwrap_or("and") {
-            "and" => r.rules.iter().all(|rule| {
-                dns_rule_address_limit_matches(rule, name, addresses, rule_sets)
-            }),
-            "or" => r.rules.iter().any(|rule| {
-                dns_rule_address_limit_matches(rule, name, addresses, rule_sets)
-            }),
-            _ => false,
+    if let Some((mode, rules)) = &rule.logical {
+        let matched = match mode {
+            LogicalMode::And => rules
+                .iter()
+                .all(|rule| dns_rule_address_limit_matches(rule, name, addresses, rule_sets)),
+            LogicalMode::Or => rules
+                .iter()
+                .any(|rule| dns_rule_address_limit_matches(rule, name, addresses, rule_sets)),
         };
-        return if r.invert { !matched } else { matched };
+        return if rule.raw.invert { !matched } else { matched };
     }
     let sets_matched = rule_sets.is_none_or(|sets| {
-        r.rule_set.iter().any(|tag| {
+        rule.raw.rule_set.iter().any(|tag| {
             sets.get(tag).is_some_and(|rules| {
                 rules
                     .iter()
@@ -177,7 +231,7 @@ pub(super) fn dns_rule_address_limit_matches(
             })
         })
     });
-    if r.invert { !sets_matched } else { sets_matched }
+    if rule.raw.invert { !sets_matched } else { sets_matched }
 }
 pub(super) fn validate_dns_rule(rule: &DnsRule, top_level: bool) -> Result<()> {
     if rule.r#type == "logical" {
@@ -725,7 +779,7 @@ pub(super) fn parse_response(id: u16, qtype: u16, b: &[u8]) -> Result<(Vec<IpAdd
             .filter(|v| *v <= b.len())
             .context("truncated DNS question")?
     }
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(an.min(16));
     let mut ttl = u32::MAX;
     for _ in 0..an {
         skip_name(b, &mut p)?;

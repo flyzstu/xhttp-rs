@@ -14,7 +14,7 @@ use std::{
 use tokio_rustls::TlsConnector;
 
 use crate::routing::CompiledRuleSetMap;
-use crate::singbox::{DnsConfig, DnsRule};
+use crate::singbox::DnsConfig;
 use crate::util::parse_duration;
 
 use self::cache::{CacheKey, CacheValue, DnsCache, Flight};
@@ -42,7 +42,7 @@ pub struct DnsResolver {
 }
 struct Inner {
     servers: HashMap<String, Arc<Upstream>>,
-    rules: Vec<DnsRule>,
+    rules: Vec<self::message::CompiledDnsRule>,
     final_tag: String,
     cache: Mutex<DnsCache>,
     flights: Mutex<HashMap<CacheKey, Arc<Flight>>>,
@@ -128,7 +128,11 @@ impl DnsResolver {
         Ok(Self {
             inner: Arc::new(Inner {
                 servers,
-                rules: config.rules.clone(),
+                rules: config
+                    .rules
+                    .iter()
+                    .map(self::message::CompiledDnsRule::compile)
+                    .collect::<Result<Vec<_>>>()?,
                 final_tag,
                 cache: Mutex::new(DnsCache::new(
                     config.cache_capacity.unwrap_or(4096).max(1),
@@ -251,7 +255,7 @@ impl DnsResolver {
             .or_else(|| {
                 self.select_rule(&name, 1)
                     .or_else(|| self.select_rule(&name, 28))
-                    .and_then(|rule| rule.strategy.as_deref())
+                    .and_then(|rule| rule.raw.strategy.as_deref())
             })
             .or(self.inner.strategy.as_deref());
         validate_strategy(strategy)?;
@@ -296,25 +300,26 @@ impl DnsResolver {
         let (name, qtype, question_end) = parse_question(request)?;
         let request_id = dns_id(request)?;
         let rule = self.select_rule(&name, qtype);
-        if rule.is_some_and(|rule| rule.action.as_deref() == Some("reject")) {
-            if rule.and_then(|rule| rule.method.as_deref()) == Some("drop") {
+        if rule.is_some_and(|rule| rule.raw.action.as_deref() == Some("reject")) {
+            if rule.and_then(|rule| rule.raw.method.as_deref()) == Some("drop") {
                 bail!("DNS query dropped by rule")
             }
             return refused_response(request, question_end);
         }
-        if let Some(rule) = rule.filter(|rule| rule.action.as_deref() == Some("predefined")) {
-            let rcode = self::message::parse_rcode(rule.rcode.as_ref())?;
+        if let Some(rule) = rule.filter(|rule| rule.raw.action.as_deref() == Some("predefined")) {
+            let rcode = self::message::parse_rcode(rule.raw.rcode.as_ref())?;
             let records = rule
+                .raw
                 .answer
                 .iter()
-                .chain(&rule.ns)
-                .chain(&rule.extra)
+                .chain(&rule.raw.ns)
+                .chain(&rule.raw.extra)
                 .map(|record| self::message::parse_dns_record(record))
                 .collect::<Result<Vec<_>>>()?;
             return predefined_response(request, question_end, rcode, &records);
         }
         let server_tag = rule
-            .and_then(|rule| rule.server.as_deref())
+            .and_then(|rule| rule.raw.server.as_deref())
             .unwrap_or(&self.inner.final_tag);
         let server = self
             .inner
@@ -323,7 +328,7 @@ impl DnsResolver {
             .cloned()
             .with_context(|| format!("unknown DNS server: {server_tag}"))?;
         let client_subnet = rule
-            .and_then(|rule| rule.client_subnet.as_deref())
+            .and_then(|rule| rule.raw.client_subnet.as_deref())
             .or(self.inner.client_subnet.as_deref());
         let wire = if let Some(subnet) = client_subnet {
             add_client_subnet(request, subnet)?
@@ -339,7 +344,7 @@ impl DnsResolver {
                 local_response(&wire, &name, qtype, question_end).await?
             } else {
                 tokio::time::timeout(
-                    rule.and_then(|rule| rule.timeout.as_deref())
+                    rule.and_then(|rule| rule.raw.timeout.as_deref())
                         .map(parse_duration)
                         .transpose()?
                         .unwrap_or(self.inner.timeout),
@@ -349,7 +354,7 @@ impl DnsResolver {
                 .context("DNS query timeout")??
             };
             validate_response(request_id, &response)?;
-            if let Some(ttl) = rule.and_then(|rule| rule.rewrite_ttl) {
+            if let Some(ttl) = rule.and_then(|rule| rule.raw.rewrite_ttl) {
                 rewrite_response_ttls(&mut response, ttl);
             }
             let ttl = if matches!(response[3] & 0x0f, 0 | 3) {
@@ -361,7 +366,7 @@ impl DnsResolver {
             canonical[..2].fill(0);
             Ok((CacheValue::Wire(canonical), ttl))
         };
-        let value = if rule.is_some_and(|rule| rule.disable_cache) {
+        let value = if rule.is_some_and(|rule| rule.raw.disable_cache) {
             load().await?.0
         } else {
             self.cached(key, load).await?
@@ -393,16 +398,16 @@ impl DnsResolver {
         } else {
             None
         };
-        if rule.is_some_and(|rule| rule.action.as_deref() == Some("reject")) {
+        if rule.is_some_and(|rule| rule.raw.action.as_deref() == Some("reject")) {
             bail!("DNS lookup rejected by rule")
         }
-        if let Some(rule) = rule.filter(|rule| rule.action.as_deref() == Some("predefined")) {
-            let rcode = self::message::parse_rcode(rule.rcode.as_ref())?;
+        if let Some(rule) = rule.filter(|rule| rule.raw.action.as_deref() == Some("predefined")) {
+            let rcode = self::message::parse_rcode(rule.raw.rcode.as_ref())?;
             if rcode != 0 {
                 bail!("DNS lookup rejected by rule with rcode {rcode}")
             }
             let mut addresses = Vec::new();
-            for record in rule.answer.iter().chain(&rule.ns).chain(&rule.extra) {
+            for record in rule.raw.answer.iter().chain(&rule.raw.ns).chain(&rule.raw.extra) {
                 let record = self::message::parse_dns_record(record)?;
                 match (qtype, record.kind) {
                     (1, 1) => {
@@ -424,12 +429,12 @@ impl DnsResolver {
         }
         let server_tag = options
             .server
-            .or_else(|| rule.and_then(|rule| rule.server.as_deref()));
+            .or_else(|| rule.and_then(|rule| rule.raw.server.as_deref()));
         let client_subnet = options
             .client_subnet
             .map(str::to_owned)
             .or_else(|| {
-                rule.and_then(|rule| rule.client_subnet.as_deref())
+                rule.and_then(|rule| rule.raw.client_subnet.as_deref())
                     .map(str::to_owned)
             })
             .or_else(|| self.inner.client_subnet.clone());
@@ -439,14 +444,14 @@ impl DnsResolver {
         let query_timeout = options
             .timeout
             .or(rule
-                .and_then(|rule| rule.timeout.as_deref())
+                .and_then(|rule| rule.raw.timeout.as_deref())
                 .map(parse_duration)
                 .transpose()?)
             .unwrap_or(self.inner.timeout);
         let rewrite_ttl = options
             .rewrite_ttl
-            .or_else(|| rule.and_then(|rule| rule.rewrite_ttl));
-        let disable_cache = options.disable_cache || rule.is_some_and(|rule| rule.disable_cache);
+            .or_else(|| rule.and_then(|rule| rule.raw.rewrite_ttl));
+        let disable_cache = options.disable_cache || rule.is_some_and(|rule| rule.raw.disable_cache);
         let key = CacheKey::Lookup {
             name: name.into(),
             qtype,
@@ -567,7 +572,7 @@ impl DnsResolver {
             .remove(&key);
         shared.map_err(anyhow::Error::msg)
     }
-    fn select_rule(&self, name: &str, qtype: u16) -> Option<&DnsRule> {
+    fn select_rule(&self, name: &str, qtype: u16) -> Option<&self::message::CompiledDnsRule> {
         let rule_sets = self
             .inner
             .rule_sets
@@ -582,7 +587,7 @@ impl DnsResolver {
     fn select_server(&self, name: &str, qtype: u16) -> Result<&Arc<Upstream>> {
         let tag = self
             .select_rule(name, qtype)
-            .and_then(|rule| rule.server.as_ref())
+            .and_then(|rule| rule.raw.server.as_ref())
             .unwrap_or(&self.inner.final_tag);
         self.inner
             .servers
@@ -599,7 +604,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
 
-    use crate::singbox::DnsServer;
+    use crate::singbox::{DnsRule, DnsServer};
 
     fn test_server(kind: &str, address: SocketAddr) -> DnsConfig {
         DnsConfig {
@@ -659,14 +664,16 @@ mod tests {
             domain_regex: vec![r"^api\d+\.example$".into()],
             ..Default::default()
         };
-        assert!(dns_rule_matches(&rule, "api12.example", 65, None));
-        assert!(!dns_rule_matches(&rule, "api12.example", 1, None));
-        assert!(!dns_rule_matches(&rule, "www.example", 65, None));
+        let compiled = self::message::CompiledDnsRule::compile(&rule).unwrap();
+        assert!(dns_rule_matches(&compiled, "api12.example", 65, None));
+        assert!(!dns_rule_matches(&compiled, "api12.example", 1, None));
+        assert!(!dns_rule_matches(&compiled, "www.example", 65, None));
         assert!(dns_rule_matches(
-            &DnsRule {
+            &self::message::CompiledDnsRule::compile(&DnsRule {
                 invert: true,
                 ..rule
-            },
+            })
+            .unwrap(),
             "www.example",
             65,
             None
@@ -725,10 +732,11 @@ mod tests {
     }
     #[test]
     fn rule_suffix() {
-        let r = DnsRule {
+        let r = self::message::CompiledDnsRule::compile(&DnsRule {
             domain_suffix: vec!["example.com".into()],
             ..Default::default()
-        };
+        })
+        .unwrap();
         assert!(dns_rule_matches(&r, "www.example.com", 1, None));
         assert!(!dns_rule_matches(&r, "badexample.com", 1, None));
     }
@@ -946,11 +954,12 @@ mod tests {
         sets.insert("geosite-cn".into(), set);
         let rule_sets = Arc::new(RwLock::new(sets));
 
-        let rule = DnsRule {
+        let rule = self::message::CompiledDnsRule::compile(&DnsRule {
             rule_set: vec!["geosite-cn".into()],
             server: Some("dns_local".into()),
             ..Default::default()
-        };
+        })
+        .unwrap();
         let unlocked = rule_sets.read().unwrap();
         assert!(super::dns_rule_matches(&rule, "www.example.com", 1, Some(&unlocked)));
         assert!(!super::dns_rule_matches(&rule, "www.elsewhere.net", 1, Some(&unlocked)));
