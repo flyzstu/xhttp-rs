@@ -680,7 +680,7 @@ impl SingBoxConfig {
         let has_proxy_inbound = self.inbounds.iter().any(|inbound| {
             matches!(
                 inbound.r#type.as_str(),
-                "socks" | "http" | "mixed" | "anytls" | "tun"
+                "socks" | "http" | "mixed" | "anytls" | "tun" | "tproxy"
             )
         });
         for inbound in &self.inbounds {
@@ -843,7 +843,7 @@ impl SingBoxConfig {
 
     fn validate_inbound(&self, inbound: &Inbound) -> Result<usize> {
         match inbound.r#type.as_str() {
-            "socks" | "http" | "mixed" => {
+            "socks" | "http" | "mixed" | "tproxy" => {
                 inbound
                     .listen_port
                     .context("proxy inbound requires listen_port")?;

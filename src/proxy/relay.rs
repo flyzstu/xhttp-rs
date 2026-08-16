@@ -123,12 +123,35 @@ pub(crate) async fn relay_anytls_tcp(
     Ok(())
 }
 pub(crate) async fn relay_tun_tcp(
-    mut stream: netstack_smoltcp::TcpStream,
+    stream: netstack_smoltcp::TcpStream,
     source: SocketAddr,
     destination: SocketAddr,
     inbound: &str,
     runtime: &ProxyRuntime,
 ) -> Result<()> {
+    relay_streamed_tcp(
+        stream,
+        source,
+        destination,
+        inbound,
+        runtime,
+    )
+    .await
+}
+
+/// Relay a TCP stream (from TUN or tproxy) to the routed outbound.
+/// The stream's data is evaluated for sniffing and the first packet is
+/// replayed after the dial connects.
+pub(crate) async fn relay_streamed_tcp<S>(
+    mut stream: S,
+    source: SocketAddr,
+    destination: SocketAddr,
+    inbound: &str,
+    runtime: &ProxyRuntime,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let destination = vless::Destination::Ip(destination.ip(), destination.port());
     let (evaluation, initial) = evaluate_stream_tcp_route(
         &mut stream,

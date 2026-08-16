@@ -142,6 +142,25 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             });
             continue;
         }
+        if inbound.r#type == "tproxy" {
+            let dns_cache_path = dns_cache_path.clone();
+            if let Some(runtime) = shared_runtime.clone() {
+                tasks.spawn(async move { xhttp::proxy::tproxy::run_tproxy_inbound(inbound, runtime).await });
+            } else {
+                let outbounds = config.outbounds.clone();
+                let route = config.route.clone();
+                let dns = config.dns.clone();
+                let http_clients = config.http_clients.clone();
+                tasks.spawn(async move {
+                    let runtime = std::sync::Arc::new(
+                        xhttp::proxy::build_runtime(outbounds, route, dns, http_clients, dns_cache_path)
+                            .await?,
+                    );
+                    xhttp::proxy::tproxy::run_tproxy_inbound(inbound, runtime).await
+                });
+            }
+            continue;
+        }
         if matches!(inbound.r#type.as_str(), "socks" | "http" | "mixed") {
             let outbounds = config.outbounds.clone();
             let route = config.route.clone();

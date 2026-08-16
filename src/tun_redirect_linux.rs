@@ -598,8 +598,8 @@ mod tests {
             exclude_macs: Vec::new(),
             bypass_addresses: vec!["192.0.2.1".parse().unwrap()],
             udp_timeout: std::time::Duration::from_secs(300),
-            udp_mapping: crate::tun::UdpNatBehavior::EndpointIndependent,
-            udp_filtering: crate::tun::UdpNatBehavior::EndpointIndependent,
+            udp_mapping: crate::proxy::udp_nat::UdpNatBehavior::EndpointIndependent,
+            udp_filtering: crate::proxy::udp_nat::UdpNatBehavior::EndpointIndependent,
             udp_nat_max: 16_384,
         }
     }

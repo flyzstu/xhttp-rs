@@ -3,6 +3,8 @@ mod inbound;
 mod relay;
 mod route;
 mod udp;
+pub mod tproxy;
+pub(crate) mod udp_nat;
 
 use crate::{
     Client,
@@ -21,7 +23,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
-pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_tun_tcp, relay_tun_udp};
+pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_streamed_tcp, relay_tun_tcp, relay_tun_udp};
 pub use inbound::run_socks;
 pub use inbound::run_socks_with_runtime;
 #[cfg(feature = "fuzzing")]

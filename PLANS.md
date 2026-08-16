@@ -114,6 +114,11 @@ idle timeout, and close lifecycle.
 - HTTP proxy CONNECT
 - HTTP proxy absolute-form request rewriting
 - mixed SOCKS5/HTTP TCP detection
+- Linux TProxy inbound: transparent TCP and UDP interception via
+  `IP_TRANSPARENT`/`IP_RECVORIGDSTADDR`, sharing the route evaluation, UDP
+  NAT table (mapping/filtering/idle/LRU) and outbound relay paths with the
+  TUN and SOCKS inbounds. Requires policy routing plus `iptables -t mangle
+  -j TPROXY` rules to divert traffic.
 
 SOCKS5 UDP preserves datagram boundaries and can route through direct,
 classic VLESS UDP, or XUDP paths.

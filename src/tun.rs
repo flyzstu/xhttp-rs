@@ -5,7 +5,10 @@
 //! TCP/UDP stack and route extracted flows through the normal dispatcher.
 
 use crate::{
-    proxy::{self, ProxyRuntime},
+    proxy::{
+        self, ProxyRuntime,
+        udp_nat::{Datagram, UdpMappingKey, UdpNatBehavior, UdpNatTable},
+    },
     singbox::{DnsConfig, Inbound, Outbound, RouteConfig},
 };
 use anyhow::{Context, Result, bail};
@@ -13,8 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use ipnet::IpNet;
 use netstack_smoltcp::StackBuilder;
 use std::{
-    collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::mpsc;
@@ -52,24 +54,6 @@ pub struct TunConfig {
     pub udp_mapping: UdpNatBehavior,
     pub udp_filtering: UdpNatBehavior,
     pub udp_nat_max: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpNatBehavior {
-    EndpointIndependent,
-    AddressDependent,
-    AddressAndPortDependent,
-}
-
-impl UdpNatBehavior {
-    fn parse(value: Option<&str>, field: &str) -> Result<Self> {
-        match value.unwrap_or("endpoint_independent") {
-            "endpoint_independent" => Ok(Self::EndpointIndependent),
-            "address_dependent" => Ok(Self::AddressDependent),
-            "address_and_port_dependent" => Ok(Self::AddressAndPortDependent),
-            value => bail!("unsupported TUN {field}: {value}"),
-        }
-    }
 }
 
 impl TunConfig {
@@ -623,141 +607,6 @@ async fn run_tcp(
     bail!("TUN TCP listener closed")
 }
 
-type Datagram = (Vec<u8>, SocketAddr, SocketAddr);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum UdpMappingKey {
-    Endpoint(SocketAddr),
-    Address(SocketAddr, IpAddr),
-    AddressAndPort(SocketAddr, SocketAddr),
-}
-
-struct UdpNatSession {
-    sender: Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
-    allowed_addresses: HashSet<IpAddr>,
-    allowed_endpoints: HashSet<SocketAddr>,
-    last_used: std::time::Instant,
-    generation: u64,
-}
-
-struct UdpNatTable {
-    filtering: UdpNatBehavior,
-    max_sessions: usize,
-    idle_timeout: std::time::Duration,
-    generation: u64,
-    sessions: HashMap<UdpMappingKey, UdpNatSession>,
-}
-
-impl UdpNatTable {
-    fn new(
-        filtering: UdpNatBehavior,
-        max_sessions: usize,
-        idle_timeout: std::time::Duration,
-    ) -> Self {
-        Self {
-            filtering,
-            max_sessions,
-            idle_timeout,
-            generation: 0,
-            sessions: HashMap::new(),
-        }
-    }
-
-    fn key_for(mapping: UdpNatBehavior, source: SocketAddr, destination: SocketAddr) -> UdpMappingKey {
-        match mapping {
-            UdpNatBehavior::EndpointIndependent => UdpMappingKey::Endpoint(source),
-            UdpNatBehavior::AddressDependent => UdpMappingKey::Address(source, destination.ip()),
-            UdpNatBehavior::AddressAndPortDependent => {
-                UdpMappingKey::AddressAndPort(source, destination)
-            }
-        }
-    }
-
-
-    /// Combined touch-and-fetch for the hot packet path, avoiding a second
-    /// table lock and deferring expiry until the table is at capacity.
-    fn touch_and_sender(&mut self, key: UdpMappingKey, destination: SocketAddr) -> Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> {
-        if !self.sessions.contains_key(&key) {
-            self.reclaim_if_full();
-        }
-        self.generation = self.generation.wrapping_add(1);
-        let session = self.sessions.entry(key).or_insert_with(|| UdpNatSession {
-            sender: None,
-            allowed_addresses: HashSet::new(),
-            allowed_endpoints: HashSet::new(),
-            last_used: std::time::Instant::now(),
-            generation: self.generation,
-        });
-        session.last_used = std::time::Instant::now();
-        session.generation = self.generation;
-        session.allowed_addresses.insert(destination.ip());
-        session.allowed_endpoints.insert(destination);
-        session
-            .sender
-            .as_ref()
-            .filter(|sender| !sender.is_closed())
-            .cloned()
-    }
-
-    /// Only scan for idle entries when the table is at capacity and a new
-    /// session is about to be inserted; the hot packet path otherwise skips
-    /// the O(sessions) retain.
-    fn reclaim_if_full(&mut self) {
-        if self.sessions.len() < self.max_sessions {
-            return;
-        }
-        let timeout = self.idle_timeout;
-        let before = self.sessions.len();
-        self.sessions
-            .retain(|_, session| session.last_used.elapsed() < timeout);
-        if self.sessions.len() == before && self.sessions.len() >= self.max_sessions {
-            self.evict_lru();
-        }
-    }
-
-    fn insert_sender(&mut self, key: UdpMappingKey, sender: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
-        if let Some(session) = self.sessions.get_mut(&key) {
-            session.sender = Some(sender);
-        }
-    }
-
-    fn allow_response(&mut self, key: UdpMappingKey, remote: SocketAddr) -> bool {
-        self.expire();
-        let Some(session) = self.sessions.get_mut(&key) else {
-            return false;
-        };
-        let allowed = match self.filtering {
-            UdpNatBehavior::EndpointIndependent => true,
-            UdpNatBehavior::AddressDependent => session.allowed_addresses.contains(&remote.ip()),
-            UdpNatBehavior::AddressAndPortDependent => session.allowed_endpoints.contains(&remote),
-        };
-        if allowed {
-            self.generation = self.generation.wrapping_add(1);
-            session.last_used = std::time::Instant::now();
-            session.generation = self.generation;
-        }
-        allowed
-    }
-
-    fn expire(&mut self) {
-        let timeout = self.idle_timeout;
-        self.sessions
-            .retain(|_, session| session.last_used.elapsed() < timeout);
-    }
-
-    fn evict_lru(&mut self) {
-        if let Some(key) = self
-            .sessions
-            .iter()
-            .min_by_key(|(_, session)| session.generation)
-            .map(|(key, _)| *key)
-        {
-            self.sessions.remove(&key);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_udp(
     socket: netstack_smoltcp::UdpSocket,
     runtime: Arc<ProxyRuntime>,
@@ -838,9 +687,8 @@ async fn run_udp(
         };
         if sender.send((payload, destination)).await.is_err()
             && let Ok(mut table) = table.lock()
-            && let Some(session) = table.sessions.get_mut(&mapping_key)
         {
-            session.sender = None;
+            table.clear_sender(mapping_key);
         }
     }
     bail!("TUN UDP reader closed")
@@ -906,6 +754,7 @@ fn endpoint_host(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1016,7 +865,7 @@ mod tests {
         let other_source = "172.19.0.3:53000".parse().unwrap();
         let other_key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, other_source, second);
         table.touch_and_sender(other_key, second);
-        assert!(!table.sessions.contains_key(&key));
+        assert!(!table.contains_key(&key));
         assert!(receiver.recv().await.is_none());
 
         let mut expiring = UdpNatTable::new(
@@ -1026,10 +875,9 @@ mod tests {
         );
         let expiring_key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first);
         expiring.touch_and_sender(expiring_key, first);
-        expiring.sessions.get_mut(&expiring_key).unwrap().last_used -=
-            std::time::Duration::from_secs(1);
+        expiring.age_last_used(expiring_key, std::time::Duration::from_secs(1));
         expiring.expire();
-        assert!(expiring.sessions.is_empty());
+        assert!(expiring.is_empty());
     }
 
     #[tokio::test]
