@@ -57,7 +57,14 @@ impl RouteState {
         }
     }
 
-    fn context<'a>(&'a self, input: &'a RouteInput<'_>, destination: &'a vless::Destination, network: &'a str, detected_protocol: Option<&'a str>, detected_client: Option<&'a str>) -> RouteContext<'a> {
+    fn context<'a>(
+        &'a self,
+        input: &'a RouteInput<'_>,
+        destination: &'a vless::Destination,
+        network: &'a str,
+        detected_protocol: Option<&'a str>,
+        detected_client: Option<&'a str>,
+    ) -> RouteContext<'a> {
         RouteContext {
             domain: self.domain.as_deref(),
             destination_ip: self.destination_ip,
@@ -194,7 +201,13 @@ pub(super) async fn evaluate_tcp_route(
     let mut detected_client = None;
     let mut options = router.default_options();
     let decision = loop {
-        let context = state.context(&input, &destination, "tcp", detected_protocol.as_deref(), detected_client.as_deref());
+        let context = state.context(
+            &input,
+            &destination,
+            "tcp",
+            detected_protocol.as_deref(),
+            detected_client.as_deref(),
+        );
         match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
@@ -267,7 +280,13 @@ where
     let mut detected_client = None;
     let mut options = router.default_options();
     let decision = loop {
-        let context = state.context(&input, &destination, "tcp", detected_protocol.as_deref(), detected_client.as_deref());
+        let context = state.context(
+            &input,
+            &destination,
+            "tcp",
+            detected_protocol.as_deref(),
+            detected_client.as_deref(),
+        );
         match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
@@ -344,7 +363,13 @@ pub(super) async fn evaluate_udp_route(
     let mut detected_client = None;
     let mut options = router.default_options();
     let decision = loop {
-        let context = state.context(&input, &destination, "udp", detected_protocol.as_deref(), detected_client.as_deref());
+        let context = state.context(
+            &input,
+            &destination,
+            "udp",
+            detected_protocol.as_deref(),
+            detected_client.as_deref(),
+        );
         match router.next_action_lazy(&context, state.cursor) {
             ActionLookup::Action { index, action } => {
                 let action = *action;
@@ -763,13 +788,19 @@ mod tests {
         query.extend(1u16.to_be_bytes()); // qtype A
         query.extend(1u16.to_be_bytes()); // qclass IN
         assert!(is_dns_message(&query, false));
-        assert_eq!(dns_question_name(&query, false).as_deref(), Some("example.com"));
+        assert_eq!(
+            dns_question_name(&query, false).as_deref(),
+            Some("example.com")
+        );
 
         let mut tcp = vec![0u8; 0];
         tcp.extend((query.len() as u16).to_be_bytes());
         tcp.extend_from_slice(&query);
         assert!(is_dns_message(&tcp, true));
-        assert_eq!(dns_question_name(&tcp, true).as_deref(), Some("example.com"));
+        assert_eq!(
+            dns_question_name(&tcp, true).as_deref(),
+            Some("example.com")
+        );
         assert!(!is_dns_message(&[0u8; 4], false));
     }
 

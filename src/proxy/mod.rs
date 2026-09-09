@@ -2,8 +2,8 @@ mod direct;
 mod inbound;
 mod relay;
 mod route;
-mod udp;
 pub mod tproxy;
+mod udp;
 pub(crate) mod udp_nat;
 
 use crate::{
@@ -23,13 +23,15 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
-pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_streamed_tcp, relay_tun_tcp, relay_tun_udp};
-pub use inbound::run_socks;
-pub use inbound::run_socks_with_runtime;
-#[cfg(feature = "fuzzing")]
-pub use udp::fuzz_socks_udp;
 pub(crate) use crate::util::socket;
 pub(crate) use crate::util::url_host;
+pub use inbound::run_socks;
+pub use inbound::run_socks_with_runtime;
+pub(crate) use relay::{
+    relay_anytls_tcp, relay_anytls_udp, relay_streamed_tcp, relay_tun_tcp, relay_tun_udp,
+};
+#[cfg(feature = "fuzzing")]
+pub use udp::fuzz_socks_udp;
 
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
@@ -162,9 +164,15 @@ impl Dialer {
 
     /// Establish a TCP stream through this dialer to a probe URL's host and
     /// port, returning the raw byte stream for a latency check.
-    pub(crate) async fn connect_for_probe(&self, url: &Url, resolver: Option<&DnsResolver>) -> Result<BoxIo> {
+    pub(crate) async fn connect_for_probe(
+        &self,
+        url: &Url,
+        resolver: Option<&DnsResolver>,
+    ) -> Result<BoxIo> {
         let host = url.host_str().context("probe URL has no host")?.to_owned();
-        let port = url.port_or_known_default().context("probe URL has no port")?;
+        let port = url
+            .port_or_known_default()
+            .context("probe URL has no port")?;
         match self {
             Self::Direct => {
                 let destination = vless::Destination::Domain(host, port);
@@ -179,12 +187,8 @@ impl Dialer {
             }
             Self::Vless { client, user, .. } => {
                 let mut stream = client.connect().await?;
-                vless::write_request(
-                    &mut stream,
-                    user,
-                    &vless::Destination::Domain(host, port),
-                )
-                .await?;
+                vless::write_request(&mut stream, user, &vless::Destination::Domain(host, port))
+                    .await?;
                 vless::read_response(&mut stream).await?;
                 Ok(Box::new(stream))
             }
@@ -198,6 +202,39 @@ impl Dialer {
                 Ok(Box::new(stream))
             }
             Self::Block | Self::Group(_) => bail!("cannot probe through block/group outbound"),
+        }
+    }
+
+    /// Establish the underlying connection so the first real use (e.g.
+    /// rule-set prefetch) doesn't fail on lazy-connect. No-op for Direct;
+    /// for AnyTLS/VLESS, creates and immediately drops a stream to trigger
+    /// connection setup.
+    pub(crate) async fn warm_up(&self) -> Result<()> {
+        match self {
+            Self::Direct | Self::Block | Self::Group(_) => Ok(()),
+            Self::AnyTls { client } => {
+                let destination = vless::Destination::Ip(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
+                    1,
+                );
+                let destination = crate::proxy::udp::to_anytls_destination(&destination);
+                let mut stream = client
+                    .create_stream(&anytls::encode_address(&destination)?)
+                    .await?;
+                stream.shutdown().await.ok();
+                Ok(())
+            }
+            Self::Vless { client, user, .. } => {
+                let destination = vless::Destination::Ip(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
+                    1,
+                );
+                let mut stream = client.connect().await?;
+                vless::write_request(&mut stream, user, &destination).await?;
+                vless::read_response(&mut stream).await?;
+                stream.shutdown().await.ok();
+                Ok(())
+            }
         }
     }
 }
@@ -233,6 +270,12 @@ impl DetourProvider {
     fn resolve(&self, tag: &str) -> Option<Dialer> {
         resolve_grouped_dialer(&self.dialers, tag)
     }
+
+    /// Resolve a dialer by tag for external use (e.g. warm-up before
+    /// rule-set prefetch).
+    pub(crate) fn dialer(&self, tag: &str) -> Option<Dialer> {
+        self.resolve(tag)
+    }
 }
 
 impl crate::dns::transport::DnsUdpDetour for DetourProvider {
@@ -244,20 +287,22 @@ impl crate::dns::transport::DnsUdpDetour for DetourProvider {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
         let tag = tag.to_owned();
         let request = request.to_vec();
-        Box::pin(async move {
-            self.exchange_udp_inner(&tag, destination, &request).await
-        })
+        Box::pin(async move { self.exchange_udp_inner(&tag, destination, &request).await })
     }
 
     fn connect_tcp(
         &self,
         tag: &str,
         destination: std::net::SocketAddr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn crate::dns::transport::DnsIo>>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Box<dyn crate::dns::transport::DnsIo>>>
+                + Send
+                + '_,
+        >,
+    > {
         let tag = tag.to_owned();
-        Box::pin(async move {
-            self.connect_tcp_inner(&tag, destination).await
-        })
+        Box::pin(async move { self.connect_tcp_inner(&tag, destination).await })
     }
 }
 
@@ -268,16 +313,22 @@ impl DetourProvider {
         destination: std::net::SocketAddr,
         request: &[u8],
     ) -> Result<Vec<u8>> {
-        let dialer = self.resolve(tag).with_context(|| format!("unknown DNS detour outbound: {tag}"))?;
+        let dialer = self
+            .resolve(tag)
+            .with_context(|| format!("unknown DNS detour outbound: {tag}"))?;
         match dialer {
             Dialer::Direct => {
-                let socket = crate::proxy::direct::direct_udp_socket(destination, &Default::default())?;
+                let socket =
+                    crate::proxy::direct::direct_udp_socket(destination, &Default::default())?;
                 socket.connect(destination).await?;
                 socket.send(request).await?;
                 let mut response = vec![0; u16::MAX as usize];
-                let length = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut response))
-                    .await
-                    .context("DNS detour direct timeout")??;
+                let length = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.recv(&mut response),
+                )
+                .await
+                .context("DNS detour direct timeout")??;
                 response.truncate(length);
                 Ok(response)
             }
@@ -287,14 +338,20 @@ impl DetourProvider {
                 vless::write_request_with_command(
                     &mut stream,
                     &user,
-                    if xudp { vless::Command::Xudp } else { vless::Command::Udp },
+                    if xudp {
+                        vless::Command::Xudp
+                    } else {
+                        vless::Command::Udp
+                    },
                     &destination,
                 )
                 .await?;
                 if xudp {
                     vless::write_xudp_packet(&mut stream, true, &destination, request).await?;
                 } else {
-                    stream.write_u16(request.len().try_into().context("DNS query too large")?).await?;
+                    stream
+                        .write_u16(request.len().try_into().context("DNS query too large")?)
+                        .await?;
                     stream.write_all(request).await?;
                     stream.flush().await?;
                 }
@@ -311,7 +368,10 @@ impl DetourProvider {
                 Ok(response)
             }
             Dialer::AnyTls { client } => {
-                let destination = udp::to_anytls_destination(&vless::Destination::Ip(destination.ip(), destination.port()));
+                let destination = udp::to_anytls_destination(&vless::Destination::Ip(
+                    destination.ip(),
+                    destination.port(),
+                ));
                 let initial = anytls::encode_address(&anytls::uot::magic_destination())?;
                 let mut stream = client.create_stream(&initial).await?;
                 anytls::uot::write_request(
@@ -323,7 +383,8 @@ impl DetourProvider {
                 )
                 .await?;
                 anytls::uot::write_packet(&mut stream, &destination, request, true).await?;
-                let (_, payload) = anytls::uot::read_packet(&mut stream, Some(&destination)).await?;
+                let (_, payload) =
+                    anytls::uot::read_packet(&mut stream, Some(&destination)).await?;
                 Ok(payload)
             }
             Dialer::Block | Dialer::Group(_) => bail!("DNS detour cannot use block/group outbound"),
@@ -335,26 +396,45 @@ impl DetourProvider {
         tag: &str,
         destination: std::net::SocketAddr,
     ) -> Result<Box<dyn crate::dns::transport::DnsIo>> {
-        let dialer = self.resolve(tag).with_context(|| format!("unknown DNS detour outbound: {tag}"))?;
-        let destination = vless::Destination::Ip(destination.ip(), destination.port());
+        self.connect_tcp_destination(
+            tag,
+            &vless::Destination::Ip(destination.ip(), destination.port()),
+        )
+        .await
+    }
+
+    async fn connect_tcp_destination(
+        &self,
+        tag: &str,
+        destination: &vless::Destination,
+    ) -> Result<Box<dyn crate::dns::transport::DnsIo>> {
+        let dialer = self
+            .resolve(tag)
+            .with_context(|| format!("unknown detour outbound: {tag}"))?;
         match dialer {
             Dialer::Direct => Ok(Box::new(
-                crate::proxy::direct::connect_direct(&destination, self.resolver.as_deref(), &Default::default(), &[]).await?,
+                crate::proxy::direct::connect_direct(
+                    destination,
+                    self.resolver.as_deref(),
+                    &Default::default(),
+                    &[],
+                )
+                .await?,
             )),
             Dialer::Vless { client, user, .. } => {
                 let mut stream = client.connect().await?;
-                vless::write_request(&mut stream, &user, &destination).await?;
+                vless::write_request(&mut stream, &user, destination).await?;
                 vless::read_response(&mut stream).await?;
                 Ok(Box::new(stream))
             }
             Dialer::AnyTls { client } => {
-                let destination = udp::to_anytls_destination(&destination);
+                let anytls_dest = udp::to_anytls_destination(destination);
                 let stream = client
-                    .create_stream(&anytls::encode_address(&destination)?)
+                    .create_stream(&anytls::encode_address(&anytls_dest)?)
                     .await?;
                 Ok(Box::new(stream))
             }
-            Dialer::Block | Dialer::Group(_) => bail!("DNS detour cannot use block/group outbound"),
+            Dialer::Block | Dialer::Group(_) => bail!("detour cannot use block/group outbound"),
         }
     }
 
@@ -373,14 +453,10 @@ impl DetourProvider {
         url: &str,
         etag: Option<&str>,
     ) -> Result<(Vec<u8>, Option<String>, bool)> {
-        let (data, headers, status) = self
-            .fetch_url_with_etag(tag, url, etag, 0)
-            .await?;
+        let (data, headers, status) = self.fetch_url_with_etag(tag, url, etag, 0).await?;
         let new_etag = headers
             .iter()
-            .find_map(|(name, value)| {
-                name.eq_ignore_ascii_case("etag").then(|| value.clone())
-            });
+            .find_map(|(name, value)| name.eq_ignore_ascii_case("etag").then(|| value.clone()));
         Ok((data, new_etag, status == 304))
     }
 
@@ -403,25 +479,37 @@ impl DetourProvider {
             .host_str()
             .context("rule-set URL has no host")?
             .to_owned();
-        let port = url.port_or_known_default().context("rule-set URL has no port")?;
+        let port = url
+            .port_or_known_default()
+            .context("rule-set URL has no port")?;
         let path = if url.path().is_empty() {
             "/".to_owned()
         } else {
             url.path().to_owned()
         };
-        let query = url.query().map(|query| format!("?{query}")).unwrap_or_default();
-        let address = tokio::net::lookup_host((host.as_str(), port))
-            .await?
-            .next()
-            .context("rule-set host did not resolve")?;
-        let tcp = self
-            .connect_tcp_inner(tag, address)
-            .await
-            .context("connect rule-set host through outbound")?;
+        let query = url
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let destination = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            vless::Destination::Ip(ip, port)
+        } else {
+            vless::Destination::Domain(host.clone(), port)
+        };
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.connect_tcp_destination(tag, &destination),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect rule-set host through outbound timed out"))?
+        .context("connect rule-set host through outbound")?;
+
         let mut stream: Box<dyn crate::dns::transport::DnsIo> = if scheme == "https" {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in rustls_native_certs::load_native_certs().certs {
-                roots.add(certificate).context("add native root certificate")?;
+                roots
+                    .add(certificate)
+                    .context("add native root certificate")?;
             }
             let connector = tokio_rustls::TlsConnector::from(Arc::new(
                 rustls::ClientConfig::builder()
@@ -430,7 +518,14 @@ impl DetourProvider {
             ));
             let name = rustls::pki_types::ServerName::try_from(host.clone())
                 .context("invalid rule-set host")?;
-            Box::new(connector.connect(name, tcp).await.context("TLS handshake with rule-set host")?)
+            let tls_stream = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connector.connect(name, tcp),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("TLS handshake with rule-set host timed out"))?
+            .context("TLS handshake with rule-set host")?;
+            Box::new(tls_stream)
         } else {
             tcp
         };
@@ -439,11 +534,21 @@ impl DetourProvider {
             .map(|value| format!("If-None-Match: {value}\r\n"))
             .unwrap_or_default();
         let request = format!(
-            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: xhttp-rs\r\nConnection: close\r\nAccept: */*\r\n{conditional}\r\n"
+            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: sing-box/1.10.0 (xhttp-rs)\r\nConnection: close\r\nAccept: */*\r\n{conditional}\r\n"
         );
-        stream.write_all(request.as_bytes()).await?;
-        stream.flush().await?;
-        let response = read_http_response(&mut *stream).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            stream.write_all(request.as_bytes()).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("send HTTP request timed out"))??;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            read_http_response(&mut *stream),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("read HTTP response timed out"))??;
         let (status, headers, body) = response;
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             let location = headers
@@ -620,25 +725,29 @@ pub async fn build_runtime(
                     port,
                     transport.path
                 );
-                let ech_config_bytes =
-                    if let Some(ech) = tls.ech.as_ref().filter(|ech| {
-                        ech.enabled && ech.config.is_empty() && ech.config_path.is_none()
-                    }) {
-                        let query_name = ech
-                            .query_server_name
-                            .as_deref()
-                            .or(tls.server_name.as_deref())
-                            .unwrap_or(server);
-                        Some(
-                            resolver
-                                .as_deref()
-                                .context("DNS-discovered ECH requires a DNS configuration")?
-                                .ech_config(query_name)
-                                .await?,
-                        )
-                    } else {
-                        None
-                    };
+                let needs_dns_ech = tls.ech.as_ref().is_some_and(|ech| {
+                    ech.enabled && ech.config.is_empty() && ech.config_path.is_none()
+                });
+                let (ech_dns_name, ech_dns_cache) = if needs_dns_ech {
+                    let query_name = tls
+                        .ech
+                        .as_ref()
+                        .and_then(|ech| ech.query_server_name.clone())
+                        .or_else(|| tls.server_name.clone())
+                        .unwrap_or_else(|| server.clone());
+                    let resolver = resolver
+                        .as_deref()
+                        .context("DNS-discovered ECH requires a DNS configuration")?;
+                    (
+                        Some(query_name.clone()),
+                        Some(std::sync::Arc::new(crate::dns::EchCache::new(
+                            resolver.clone(),
+                            query_name,
+                        ))),
+                    )
+                } else {
+                    (None, None)
+                };
                 let client = Client::new(ClientConfig {
                     listen: String::new(),
                     server: url,
@@ -682,7 +791,9 @@ pub async fn build_runtime(
                             .as_ref()
                             .filter(|ech| ech.enabled)
                             .and_then(|ech| ech.config_path.clone()),
-                        ech_config_bytes,
+                        ech_config_bytes: None,
+                        ech_dns_name,
+                        ech_dns_cache,
                     },
                 })?;
                 Dialer::Vless {
@@ -723,9 +834,7 @@ pub async fn build_runtime(
         .context("route compiler task failed")??,
     );
     {
-        let mut slot = rule_set_slot
-            .write()
-            .expect("rule-set slot lock poisoned");
+        let mut slot = rule_set_slot.write().expect("rule-set slot lock poisoned");
         *slot = router
             .rule_sets()
             .read()
@@ -795,10 +904,7 @@ impl ProxyRuntime {
 
     #[allow(dead_code)]
     pub(crate) fn set_clash_mode(&self, mode: Option<String>) {
-        *self
-            .clash_mode
-            .write()
-            .expect("clash mode lock poisoned") = mode;
+        *self.clash_mode.write().expect("clash mode lock poisoned") = mode;
     }
 
     /// Set the route fallback outbound (the GLOBAL selection in a Clash API).
@@ -857,12 +963,7 @@ impl ProxyRuntime {
     }
 }
 
-async fn run_url_test(
-    runtime: &ProxyRuntime,
-    tag: &str,
-    group: &Arc<Group>,
-    url: &str,
-) {
+async fn run_url_test(runtime: &ProxyRuntime, tag: &str, group: &Arc<Group>, url: &str) {
     let tolerance = group.tolerance();
     let mut best: Option<(String, u16)> = None;
     for member in group.all() {
@@ -939,56 +1040,96 @@ async fn prefetch_rule_sets(
     else {
         return HashMap::new();
     };
-    let Some(client) = http_clients.iter().find(|client| client.tag == default_http_client) else {
+    let Some(client) = http_clients
+        .iter()
+        .find(|client| client.tag == default_http_client)
+    else {
         tracing::warn!(%default_http_client, "default_http_client not found; rule-set downloads will go direct");
         return HashMap::new();
     };
     let Some(detour) = client.detour.as_deref().filter(|tag| !tag.is_empty()) else {
         return HashMap::new();
     };
-    let mut prefetched = HashMap::new();
-    for set in route.rule_set.iter().filter(|set| set.r#type == "remote") {
-        let Some(url) = set.url.as_deref() else {
-            continue;
-        };
-        let Ok(format) = crate::routing::rule_set_format_for(set, url) else {
-            continue;
-        };
-        let cache_path = crate::routing::rule_set_cache_path(url, format);
-        let cached_etag = std::fs::read(cache_path.with_extension("etag"))
-            .ok()
-            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
-            .filter(|value| !value.is_empty());
-        match provider.fetch_url_etag(detour, url, cached_etag.as_deref()).await {
-            Ok((data, new_etag, not_modified)) => {
-                if not_modified {
-                    tracing::debug!(tag = %set.tag, "remote rule-set not modified");
-                    if let Ok(data) = std::fs::read(&cache_path) {
-                        prefetched.insert(set.tag.clone(), data);
-                    }
-                    continue;
+    // Warm up the detour so the first real request doesn't fail on
+    // lazy-connect. Retry with backoff; proceed anyway if it fails.
+    if let Some(dialer) = provider.dialer(detour) {
+        for attempt in 1u8..=3 {
+            match dialer.warm_up().await {
+                Ok(()) => break,
+                Err(error) if attempt < 3 => {
+                    tracing::debug!(%error, attempt, detour, "detour warm-up failed, retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(300 * u64::from(attempt)))
+                        .await;
                 }
-                tracing::info!(
-                    tag = %set.tag,
-                    bytes = data.len(),
-                    "prefetched remote rule-set through http_client"
-                );
-                if let Err(error) = crate::routing::write_rule_set_cache(&cache_path, &data) {
-                    tracing::warn!(%error, tag = %set.tag, "failed to write rule-set cache");
+                Err(error) => {
+                    tracing::warn!(%error, attempt, detour, "detour warm-up failed after 3 attempts");
                 }
-                if let Some(etag) = new_etag
-                    && let Err(error) = std::fs::write(cache_path.with_extension("etag"), etag)
-                {
-                    tracing::warn!(%error, tag = %set.tag, "failed to write rule-set etag");
-                }
-                prefetched.insert(set.tag.clone(), data);
             }
-            Err(error) => tracing::warn!(
-                %error,
-                tag = %set.tag,
-                "failed to prefetch remote rule-set through http_client; falling back to direct download"
-            ),
         }
+    }
+    let remote_sets: Vec<_> = route
+        .rule_set
+        .iter()
+        .filter(|set| set.r#type == "remote")
+        .cloned()
+        .collect();
+
+    let tasks = remote_sets.into_iter().map(|set| {
+        let tag = set.tag.clone();
+        let url_opt = set.url.clone();
+        let format_opt = set
+            .url
+            .as_deref()
+            .and_then(|url| crate::routing::rule_set_format_for(&set, url).ok())
+            .map(|s| s.to_owned());
+        async move {
+            let url = url_opt?;
+            let format = format_opt?;
+            let cache_path = crate::routing::rule_set_cache_path(&url, &format);
+            let cached_etag = std::fs::read(cache_path.with_extension("etag"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+                .filter(|value| !value.is_empty());
+            match provider.fetch_url_etag(detour, &url, cached_etag.as_deref()).await {
+                Ok((data, new_etag, not_modified)) => {
+                    if not_modified {
+                        tracing::debug!(tag = %tag, "remote rule-set not modified");
+                        if let Ok(data) = std::fs::read(&cache_path) {
+                            return Some((tag, data));
+                        }
+                        return None;
+                    }
+                    tracing::info!(
+                        tag = %tag,
+                        bytes = data.len(),
+                        "prefetched remote rule-set through http_client"
+                    );
+                    if let Err(error) = crate::routing::write_rule_set_cache(&cache_path, &data) {
+                        tracing::warn!(%error, tag = %tag, "failed to write rule-set cache");
+                    }
+                    if let Some(etag) = new_etag
+                        && let Err(error) = std::fs::write(cache_path.with_extension("etag"), etag)
+                    {
+                        tracing::warn!(%error, tag = %tag, "failed to write rule-set etag");
+                    }
+                    Some((tag, data))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        tag = %tag,
+                        "failed to prefetch remote rule-set through http_client; falling back to direct download"
+                    );
+                    None
+                }
+            }
+        }
+    });
+
+    let results = futures_util::future::join_all(tasks).await;
+    let mut prefetched = HashMap::new();
+    for item in results.into_iter().flatten() {
+        prefetched.insert(item.0, item.1);
     }
     prefetched
 }
@@ -999,8 +1140,8 @@ pub(crate) fn parse_duration(value: Option<&str>) -> std::time::Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::udp::{encode_socks_udp, parse_socks_udp, udp_response_proxy_destination};
+    use super::*;
     use crate::Server;
     use crate::config::{Mode, ServerConfig, TransportConfig};
     use crate::routing::RouteOptions;
@@ -1112,7 +1253,14 @@ mod tests {
             tag: Some("direct".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
+        let task = tokio::spawn(run_socks(
+            inbound,
+            vec![outbound],
+            None,
+            None,
+            Vec::new(),
+            None,
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
@@ -1167,7 +1315,14 @@ mod tests {
             final_outbound: Some("proxy".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, outbounds, Some(route), None, Vec::new(), None));
+        let task = tokio::spawn(run_socks(
+            inbound,
+            outbounds,
+            Some(route),
+            None,
+            Vec::new(),
+            None,
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client.write_all(&[5, 1, 0]).await.unwrap();
@@ -1217,7 +1372,14 @@ mod tests {
             tag: Some("direct".into()),
             ..Default::default()
         };
-        let task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
+        let task = tokio::spawn(run_socks(
+            inbound,
+            vec![outbound],
+            None,
+            None,
+            Vec::new(),
+            None,
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = TcpStream::connect(listen).await.unwrap();
         client
@@ -1294,7 +1456,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let proxy_task = tokio::spawn(run_socks(inbound, vec![outbound], None, None, Vec::new(), None));
+        let proxy_task = tokio::spawn(run_socks(
+            inbound,
+            vec![outbound],
+            None,
+            None,
+            Vec::new(),
+            None,
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut control = TcpStream::connect(proxy_addr).await.unwrap();
@@ -1350,9 +1519,16 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (status, headers, body) = read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>)).await.unwrap();
+        let (status, headers, body) =
+            read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>))
+                .await
+                .unwrap();
         assert_eq!(status, 200);
-        assert!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("content-length") && value == "5"));
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("content-length") && value == "5")
+        );
         assert_eq!(body, b"hello");
     }
 
@@ -1365,7 +1541,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (status, _, body) = read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>)).await.unwrap();
+        let (status, _, body) =
+            read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>))
+                .await
+                .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"hello world");
     }
@@ -1380,7 +1559,10 @@ mod tests {
                 .unwrap();
             server.shutdown().await.unwrap();
         });
-        let (status, _, body) = read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>)).await.unwrap();
+        let (status, _, body) =
+            read_http_response(&mut (Box::new(client) as Box<dyn crate::dns::transport::DnsIo>))
+                .await
+                .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"body until close");
     }
@@ -1395,9 +1577,7 @@ mod tests {
             let mut request = vec![0; 4096];
             let _ = stream.read(&mut request).await.unwrap();
             stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\n\r\nhello",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\n\r\nhello")
                 .await
                 .unwrap();
         });
@@ -1405,7 +1585,8 @@ mod tests {
         dialers.insert("direct".into(), Dialer::Direct);
         let provider = DetourProvider::new(Arc::new(dialers), None);
         let url = format!("http://{address}/rules.json");
-        let (body, etag, not_modified) = provider.fetch_url_etag("direct", &url, None).await.unwrap();
+        let (body, etag, not_modified) =
+            provider.fetch_url_etag("direct", &url, None).await.unwrap();
         assert_eq!(body, b"hello");
         assert_eq!(etag.as_deref(), Some("\"v1\""));
         assert!(!not_modified);
@@ -1423,7 +1604,11 @@ mod tests {
                 .unwrap();
         });
         let (body, etag, not_modified) = provider
-            .fetch_url_etag("direct", &format!("http://{address}/rules.json"), Some("\"v1\""))
+            .fetch_url_etag(
+                "direct",
+                &format!("http://{address}/rules.json"),
+                Some("\"v1\""),
+            )
             .await
             .unwrap();
         assert!(body.is_empty());

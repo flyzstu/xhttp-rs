@@ -1,8 +1,4 @@
-use crate::{
-    dns::DnsResolver,
-    routing::RouteOptions,
-    vless,
-};
+use crate::{dns::DnsResolver, routing::RouteOptions, vless};
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::net::{IpAddr, SocketAddr};

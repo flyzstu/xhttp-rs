@@ -22,8 +22,7 @@ use self::message::{
     add_client_subnet, build_query, build_query_with_subnet, canonical_query, dns_id,
     dns_rule_matches, local_response, normalize, optimistic_enabled, parse_client_subnet,
     parse_https_ech, parse_question, parse_response, predefined_response, refused_response,
-    response_ttl, rewrite_response_ttls, validate_dns_rule, validate_response,
-    validate_strategy,
+    response_ttl, rewrite_response_ttls, validate_dns_rule, validate_response, validate_strategy,
 };
 use self::transport::Upstream;
 
@@ -163,11 +162,7 @@ impl DnsResolver {
         for server in self.inner.servers.values() {
             server.set_detour(detour.clone());
         }
-        *self
-            .inner
-            .detour
-            .write()
-            .expect("DNS detour lock poisoned") = Some(detour);
+        *self.inner.detour.write().expect("DNS detour lock poisoned") = Some(detour);
     }
 
     /// Load persisted DNS cache entries from the `cache_file` path, and
@@ -380,11 +375,39 @@ impl DnsResolver {
         }
     }
 
-    pub async fn ech_config(&self, domain: &str) -> Result<Vec<u8>> {
+    /// Fetch the ECH config list for `domain` from its HTTPS (type 65)
+    /// record, returning the raw config bytes plus the record TTL. The TTL
+    /// lets callers cache the config and refresh it when it expires, matching
+    /// sing-box's `ECHClientConfig` behaviour.
+    pub async fn ech_config(&self, domain: &str) -> Result<(Vec<u8>, Duration)> {
         let id = rand::random();
         let query = build_query(id, &normalize(domain), 65)?;
         let response = self.exchange(&query).await?;
-        parse_https_ech(id, &response)
+        let (config, ttl) = parse_https_ech(id, &response)?;
+        Ok((config, Duration::from_secs(ttl.clamp(1, 86400) as u64)))
+    }
+
+    /// Cached variant of [`Self::ech_config`]. Concurrent callers for the
+    /// same domain share one in-flight query (singleflight); results are
+    /// cached for the record TTL (bounded like other DNS cache entries), so
+    /// repeated handshakes do not issue a DNS query each time.
+    pub async fn cached_ech_config(&self, domain: &str) -> Result<Vec<u8>> {
+        let key = CacheKey::Ech {
+            name: normalize(domain).into(),
+        };
+        let load_domain = normalize(domain);
+        let load = || async move {
+            let id = rand::random::<u16>();
+            let query = build_query(id, &load_domain, 65)?;
+            let response = self.exchange(&query).await?;
+            let (config, ttl) = parse_https_ech(id, &response)?;
+            let ttl = Duration::from_secs(ttl.clamp(1, 86400) as u64);
+            Ok((CacheValue::Wire(config), ttl))
+        };
+        match self.cached(key, load).await? {
+            CacheValue::Wire(config) => Ok(config),
+            CacheValue::Addresses(_) => bail!("invalid DNS ECH cache entry"),
+        }
     }
 
     async fn lookup_type(
@@ -407,7 +430,13 @@ impl DnsResolver {
                 bail!("DNS lookup rejected by rule with rcode {rcode}")
             }
             let mut addresses = Vec::new();
-            for record in rule.raw.answer.iter().chain(&rule.raw.ns).chain(&rule.raw.extra) {
+            for record in rule
+                .raw
+                .answer
+                .iter()
+                .chain(&rule.raw.ns)
+                .chain(&rule.raw.extra)
+            {
                 let record = self::message::parse_dns_record(record)?;
                 match (qtype, record.kind) {
                     (1, 1) => {
@@ -417,7 +446,10 @@ impl DnsResolver {
                         addresses.push(IpAddr::from([a, b, c, d]));
                     }
                     (28, 28) => {
-                        let bytes: [u8; 16] = record.rdata[..].try_into().ok().context("invalid AAAA record")?;
+                        let bytes: [u8; 16] = record.rdata[..]
+                            .try_into()
+                            .ok()
+                            .context("invalid AAAA record")?;
                         addresses.push(IpAddr::from(bytes));
                     }
                     _ => {}
@@ -451,7 +483,8 @@ impl DnsResolver {
         let rewrite_ttl = options
             .rewrite_ttl
             .or_else(|| rule.and_then(|rule| rule.raw.rewrite_ttl));
-        let disable_cache = options.disable_cache || rule.is_some_and(|rule| rule.raw.disable_cache);
+        let disable_cache =
+            options.disable_cache || rule.is_some_and(|rule| rule.raw.disable_cache);
         let key = CacheKey::Lookup {
             name: name.into(),
             qtype,
@@ -572,6 +605,17 @@ impl DnsResolver {
             .remove(&key);
         shared.map_err(anyhow::Error::msg)
     }
+    /// A per-domain ECH handle returned when the static config is absent.
+    /// The first [`Self::config`] call fetches the HTTPS record; the result
+    /// is cached for its TTL and refreshed on expiry, so pool rebuilds pick
+    /// up a rotated ECH config without a restart.
+    pub fn ech_handle(&self, domain: &str) -> EchHandle {
+        EchHandle {
+            resolver: self.clone(),
+            domain: normalize(domain),
+        }
+    }
+
     fn select_rule(&self, name: &str, qtype: u16) -> Option<&self::message::CompiledDnsRule> {
         let rule_sets = self
             .inner
@@ -593,6 +637,89 @@ impl DnsResolver {
             .servers
             .get(tag)
             .with_context(|| format!("unknown DNS server: {tag}"))
+    }
+}
+
+/// Handle for one domain's DNS-discovered ECH config.
+///
+/// The config is fetched lazily on the first [`Self::config`] call and
+/// cached for the HTTPS record's TTL. When the TTL expires the next call
+/// re-queries, so XMUX pool rebuilds pick up rotated configs without a
+/// restart — mirroring sing-box's `ECHClientConfig` refresh behaviour.
+/// Concurrent refreshes for one domain share a single query.
+#[derive(Clone)]
+pub struct EchHandle {
+    resolver: DnsResolver,
+    domain: String,
+}
+
+/// Shared, TTL-cached ECH config provider for outbounds whose ECH comes
+/// from DNS. `Clone` shares the underlying state, so one HTTPS query serves
+/// every connection of every outbound using the same domain, with
+/// singleflight refresh on expiry.
+type EchState = Arc<Mutex<Option<(Vec<u8>, std::time::Instant)>>>;
+
+#[derive(Clone)]
+pub struct EchCache {
+    resolver: DnsResolver,
+    domain: String,
+    state: EchState,
+    flight: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl EchHandle {
+    /// Resolve the ECH config bytes, consulting the DNS cache first and
+    /// refreshing when the record TTL has expired.
+    pub async fn config(&self) -> Result<Vec<u8>> {
+        self.resolver.cached_ech_config(&self.domain).await
+    }
+
+    /// The queried (normalized) domain, for logging.
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Build the shared cache provider used by connection pools.
+    pub fn shared(&self) -> EchCache {
+        EchCache {
+            resolver: self.resolver.clone(),
+            domain: self.domain.clone(),
+            state: Arc::new(Mutex::new(None)),
+            flight: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+impl EchCache {
+    /// Create a shared ECH cache for `domain` backed by `resolver`.
+    pub fn new(resolver: DnsResolver, domain: impl Into<String>) -> Self {
+        resolver.ech_handle(&normalize(&domain.into())).shared()
+    }
+
+    /// Resolve the current ECH config. The HTTPS record TTL bounds how long
+    /// a fetched config is reused; concurrent refreshes share one query.
+    pub async fn config(&self) -> Result<Vec<u8>> {
+        {
+            let state = self.state.lock().expect("ECH cache lock poisoned");
+            if let Some((config, expires)) = state.as_ref()
+                && *expires > std::time::Instant::now()
+            {
+                return Ok(config.clone());
+            }
+        }
+        let _guard = self.flight.lock().await;
+        if let Some((config, expires)) =
+            self.state.lock().expect("ECH cache lock poisoned").as_ref()
+            && *expires > std::time::Instant::now()
+        {
+            return Ok(config.clone());
+        }
+        let (config, ttl) = self.resolver.ech_config(&self.domain).await?;
+        *self.state.lock().expect("ECH cache lock poisoned") = Some((
+            config.clone(),
+            std::time::Instant::now() + ttl.max(Duration::from_secs(1)),
+        ));
+        Ok(config)
     }
 }
 
@@ -728,7 +855,7 @@ mod tests {
         rdata.extend(ech);
         response.extend((rdata.len() as u16).to_be_bytes());
         response.extend(rdata);
-        assert_eq!(parse_https_ech(7, &response).unwrap(), ech);
+        assert_eq!(parse_https_ech(7, &response).unwrap(), (ech.to_vec(), 60));
     }
     #[test]
     fn rule_suffix() {
@@ -941,15 +1068,17 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::{Arc, RwLock};
 
-        let set = vec![CompiledRule::compile(
-            &RouteRule {
-                domain_suffix: vec!["example.com".into()],
-                ..Default::default()
-            },
-            &HashMap::new(),
-            false,
-        )
-        .unwrap()];
+        let set = vec![
+            CompiledRule::compile(
+                &RouteRule {
+                    domain_suffix: vec!["example.com".into()],
+                    ..Default::default()
+                },
+                &HashMap::new(),
+                false,
+            )
+            .unwrap(),
+        ];
         let mut sets = HashMap::new();
         sets.insert("geosite-cn".into(), set);
         let rule_sets = Arc::new(RwLock::new(sets));
@@ -961,8 +1090,18 @@ mod tests {
         })
         .unwrap();
         let unlocked = rule_sets.read().unwrap();
-        assert!(super::dns_rule_matches(&rule, "www.example.com", 1, Some(&unlocked)));
-        assert!(!super::dns_rule_matches(&rule, "www.elsewhere.net", 1, Some(&unlocked)));
+        assert!(super::dns_rule_matches(
+            &rule,
+            "www.example.com",
+            1,
+            Some(&unlocked)
+        ));
+        assert!(!super::dns_rule_matches(
+            &rule,
+            "www.elsewhere.net",
+            1,
+            Some(&unlocked)
+        ));
         assert!(!super::dns_rule_matches(&rule, "www.example.com", 1, None));
     }
 
@@ -973,15 +1112,17 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::{Arc, RwLock};
 
-        let set = vec![CompiledRule::compile(
-            &RouteRule {
-                domain_suffix: vec!["ads.example".into()],
-                ..Default::default()
-            },
-            &HashMap::new(),
-            false,
-        )
-        .unwrap()];
+        let set = vec![
+            CompiledRule::compile(
+                &RouteRule {
+                    domain_suffix: vec!["ads.example".into()],
+                    ..Default::default()
+                },
+                &HashMap::new(),
+                false,
+            )
+            .unwrap(),
+        ];
         let mut sets = HashMap::new();
         sets.insert("geosite-ads".into(), set);
         let config = DnsConfig {
@@ -1083,9 +1224,8 @@ mod tests {
             _tag: &str,
             _destination: std::net::SocketAddr,
             request: &[u8],
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>
+        {
             let request = request.to_vec();
             let target = self.target;
             Box::pin(async move {
@@ -1102,7 +1242,11 @@ mod tests {
             _tag: &str,
             _destination: std::net::SocketAddr,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Box<dyn super::transport::DnsIo>>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<Box<dyn super::transport::DnsIo>>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async move { bail!("fake detour does not support TCP") })
         }
@@ -1160,10 +1304,8 @@ mod tests {
         let mut config = test_server("udp", address);
         config.disable_cache = Some(false);
         let resolver = DnsResolver::new(&config).unwrap();
-        let path = std::env::temp_dir().join(format!(
-            "xhttp-rs-dns-cache-{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("xhttp-rs-dns-cache-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         resolver
             .lookup_with_options("persisted.example", &LookupOptions::default())

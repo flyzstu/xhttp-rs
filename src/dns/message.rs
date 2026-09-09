@@ -139,30 +139,40 @@ impl CompiledDnsRule {
         })
     }
 
-    fn matches(&self, name: &str, qtype: u16, rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>) -> bool {
+    fn matches(
+        &self,
+        name: &str,
+        qtype: u16,
+        rule_sets: Option<&HashMap<String, Vec<CompiledRule>>>,
+    ) -> bool {
         if let Some((mode, rules)) = &self.logical {
             let matched = match mode {
-                LogicalMode::And => rules.iter().all(|rule| rule.matches(name, qtype, rule_sets)),
-                LogicalMode::Or => rules.iter().any(|rule| rule.matches(name, qtype, rule_sets)),
+                LogicalMode::And => rules
+                    .iter()
+                    .all(|rule| rule.matches(name, qtype, rule_sets)),
+                LogicalMode::Or => rules
+                    .iter()
+                    .any(|rule| rule.matches(name, qtype, rule_sets)),
             };
             return if self.raw.invert { !matched } else { matched };
         }
         let query_type = self.query_type.is_empty() || self.query_type.contains(&qtype);
         let exact = self.domains.is_empty() || self.domains.iter().any(|v| v == name);
         let suffix = self.suffixes.is_empty()
-            || self.suffixes.iter().any(|v| {
-                name == v || name.strip_suffix(v).is_some_and(|r| r.ends_with('.'))
-            });
-        let keyword = self.keywords.is_empty()
-            || self.keywords.iter().any(|v| name.contains(v.as_str()));
+            || self
+                .suffixes
+                .iter()
+                .any(|v| name == v || name.strip_suffix(v).is_some_and(|r| r.ends_with('.')));
+        let keyword =
+            self.keywords.is_empty() || self.keywords.iter().any(|v| name.contains(v.as_str()));
         let regex = self.regexes.is_empty() || self.regexes.iter().any(|v| v.is_match(name));
         let rule_set = self.raw.rule_set.is_empty()
             || rule_sets.is_some_and(|sets| {
                 self.raw.rule_set.iter().any(|tag| {
                     sets.get(tag).is_some_and(|rules| {
-                        rules
-                            .iter()
-                            .any(|rule| rule.dns_matches_domain(name) || rule.dns_contains_ip_cidr())
+                        rules.iter().any(|rule| {
+                            rule.dns_matches_domain(name) || rule.dns_contains_ip_cidr()
+                        })
                     })
                 })
             });
@@ -221,17 +231,19 @@ pub(super) fn dns_rule_address_limit_matches(
     let sets_matched = rule_sets.is_none_or(|sets| {
         rule.raw.rule_set.iter().any(|tag| {
             sets.get(tag).is_some_and(|rules| {
-                rules
-                    .iter()
-                    .any(|rule| {
-                        addresses
-                            .iter()
-                            .any(|address| rule.dns_matches_address(*address, Some(name)))
-                    })
+                rules.iter().any(|rule| {
+                    addresses
+                        .iter()
+                        .any(|address| rule.dns_matches_address(*address, Some(name)))
+                })
             })
         })
     });
-    if rule.raw.invert { !sets_matched } else { sets_matched }
+    if rule.raw.invert {
+        !sets_matched
+    } else {
+        sets_matched
+    }
 }
 pub(super) fn validate_dns_rule(rule: &DnsRule, top_level: bool) -> Result<()> {
     if rule.r#type == "logical" {
@@ -272,12 +284,7 @@ pub(super) fn validate_dns_rule(rule: &DnsRule, top_level: bool) -> Result<()> {
     }
     if rule.action.as_deref() == Some("predefined") {
         parse_rcode(rule.rcode.as_ref())?;
-        for record in rule
-            .answer
-            .iter()
-            .chain(&rule.ns)
-            .chain(&rule.extra)
-        {
+        for record in rule.answer.iter().chain(&rule.ns).chain(&rule.extra) {
             parse_dns_record(record)?;
         }
     }
@@ -424,7 +431,9 @@ pub(super) fn parse_rcode(value: Option<&serde_json::Value>) -> Result<u8> {
     if let Some(number) = value.as_u64() {
         return u8::try_from(number).context("DNS rcode exceeds 255");
     }
-    let value = value.as_str().context("DNS rcode must be a number or string")?;
+    let value = value
+        .as_str()
+        .context("DNS rcode must be a number or string")?;
     Ok(match value {
         "NOERROR" => 0,
         "FORMERR" => 1,
@@ -452,11 +461,25 @@ pub(super) fn parse_dns_record(record: &str) -> Result<PredefinedRecord> {
         let first = iter.next().context("DNS record is missing fields")?;
         match first.parse::<u32>() {
             Ok(ttl) => (ttl, Box::new(iter)),
-            Err(_) if matches!(
-                first,
-                "IN" | "CH" | "HS" | "A" | "AAAA" | "CNAME" | "NS" | "PTR" | "MX" | "SOA"
-                    | "TXT" | "SRV" | "CAA"
-            ) => (3600, Box::new(std::iter::once(first).chain(iter))),
+            Err(_)
+                if matches!(
+                    first,
+                    "IN" | "CH"
+                        | "HS"
+                        | "A"
+                        | "AAAA"
+                        | "CNAME"
+                        | "NS"
+                        | "PTR"
+                        | "MX"
+                        | "SOA"
+                        | "TXT"
+                        | "SRV"
+                        | "CAA"
+                ) =>
+            {
+                (3600, Box::new(std::iter::once(first).chain(iter)))
+            }
             Err(_) => bail!("invalid DNS record TTL: {first}"),
         }
     };
@@ -511,7 +534,9 @@ pub(super) fn parse_dns_record(record: &str) -> Result<PredefinedRecord> {
                 .parse()
                 .context("invalid MX preference")?;
             let mut data = preference.to_be_bytes().to_vec();
-            data.extend(encode_name(tokens.next().context("MX record is missing an exchange")?)?);
+            data.extend(encode_name(
+                tokens.next().context("MX record is missing an exchange")?,
+            )?);
             data
         }
         "SOA" => {
@@ -539,7 +564,9 @@ pub(super) fn parse_dns_record(record: &str) -> Result<PredefinedRecord> {
                     .context("invalid SRV numeric field")?;
                 data.extend(value.to_be_bytes());
             }
-            data.extend(encode_name(tokens.next().context("SRV record is missing a target")?)?);
+            data.extend(encode_name(
+                tokens.next().context("SRV record is missing a target")?,
+            )?);
             data
         }
         "CAA" => {
@@ -809,7 +836,7 @@ pub(super) fn parse_response(id: u16, qtype: u16, b: &[u8]) -> Result<(Vec<IpAdd
     }
     Ok((out, if ttl == u32::MAX { 30 } else { ttl }))
 }
-pub(super) fn parse_https_ech(id: u16, message: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn parse_https_ech(id: u16, message: &[u8]) -> Result<(Vec<u8>, u32)> {
     if message.len() < 12 || dns_id(message)? != id {
         bail!("invalid DNS HTTPS response")
     }
@@ -833,6 +860,7 @@ pub(super) fn parse_https_ech(id: u16, message: &[u8]) -> Result<Vec<u8>> {
             .get(position..position + 10)
             .context("truncated DNS HTTPS answer")?;
         let record_type = u16::from_be_bytes([header[0], header[1]]);
+        let ttl = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
         let length = u16::from_be_bytes([header[8], header[9]]) as usize;
         position += 10;
         let end = position
@@ -866,7 +894,7 @@ pub(super) fn parse_https_ech(id: u16, message: &[u8]) -> Result<Vec<u8>> {
                 if value_length == 0 {
                     bail!("empty ECH config in DNS HTTPS record")
                 }
-                return Ok(message[position..value_end].to_vec());
+                return Ok((message[position..value_end].to_vec(), ttl));
             }
             position = value_end;
         }
@@ -1110,7 +1138,12 @@ mod tests {
         assert_eq!(parse_query_type(&serde_json::json!(1)).unwrap(), 1);
         assert_eq!(parse_query_type(&serde_json::json!("AAAA")).unwrap(), 28);
         assert_eq!(parse_query_type(&serde_json::json!("HTTPS")).unwrap(), 65);
-        assert!(parse_query_type(&serde_json::json!(70000)).unwrap_err().to_string().contains("65535"));
+        assert!(
+            parse_query_type(&serde_json::json!(70000))
+                .unwrap_err()
+                .to_string()
+                .contains("65535")
+        );
         assert!(parse_query_type(&serde_json::json!("BOGUS")).is_err());
     }
 
@@ -1126,7 +1159,10 @@ mod tests {
     fn parse_rcode_accepts_names_and_numbers() {
         assert_eq!(parse_rcode(None).unwrap(), 0);
         assert_eq!(parse_rcode(Some(&serde_json::json!("NOERROR"))).unwrap(), 0);
-        assert_eq!(parse_rcode(Some(&serde_json::json!("NXDOMAIN"))).unwrap(), 3);
+        assert_eq!(
+            parse_rcode(Some(&serde_json::json!("NXDOMAIN"))).unwrap(),
+            3
+        );
         assert_eq!(parse_rcode(Some(&serde_json::json!("REFUSED"))).unwrap(), 5);
         assert_eq!(parse_rcode(Some(&serde_json::json!(2))).unwrap(), 2);
         assert!(parse_rcode(Some(&serde_json::json!("BOGUS"))).is_err());

@@ -13,15 +13,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    net::TcpListener,
-    sync::mpsc,
-};
+use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::proxy::udp_nat::{UdpMappingKey, UdpNatBehavior, UdpNatTable};
-use crate::proxy::{
-    ProxyRuntime, relay_streamed_tcp, relay_tun_udp,
-};
+use crate::proxy::{ProxyRuntime, relay_streamed_tcp, relay_tun_udp};
 use crate::singbox::Inbound;
 
 // Linux constants not exported by the libc crate.
@@ -31,7 +26,12 @@ const IPV6_TRANSPARENT: libc::c_int = 75;
 const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
 const MAX_OOB: usize = 1024;
 
-fn set_int_option(fd: i32, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> Result<()> {
+fn set_int_option(
+    fd: i32,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> Result<()> {
     let result = unsafe {
         libc::setsockopt(
             fd,
@@ -54,15 +54,31 @@ fn set_tproxy_options(fd: i32, is_ipv6: bool, is_udp: bool) -> Result<()> {
     set_int_option(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
     set_int_option(
         fd,
-        if is_ipv6 { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP },
-        if is_ipv6 { IPV6_TRANSPARENT } else { IP_TRANSPARENT },
+        if is_ipv6 {
+            libc::IPPROTO_IPV6
+        } else {
+            libc::IPPROTO_IP
+        },
+        if is_ipv6 {
+            IPV6_TRANSPARENT
+        } else {
+            IP_TRANSPARENT
+        },
         1,
     )?;
     if is_udp {
         set_int_option(
             fd,
-            if is_ipv6 { libc::IPPROTO_IPV6 } else { libc::IPPROTO_IP },
-            if is_ipv6 { IPV6_RECVORIGDSTADDR } else { IP_RECVORIGDSTADDR },
+            if is_ipv6 {
+                libc::IPPROTO_IPV6
+            } else {
+                libc::IPPROTO_IP
+            },
+            if is_ipv6 {
+                IPV6_RECVORIGDSTADDR
+            } else {
+                IP_RECVORIGDSTADDR
+            },
             1,
         )?;
     }
@@ -115,12 +131,8 @@ fn original_destination(oob: &[u8]) -> Result<SocketAddr> {
         if cmsg_len < 12 {
             break;
         }
-        let level = unsafe {
-            (oob.as_ptr().add(position + 8) as *const i32).read_unaligned()
-        };
-        let ctype = unsafe {
-            (oob.as_ptr().add(position + 12) as *const i32).read_unaligned()
-        };
+        let level = unsafe { (oob.as_ptr().add(position + 8) as *const i32).read_unaligned() };
+        let ctype = unsafe { (oob.as_ptr().add(position + 12) as *const i32).read_unaligned() };
         let data_start = position + 16;
         if level == libc::SOL_IP && ctype == IP_RECVORIGDSTADDR {
             let port = u16::from_be_bytes([oob[data_start + 2], oob[data_start + 3]]);
@@ -161,9 +173,7 @@ pub async fn run_tproxy_inbound(inbound: Inbound, runtime: Arc<ProxyRuntime>) ->
     // TCP: transparent listener; the accepted socket's local address is the
     // original destination. Options must be set before bind so the socket
     // can bind the non-local listen address.
-    let tcp_socket = std::net::TcpListener::from(
-        transparent_socket(&listen, false)?,
-    );
+    let tcp_socket = std::net::TcpListener::from(transparent_socket(&listen, false)?);
     let tcp_listener = TcpListener::from_std(tcp_socket).context("adopt tproxy TCP listener")?;
     let tcp_runtime = runtime.clone();
     let tcp_tag = tag.clone();
@@ -204,9 +214,9 @@ pub async fn run_tproxy_inbound(inbound: Inbound, runtime: Arc<ProxyRuntime>) ->
     let weak_table = Arc::downgrade(&table);
 
     // UDP: transparent socket reading original destinations from ancdata.
-    let udp_socket = Arc::new(std::net::UdpSocket::from(
-        transparent_socket(&listen, true)?,
-    ));
+    let udp_socket = Arc::new(std::net::UdpSocket::from(transparent_socket(
+        &listen, true,
+    )?));
     let (packet_tx, mut packet_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>, SocketAddr)>(512);
     let reader_socket = udp_socket.clone();
     tokio::spawn(async move {
@@ -240,7 +250,13 @@ pub async fn run_tproxy_inbound(inbound: Inbound, runtime: Arc<ProxyRuntime>) ->
                     return Err(std::io::Error::last_os_error());
                 }
                 let address = udp_recvmsg::addr_from_sockaddr(&source);
-                Ok((length as usize, message.msg_controllen, address, owned_buffer, owned_oob))
+                Ok((
+                    length as usize,
+                    message.msg_controllen,
+                    address,
+                    owned_buffer,
+                    owned_oob,
+                ))
             })
             .await;
             let result = match result {
@@ -260,7 +276,11 @@ pub async fn run_tproxy_inbound(inbound: Inbound, runtime: Arc<ProxyRuntime>) ->
                 }
             };
             if packet_tx
-                .send((received[..length].to_vec(), received_oob[..oob_length].to_vec(), address))
+                .send((
+                    received[..length].to_vec(),
+                    received_oob[..oob_length].to_vec(),
+                    address,
+                ))
                 .await
                 .is_err()
             {

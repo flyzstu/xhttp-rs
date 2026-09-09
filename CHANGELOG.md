@@ -14,6 +14,24 @@ All notable changes to xhttp-rs are documented in this file.
   GLOBAL selector, node switching, and per-node delay tests. The shared
   proxy runtime is used by all inbounds so switches take effect immediately.
 
+## [0.1.4] - 2026-09-09
+
+### Added
+
+- Linux TProxy inbound: transparent TCP and UDP interception via
+  `IP_TRANSPARENT`/`IP_RECVORIGDSTADDR`, sharing route evaluation and UDP
+  NAT table with the TUN and SOCKS inbounds.
+- Preserve destination domains for outbound proxy detours (VLESS/AnyTLS) to
+  enable remote DNS resolution and eliminate local DNS pollution.
+- Concurrent remote rule-set prefetching with per-stage timeouts (connect, TLS,
+  request, response) and warmup retries.
+- Singleflight and TTL-based caching for DNS-discovered ECH configs (`EchCache`).
+
+### Fixed
+
+- Prevent startup hangs and connection timeouts on remote rule-set prefetching
+  in restricted network environments.
+
 ## [0.1.3] - 2026-08-15
 
 ### Added

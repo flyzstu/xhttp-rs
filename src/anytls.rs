@@ -53,7 +53,9 @@ pub async fn run_inbound(
     http_clients: Vec<crate::singbox::HttpClientConfig>,
     dns_cache_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let runtime = Arc::new(crate::proxy::build_runtime(outbounds, route, dns, http_clients, dns_cache_path).await?);
+    let runtime = Arc::new(
+        crate::proxy::build_runtime(outbounds, route, dns, http_clients, dns_cache_path).await?,
+    );
     let listen = socket(
         inbound.listen.as_deref().unwrap_or("::"),
         inbound
@@ -525,7 +527,24 @@ fn socket(host: &str, port: u16) -> String {
 }
 
 pub(crate) fn configure_tcp(socket: &TcpStream) -> std::io::Result<()> {
-    socket.set_nodelay(true)
+    socket.set_nodelay(true)?;
+    // Explicitly disable TCP Fast Open so the kernel cannot send data
+    // during the SYN phase, which some middleboxes drop or mishandle.
+    #[cfg(target_os = "linux")]
+    {
+        let descriptor = std::os::fd::AsRawFd::as_raw_fd(socket);
+        let enabled: libc::c_int = 0;
+        let _ = unsafe {
+            libc::setsockopt(
+                descriptor,
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN_CONNECT,
+                std::ptr::from_ref(&enabled).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+    Ok(())
 }
 
 pub fn build_client(
@@ -595,7 +614,7 @@ pub fn build_client(
                                 "DNS-discovered ECH requires a DNS configuration",
                             )
                         })?
-                        .ech_config(&query_name)
+                        .cached_ech_config(&query_name)
                         .await
                         .map_err(std::io::Error::other)?,
                 )

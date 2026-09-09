@@ -288,7 +288,7 @@ pub struct ClientConfig {
     pub tls: ClientTlsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ClientTlsConfig {
     pub insecure: bool,
@@ -305,7 +305,39 @@ pub struct ClientTlsConfig {
     pub ech_config_path: Option<String>,
     #[serde(skip)]
     pub ech_config_bytes: Option<Vec<u8>>,
+    #[serde(skip)]
+    pub ech_dns_name: Option<String>,
+    #[serde(skip)]
+    pub ech_dns_cache: Option<std::sync::Arc<crate::dns::EchCache>>,
     pub disable_sni: bool,
     pub min_version: Option<String>,
     pub max_version: Option<String>,
+}
+
+impl std::fmt::Debug for ClientTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTlsConfig")
+            .field("insecure", &self.insecure)
+            .field("ca_certificate", &self.ca_certificate)
+            .field("ca_pem", &self.ca_pem)
+            .field(
+                "certificate_public_key_sha256",
+                &self.certificate_public_key_sha256,
+            )
+            .field("client_certificate", &self.client_certificate)
+            .field("client_certificate_path", &self.client_certificate_path)
+            .field("client_key", &self.client_key)
+            .field("client_key_path", &self.client_key_path)
+            .field("http2_only", &self.http2_only)
+            .field("http3", &self.http3)
+            .field("ech_config", &self.ech_config)
+            .field("ech_config_path", &self.ech_config_path)
+            .field("ech_config_bytes", &self.ech_config_bytes)
+            .field("ech_dns_name", &self.ech_dns_name)
+            .field("ech_dns_cache", &self.ech_dns_cache.is_some())
+            .field("disable_sni", &self.disable_sni)
+            .field("min_version", &self.min_version)
+            .field("max_version", &self.max_version)
+            .finish()
+    }
 }

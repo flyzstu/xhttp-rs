@@ -1,6 +1,6 @@
 [package]
 name = "xhttp-rs"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 description = "An interoperable XHTTP transport client and server"
@@ -18,6 +18,10 @@ path = "src/main.rs"
 
 [[bench]]
 name = "dns"
+harness = false
+
+[[bench]]
+name = "routing"
 harness = false
 
 [dependencies]

@@ -64,7 +64,11 @@ impl UdpNatTable {
         }
     }
 
-    pub(crate) fn key_for(mapping: UdpNatBehavior, source: SocketAddr, destination: SocketAddr) -> UdpMappingKey {
+    pub(crate) fn key_for(
+        mapping: UdpNatBehavior,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> UdpMappingKey {
         match mapping {
             UdpNatBehavior::EndpointIndependent => UdpMappingKey::Endpoint(source),
             UdpNatBehavior::AddressDependent => UdpMappingKey::Address(source, destination.ip()),
@@ -74,10 +78,13 @@ impl UdpNatTable {
         }
     }
 
-
     /// Combined touch-and-fetch for the hot packet path, avoiding a second
     /// table lock and deferring expiry until the table is at capacity.
-    pub(crate) fn touch_and_sender(&mut self, key: UdpMappingKey, destination: SocketAddr) -> Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> {
+    pub(crate) fn touch_and_sender(
+        &mut self,
+        key: UdpMappingKey,
+        destination: SocketAddr,
+    ) -> Option<mpsc::Sender<(Vec<u8>, SocketAddr)>> {
         if !self.sessions.contains_key(&key) {
             self.reclaim_if_full();
         }
@@ -116,7 +123,11 @@ impl UdpNatTable {
         }
     }
 
-    pub(crate) fn insert_sender(&mut self, key: UdpMappingKey, sender: mpsc::Sender<(Vec<u8>, SocketAddr)>) {
+    pub(crate) fn insert_sender(
+        &mut self,
+        key: UdpMappingKey,
+        sender: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    ) {
         if let Some(session) = self.sessions.get_mut(&key) {
             session.sender = Some(sender);
         }
@@ -183,4 +194,3 @@ impl UdpNatTable {
         }
     }
 }
-

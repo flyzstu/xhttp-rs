@@ -15,11 +15,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use super::{BoxIo, Dialer, ProxyRuntime, build_runtime, parse_duration, socket};
 use super::direct::connect_direct;
 use super::relay::write_first_packet;
 use super::route::{RouteEvaluation, RouteInput, evaluate_tcp_route};
 use super::udp::{UdpAssociateRuntime, relay_dns_tcp, to_anytls_destination, udp_associate};
+use super::{BoxIo, Dialer, ProxyRuntime, build_runtime, parse_duration, socket};
 
 pub async fn run_socks(
     inbound: Inbound,
@@ -29,7 +29,8 @@ pub async fn run_socks(
     http_clients: Vec<crate::singbox::HttpClientConfig>,
     dns_cache_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let runtime = Arc::new(build_runtime(outbounds, route, dns, http_clients, dns_cache_path).await?);
+    let runtime =
+        Arc::new(build_runtime(outbounds, route, dns, http_clients, dns_cache_path).await?);
     run_socks_with_runtime(inbound, runtime).await
 }
 
@@ -92,9 +93,11 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
         if scope.is_empty() {
             LinuxRouteMetadata::default()
         } else {
-            tokio::task::spawn_blocking(move || crate::linux_route::collect_tcp(peer, proxy_address, scope))
-                .await
-                .unwrap_or_default()
+            tokio::task::spawn_blocking(move || {
+                crate::linux_route::collect_tcp(peer, proxy_address, scope)
+            })
+            .await
+            .unwrap_or_default()
         }
     };
     let handshake = tokio::time::timeout(
@@ -224,8 +227,15 @@ async fn handle(mut local: TcpStream, peer: SocketAddr, runtime: HandleRuntime<'
             }
         )?;
     } else {
-        let mut remote: BoxIo =
-            Box::new(connect_direct(&destination, runtime.resolver.as_deref(), &route_options, &resolved_addresses).await?);
+        let mut remote: BoxIo = Box::new(
+            connect_direct(
+                &destination,
+                runtime.resolver.as_deref(),
+                &route_options,
+                &resolved_addresses,
+            )
+            .await?,
+        );
         if let Some(reply) = &reply {
             local.write_all(reply).await?
         }
@@ -569,7 +579,9 @@ mod tests {
         client.read_exact(&mut method).await.unwrap();
         assert_eq!(method, [5, 2]);
         client
-            .write_all(&[1, 5, b'a', b'l', b'i', b'c', b'e', 6, b's', b'e', b'c', b'r', b'e', b't'])
+            .write_all(&[
+                1, 5, b'a', b'l', b'i', b'c', b'e', 6, b's', b'e', b'c', b'r', b'e', b't',
+            ])
             .await
             .unwrap();
         let mut auth = [0; 2];
@@ -595,7 +607,9 @@ mod tests {
         let mut method = [0; 2];
         client.read_exact(&mut method).await.unwrap();
         client
-            .write_all(&[1, 5, b'a', b'l', b'i', b'c', b'e', 5, b'w', b'r', b'o', b'n', b'g'])
+            .write_all(&[
+                1, 5, b'a', b'l', b'i', b'c', b'e', 5, b'w', b'r', b'o', b'n', b'g',
+            ])
             .await
             .unwrap();
         let mut auth = [0; 2];

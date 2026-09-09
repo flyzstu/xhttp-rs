@@ -20,7 +20,7 @@ use tokio_rustls::TlsConnector;
 use crate::singbox::DnsServer;
 
 use super::message::dns_id;
-use super::{MAX_DNS_MESSAGE, STREAM_IDLE_TIMEOUT, STREAM_POOL_SIZE, DNS_TIMEOUT};
+use super::{DNS_TIMEOUT, MAX_DNS_MESSAGE, STREAM_IDLE_TIMEOUT, STREAM_POOL_SIZE};
 
 pub(crate) type DetourUdpFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>;
@@ -75,10 +75,7 @@ pub(super) struct IdleConnection {
     last_used: Instant,
 }
 impl Upstream {
-    pub(super) fn new(
-        config: DnsServer,
-        dot_tls: Option<TlsConnector>,
-    ) -> Result<Self> {
+    pub(super) fn new(config: DnsServer, dot_tls: Option<TlsConnector>) -> Result<Self> {
         let kind = config.r#type.as_str();
         if !matches!(kind, "" | "udp" | "tcp" | "tls" | "https" | "local") {
             bail!("unsupported DNS server type: {kind}")
@@ -120,10 +117,7 @@ impl Upstream {
     }
 
     pub(super) fn set_detour(&self, detour: Arc<dyn DnsUdpDetour>) {
-        *self
-            .detour
-            .write()
-            .expect("DNS detour lock poisoned") = Some(detour);
+        *self.detour.write().expect("DNS detour lock poisoned") = Some(detour);
     }
 
     pub(super) async fn query(&self, http: &reqwest::Client, request: &[u8]) -> Result<Vec<u8>> {
@@ -141,8 +135,18 @@ impl Upstream {
             None
         };
         if let Some(detour) = detour {
-            let endpoint = self.endpoint.as_ref().context("detour DNS server missing address")?;
-            return query_via_detour(&detour, &self.config, endpoint, request, self.detour_tls.as_ref()).await;
+            let endpoint = self
+                .endpoint
+                .as_ref()
+                .context("detour DNS server missing address")?;
+            return query_via_detour(
+                &detour,
+                &self.config,
+                endpoint,
+                request,
+                self.detour_tls.as_ref(),
+            )
+            .await;
         }
         match self.config.r#type.as_str() {
             "" | "udp" => {
@@ -380,10 +384,7 @@ async fn query_via_detour(
     request: &[u8],
     dot_tls: Option<&TlsConnector>,
 ) -> Result<Vec<u8>> {
-    let tag = config
-        .detour
-        .as_deref()
-        .context("DNS detour tag missing")?;
+    let tag = config.detour.as_deref().context("DNS detour tag missing")?;
     let address = endpoint.resolve().await?;
     match config.r#type.as_str() {
         "" | "udp" => {
@@ -402,11 +403,7 @@ async fn query_via_detour(
         "tls" => {
             let tcp = detour.connect_tcp(tag, address).await?;
             let connector = dot_tls.context("DoT detour TLS configuration unavailable")?;
-            let server_name = config
-                .server
-                .as_deref()
-                .unwrap_or_default()
-                .to_owned();
+            let server_name = config.server.as_deref().unwrap_or_default().to_owned();
             let name = rustls::pki_types::ServerName::try_from(server_name)
                 .context("invalid DoT server name")?;
             let mut stream = connector.connect(name, tcp).await?;
@@ -416,7 +413,8 @@ async fn query_via_detour(
         "local" => bail!("local DNS server cannot use a detour"),
         other => bail!("unsupported DNS server type for detour: {other}"),
     }
-}async fn query_https(http: &reqwest::Client, s: &DnsServer, q: &[u8]) -> Result<Vec<u8>> {
+}
+async fn query_https(http: &reqwest::Client, s: &DnsServer, q: &[u8]) -> Result<Vec<u8>> {
     let host = s
         .server
         .as_deref()

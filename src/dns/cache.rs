@@ -23,6 +23,12 @@ pub(super) enum CacheKey {
         query: Arc<[u8]>,
         server: Arc<str>,
     },
+    /// DNS-discovered ECH config for a domain (HTTPS record, key 5). Stored
+    /// separately from wire responses so the parsed bytes can be shared by
+    /// all outbounds using the same `query_server_name`.
+    Ech {
+        name: Arc<str>,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CacheValue {
@@ -54,6 +60,9 @@ enum PersistentKey {
     Wire {
         query: Vec<u8>,
         server: String,
+    },
+    Ech {
+        name: String,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -225,7 +234,10 @@ impl DnsCache {
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                let remaining = entry.expires.saturating_duration_since(Instant::now()).as_secs();
+                let remaining = entry
+                    .expires
+                    .saturating_duration_since(Instant::now())
+                    .as_secs();
                 if remaining == 0 {
                     return None;
                 }
@@ -245,6 +257,9 @@ impl DnsCache {
                         CacheKey::Wire { query, server } => PersistentKey::Wire {
                             query: query.to_vec(),
                             server: server.to_string(),
+                        },
+                        CacheKey::Ech { name } => PersistentKey::Ech {
+                            name: name.to_string(),
                         },
                     },
                     value: match &entry.value {
@@ -289,6 +304,7 @@ impl DnsCache {
                     query: query.into(),
                     server: server.into(),
                 },
+                PersistentKey::Ech { name } => CacheKey::Ech { name: name.into() },
             };
             let value = match entry.value {
                 PersistentValue::Addresses(addresses) => CacheValue::Addresses(addresses),
@@ -323,7 +339,11 @@ mod tests {
     fn insert_and_get_return_the_value() {
         let mut cache = DnsCache::new(16, false);
         let key = lookup_key("example.com");
-        cache.insert(key.clone(), CacheValue::Addresses(vec!["1.2.3.4".parse().unwrap()]), Duration::from_secs(60));
+        cache.insert(
+            key.clone(),
+            CacheValue::Addresses(vec!["1.2.3.4".parse().unwrap()]),
+            Duration::from_secs(60),
+        );
         assert!(matches!(
             cache.get(&key),
             Some(CacheValue::Addresses(ref addresses)) if addresses == &vec!["1.2.3.4".parse::<IpAddr>().unwrap()]
@@ -343,16 +363,26 @@ mod tests {
         response.extend(4u16.to_be_bytes());
         response.extend([1, 2, 3, 4]);
         let key = wire_key(&[0u8; 4]);
-        cache.insert(key.clone(), CacheValue::Wire(response.clone()), Duration::from_secs(60));
+        cache.insert(
+            key.clone(),
+            CacheValue::Wire(response.clone()),
+            Duration::from_secs(60),
+        );
         // Immediately after insert the TTL is still ~100.
         let first = cache.get(&key).unwrap();
-        let CacheValue::Wire(first_bytes) = first else { panic!() };
+        let CacheValue::Wire(first_bytes) = first else {
+            panic!()
+        };
         let ttl_offsets = super::super::message::ttl_offsets(&first_bytes).unwrap();
         assert_eq!(ttl_offsets[0].2, 100);
         // Force expiry of the entry and confirm it is gone.
         std::thread::sleep(Duration::from_millis(5));
         let mut cache = DnsCache::new(16, false);
-        cache.insert(key.clone(), CacheValue::Wire(response), Duration::from_millis(1));
+        cache.insert(
+            key.clone(),
+            CacheValue::Wire(response),
+            Duration::from_millis(1),
+        );
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get(&key).is_none());
     }
@@ -361,7 +391,11 @@ mod tests {
     fn expired_entries_are_purged() {
         let mut cache = DnsCache::new(16, false);
         let key = lookup_key("short.com");
-        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_millis(1));
+        cache.insert(
+            key.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_millis(1),
+        );
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get(&key).is_none());
     }
@@ -370,7 +404,11 @@ mod tests {
     fn disable_expire_keeps_entries_forever() {
         let mut cache = DnsCache::new(16, true);
         let key = lookup_key("forever.com");
-        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_millis(1));
+        cache.insert(
+            key.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_millis(1),
+        );
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get(&key).is_some());
     }
@@ -381,11 +419,23 @@ mod tests {
         let a = lookup_key("a.com");
         let b = lookup_key("b.com");
         let c = lookup_key("c.com");
-        cache.insert(a.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
-        cache.insert(b.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        cache.insert(
+            a.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_secs(60),
+        );
+        cache.insert(
+            b.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_secs(60),
+        );
         // Touching a makes b the least recently used.
         let _ = cache.get(&a);
-        cache.insert(c.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        cache.insert(
+            c.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_secs(60),
+        );
         assert!(cache.get(&b).is_none());
         assert!(cache.get(&a).is_some());
         assert!(cache.get(&c).is_some());
@@ -395,18 +445,32 @@ mod tests {
     fn stale_lru_entries_do_not_evict_reinserted_keys() {
         let mut cache = DnsCache::new(1, false);
         let key = lookup_key("x.com");
-        cache.insert(key.clone(), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+        cache.insert(
+            key.clone(),
+            CacheValue::Addresses(vec![]),
+            Duration::from_secs(60),
+        );
         // Same key reinserted gets a new version; the stale LRU entry must not evict it.
-        cache.insert(key.clone(), CacheValue::Addresses(vec!["9.9.9.9".parse().unwrap()]), Duration::from_secs(60));
+        cache.insert(
+            key.clone(),
+            CacheValue::Addresses(vec!["9.9.9.9".parse().unwrap()]),
+            Duration::from_secs(60),
+        );
         let value = cache.get(&key).unwrap();
-        assert!(matches!(value, CacheValue::Addresses(ref v) if v == &vec!["9.9.9.9".parse::<IpAddr>().unwrap()]));
+        assert!(
+            matches!(value, CacheValue::Addresses(ref v) if v == &vec!["9.9.9.9".parse::<IpAddr>().unwrap()])
+        );
     }
 
     #[test]
     fn compact_lru_rebuilds_from_current_entries() {
         let mut cache = DnsCache::new(5, false);
         for name in ["a.com", "b.com", "c.com", "d.com", "e.com"] {
-            cache.insert(lookup_key(name), CacheValue::Addresses(vec![]), Duration::from_secs(60));
+            cache.insert(
+                lookup_key(name),
+                CacheValue::Addresses(vec![]),
+                Duration::from_secs(60),
+            );
         }
         // Force a compact by touching entries and growing the LRU queue.
         let keys: Vec<_> = ["a.com", "b.com", "c.com", "d.com", "e.com"]
@@ -452,13 +516,12 @@ mod tests {
         let mut target = DnsCache::new(16, false);
         target.restore(restored);
         assert_eq!(
-            target
-                .get(&CacheKey::Lookup {
-                    name: "example.com".into(),
-                    qtype: 1,
-                    server: Some("main".into()),
-                    client_subnet: None,
-                }),
+            target.get(&CacheKey::Lookup {
+                name: "example.com".into(),
+                qtype: 1,
+                server: Some("main".into()),
+                client_subnet: None,
+            }),
             Some(CacheValue::Addresses(vec![IpAddr::from([1, 2, 3, 4])]))
         );
         assert_eq!(

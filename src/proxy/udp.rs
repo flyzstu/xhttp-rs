@@ -16,9 +16,9 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{Dialer, ProxyRuntime, parse_duration};
 use super::direct::direct_udp_socket;
 use super::route::{RouteEvaluation, RouteInput, evaluate_udp_route};
+use super::{Dialer, ProxyRuntime, parse_duration};
 
 pub(super) struct UdpAssociateRuntime<'a> {
     pub(super) inbound: &'a str,
@@ -532,7 +532,10 @@ fn decode_address(packet: &[u8], offset: usize) -> Result<(vless::Destination, u
         position,
     ))
 }
-pub(super) fn encode_socks_udp(destination: &vless::Destination, payload: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn encode_socks_udp(
+    destination: &vless::Destination,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     let mut packet = vec![0, 0, 0];
     encode_address(&mut packet, destination)?;
     packet.extend_from_slice(payload);
@@ -648,6 +651,9 @@ mod tests {
         let v4 = vless::Destination::Ip("192.0.2.4".parse().unwrap(), 8443);
         assert_eq!(from_anytls_destination(&to_anytls_destination(&v4)), v4);
         let domain = vless::Destination::Domain("svc.example".into(), 443);
-        assert_eq!(from_anytls_destination(&to_anytls_destination(&domain)), domain);
+        assert_eq!(
+            from_anytls_destination(&to_anytls_destination(&domain)),
+            domain
+        );
     }
 }

@@ -12,19 +12,18 @@ use tokio::{
     sync::mpsc,
 };
 
-use super::{Dialer, ProxyRuntime, parse_duration};
 use super::direct::{connect_direct, direct_udp_socket};
 use super::route::{
-    RouteEvaluation, RouteInput, evaluate_stream_tcp_route, evaluate_udp_route, override_destination,
-    tls_server_name,
+    RouteEvaluation, RouteInput, evaluate_stream_tcp_route, evaluate_udp_route,
+    override_destination, tls_server_name,
 };
 use super::udp::{
     destination_socket_addr, from_anytls_destination, relay_dns_tcp_stream, resolve_udp,
     to_anytls_destination, udp_response_destination, udp_response_proxy_destination,
 };
+use super::{Dialer, ProxyRuntime, parse_duration};
 
 pub(crate) async fn relay_anytls_tcp(
-
     mut stream: anytls::AnyTlsStream,
     destination: anytls::Address,
     source: SocketAddr,
@@ -84,7 +83,12 @@ pub(crate) async fn relay_anytls_tcp(
                     .as_deref()
                     .map(|value| parse_duration(Some(value)))
                     .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-                connect_direct(&destination, runtime.resolver.as_deref(), &options, &resolved_addresses),
+                connect_direct(
+                    &destination,
+                    runtime.resolver.as_deref(),
+                    &options,
+                    &resolved_addresses,
+                ),
             )
             .await
             .context("AnyTLS target connect timeout")??;
@@ -129,14 +133,7 @@ pub(crate) async fn relay_tun_tcp(
     inbound: &str,
     runtime: &ProxyRuntime,
 ) -> Result<()> {
-    relay_streamed_tcp(
-        stream,
-        source,
-        destination,
-        inbound,
-        runtime,
-    )
-    .await
+    relay_streamed_tcp(stream, source, destination, inbound, runtime).await
 }
 
 /// Relay a TCP stream (from TUN or tproxy) to the routed outbound.
@@ -203,7 +200,12 @@ where
                     .as_deref()
                     .map(|value| parse_duration(Some(value)))
                     .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-                connect_direct(&destination, runtime.resolver.as_deref(), &options, &resolved_addresses),
+                connect_direct(
+                    &destination,
+                    runtime.resolver.as_deref(),
+                    &options,
+                    &resolved_addresses,
+                ),
             )
             .await
             .context("TUN target connect timeout")??;
@@ -423,7 +425,11 @@ pub(crate) async fn relay_anytls_udp(
     }
     Ok(())
 }
-pub(super) async fn write_first_packet<W>(remote: &mut W, packet: &[u8], options: &RouteOptions) -> Result<()>
+pub(super) async fn write_first_packet<W>(
+    remote: &mut W,
+    packet: &[u8],
+    options: &RouteOptions,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin + ?Sized,
 {
