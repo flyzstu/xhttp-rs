@@ -17,6 +17,7 @@ RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/dns.rs \
+    && echo "fn main() {}" > benches/routing.rs \
     && cargo build --release --bin xhttp \
     && rm -rf src benches
 
