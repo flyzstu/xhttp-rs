@@ -311,7 +311,9 @@ session:
 - POST responses can carry downlink data piggybacked (`x-h1-piggyback`,
   `h1_enable_piggyback`, default on) so data does not wait for the GET poll;
 - `h1_coalesce_delay_ms` (default 0, max 1000) batches small upload reads into
-  one packet to cut request count.
+  one packet to cut request count;
+- `h1_max_pending_bytes` (default 2 MiB) bounds unacknowledged downlink bytes
+  per session: the producer pauses backend reads until the client catches up.
 
 ## Source map
 

@@ -43,10 +43,6 @@ struct Session {
     ack_seq: AtomicU64,
 }
 
-/// Upper bound on unacknowledged downstream bytes. When the window exceeds
-/// this the producer pauses reading until the client acknowledges more data.
-const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
-
 /// Downstream delivery state for one session.
 ///
 /// Every byte the backend produced between `acked` (contiguous position the
@@ -82,12 +78,12 @@ struct DownlinkState {
 }
 
 impl DownlinkState {
-    fn new() -> Self {
+    fn new(max_pending_bytes: usize) -> Self {
         Self {
             chunks: VecDeque::new(),
             total: 0,
             acked: 0,
-            max_pending_bytes: MAX_PENDING_BYTES,
+            max_pending_bytes,
             active: None,
             deliver_from: 0,
             kill: None,
@@ -579,7 +575,9 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
     }
     let (sender, mut receiver) =
         mpsc::channel::<Packet>(state.config.transport.max_buffered_packets);
-    let downlink = Arc::new(Mutex::new(DownlinkState::new()));
+    let downlink = Arc::new(Mutex::new(DownlinkState::new(
+        state.config.transport.h1_max_pending_bytes,
+    )));
     let session = Arc::new(Session {
         sender,
         downlink: downlink.clone(),
@@ -2253,7 +2251,7 @@ mod tests {
 
     #[test]
     fn downlink_acknowledge_clamps_and_trims() {
-        let mut dl = DownlinkState::new();
+        let mut dl = DownlinkState::new(2 * 1024 * 1024);
         dl.chunks.push_back((0, Bytes::from(vec![0u8; 100])));
         dl.chunks.push_back((100, Bytes::from(vec![1u8; 100])));
         dl.total = 200;

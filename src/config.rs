@@ -133,6 +133,7 @@ pub struct TransportConfig {
     pub h1_enable_piggyback: bool,
     pub h1_coalesce_delay_ms: u64,
     pub h1_enable_session_resumption: bool,
+    pub h1_max_pending_bytes: usize,
 }
 
 impl Default for TransportConfig {
@@ -170,6 +171,7 @@ impl Default for TransportConfig {
             h1_enable_piggyback: true,
             h1_coalesce_delay_ms: 0,
             h1_enable_session_resumption: true,
+            h1_max_pending_bytes: 2 * 1024 * 1024,
         }
     }
 }
@@ -203,6 +205,9 @@ impl TransportConfig {
         }
         if self.h1_coalesce_delay_ms > 1000 {
             bail!("h1_coalesce_delay_ms must not exceed 1000ms");
+        }
+        if self.h1_max_pending_bytes == 0 {
+            bail!("h1_max_pending_bytes must be greater than zero");
         }
         if !matches!(
             self.session_placement,
@@ -348,5 +353,31 @@ impl std::fmt::Debug for ClientTlsConfig {
             .field("min_version", &self.min_version)
             .field("max_version", &self.max_version)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h1_max_pending_bytes_defaults_and_validates() {
+        let c = TransportConfig::default();
+        assert_eq!(c.h1_max_pending_bytes, 2 * 1024 * 1024);
+
+        let mut bad = TransportConfig {
+            h1_max_pending_bytes: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            bad.validate().err().map(|e| e.to_string()),
+            Some("h1_max_pending_bytes must be greater than zero".into())
+        );
+
+        let mut ok = TransportConfig {
+            h1_max_pending_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 }

@@ -535,6 +535,8 @@ pub struct XHttpTransport {
         alias = "h1_enable_session_resumption"
     )]
     pub h1_enable_session_resumption: Option<bool>,
+    #[serde(alias = "h1MaxPendingBytes", alias = "h1_max_pending_bytes")]
+    pub h1_max_pending_bytes: Option<usize>,
 }
 
 impl XHttpTransport {
@@ -652,6 +654,9 @@ impl XHttpTransport {
         if let Some(v) = self.h1_enable_session_resumption {
             c.h1_enable_session_resumption = v;
         }
+        if let Some(v) = self.h1_max_pending_bytes {
+            c.h1_max_pending_bytes = v;
+        }
         c.xmux = self.xmux.clone();
         c.validate()?;
         Ok(c)
@@ -673,7 +678,8 @@ fn validate_tls_versions(tls: Option<&TlsConfig>) -> Result<()> {
     Ok(())
 }
 
-fn parse_placement(v: &str) -> Result<crate::config::Placement> {    Ok(match v {
+fn parse_placement(v: &str) -> Result<crate::config::Placement> {
+    Ok(match v {
         "path" => crate::config::Placement::Path,
         "query" => crate::config::Placement::Query,
         "header" => crate::config::Placement::Header,
@@ -698,7 +704,7 @@ impl SingBoxConfig {
         let has_proxy_inbound = self.inbounds.iter().any(|inbound| {
             matches!(
                 inbound.r#type.as_str(),
-                "socks" | "http" | "mixed" | "anytls" | "tun" | "tproxy"
+                "socks" | "http" | "mixed" | "anytls" | "tun" | "tproxy" | "redirect"
             )
         });
         for inbound in &self.inbounds {
@@ -746,7 +752,10 @@ impl SingBoxConfig {
                 && !detour.is_empty()
                 && !outbound_tags.contains(detour)
             {
-                bail!("http_client {} detour references unknown outbound: {detour}", client.tag)
+                bail!(
+                    "http_client {} detour references unknown outbound: {detour}",
+                    client.tag
+                )
             }
         }
         if let Some(default_http_client) = self
@@ -754,7 +763,9 @@ impl SingBoxConfig {
             .as_ref()
             .and_then(|route| route.default_http_client.as_deref())
             .filter(|tag| !tag.is_empty())
-            && !http_client_tags.iter().any(|tag| tag.as_str() == default_http_client)
+            && !http_client_tags
+                .iter()
+                .any(|tag| tag.as_str() == default_http_client)
         {
             bail!("route default_http_client references unknown http_client: {default_http_client}")
         }
@@ -795,7 +806,10 @@ impl SingBoxConfig {
                     && !detour.is_empty()
                     && !outbound_tags.contains(detour)
                 {
-                    bail!("DNS server {} detour references unknown outbound: {detour}", server.tag)
+                    bail!(
+                        "DNS server {} detour references unknown outbound: {detour}",
+                        server.tag
+                    )
                 }
             }
             crate::dns::DnsResolver::new(dns)?;
@@ -861,7 +875,7 @@ impl SingBoxConfig {
 
     fn validate_inbound(&self, inbound: &Inbound) -> Result<usize> {
         match inbound.r#type.as_str() {
-            "socks" | "http" | "mixed" | "tproxy" => {
+            "socks" | "http" | "mixed" | "tproxy" | "redirect" => {
                 inbound
                     .listen_port
                     .context("proxy inbound requires listen_port")?;
@@ -1107,6 +1121,30 @@ mod tests {
     }
 
     #[test]
+    fn h1_max_pending_bytes_accepts_aliases_and_defaults() {
+        let built = serde_json::from_str::<XHttpTransport>(r#"{"type":"xhttp"}"#)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(built.h1_max_pending_bytes, 2 * 1024 * 1024);
+
+        for (json, expected) in [
+            (r#"{"type":"xhttp","h1MaxPendingBytes":1048576}"#, 1_048_576),
+            (r#"{"type":"xhttp","h1_max_pending_bytes":8192}"#, 8192),
+        ] {
+            let built = serde_json::from_str::<XHttpTransport>(json)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(built.h1_max_pending_bytes, expected);
+        }
+
+        let zero: XHttpTransport =
+            serde_json::from_str(r#"{"type":"xhttp","h1MaxPendingBytes":0}"#).unwrap();
+        assert!(zero.build().is_err());
+    }
+
+    #[test]
     fn validates_anytls_client_and_server_configuration() {
         let config = SingBoxConfig::from_json(
             r#"{
@@ -1238,6 +1276,32 @@ mod tests {
         // Selector default that is not a member is rejected.
         let bad_default = valid.replace("\"default\":\"direct\"", "\"default\":\"ghost\"");
         let config = SingBoxConfig::from_json(&bad_default).unwrap();
+        assert!(config.validate_runtime().is_err());
+    }
+
+    #[test]
+    fn validates_redirect_inbound() {
+        let valid = r#"{
+            "inbounds":[{"type":"redirect","listen_port":1234}],
+            "outbounds":[{"type":"direct","tag":"direct"}]
+        }"#;
+        let config = SingBoxConfig::from_json(valid).unwrap();
+        config.validate_runtime().unwrap();
+
+        // Missing listen_port is rejected.
+        let missing_port = r#"{
+            "inbounds":[{"type":"redirect"}],
+            "outbounds":[{"type":"direct","tag":"direct"}]
+        }"#;
+        let config = SingBoxConfig::from_json(missing_port).unwrap();
+        assert!(config.validate_runtime().is_err());
+
+        // TLS on redirect inbound is rejected.
+        let with_tls = r#"{
+            "inbounds":[{"type":"redirect","listen_port":1234,"tls":{"enabled":true}}],
+            "outbounds":[{"type":"direct","tag":"direct"}]
+        }"#;
+        let config = SingBoxConfig::from_json(with_tls).unwrap();
         assert!(config.validate_runtime().is_err());
     }
 }
