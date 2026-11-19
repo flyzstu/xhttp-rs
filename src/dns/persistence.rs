@@ -473,15 +473,24 @@ mod tests {
     }
 
     #[test]
-    fn test_read_existing_singbox_cache_copy() {
-        let path = Path::new("/tmp/cache_copy.db");
-        if path.exists() {
-            let cache = Mutex::new(DnsCache::new(100, false));
-            let selected = load_persisted(path, &cache);
-            assert!(selected.is_some());
-            let sel = selected.unwrap();
-            assert!(sel.contains_key("anytls"));
-        }
+    fn test_selected_groups_survive_round_trip() {
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let mut selected = HashMap::new();
+        selected.insert("anytls".into(), "aliyunsg-anytls".into());
+        selected.insert("proxy".into(), "anytls".into());
+
+        let cache = Mutex::new(DnsCache::new(100, false));
+        save_persisted(&path, &cache, Some(&selected)).unwrap();
+
+        let restored = Mutex::new(DnsCache::new(100, false));
+        let restored_selected =
+            load_persisted(&path, &restored).expect("selector groups must restore from BoltDB");
+        assert_eq!(restored_selected, selected);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
