@@ -1,9 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::any,
 };
@@ -21,7 +21,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use futures_util::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot, Notify},
 };
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -38,8 +38,101 @@ struct ServerState {
 }
 struct Session {
     sender: mpsc::Sender<Packet>,
-    receiver: Mutex<Option<mpsc::Receiver<Packet>>>,
+    downlink: Arc<Mutex<DownlinkState>>,
     connected: AtomicBool,
+    ack_seq: AtomicU64,
+}
+
+/// Upper bound on unacknowledged downstream bytes. When the window exceeds
+/// this the producer pauses reading until the client acknowledges more data.
+const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
+
+/// Downstream delivery state for one session.
+///
+/// Every byte the backend produced between `acked` (contiguous position the
+/// client confirmed) and `total` (position produced so far) stays buffered in
+/// `chunks` until acknowledged. Delivery is by range: a GET attachment or a
+/// POST piggyback both snapshot "everything from X" and label the response
+/// with `x-dl-from: X`, so the client can deduplicate and reassemble regardless
+/// of which path delivered a given byte, and no byte is ever lost unless the
+/// client confirmed it first. This is what makes GET reattachment safe.
+struct DownlinkState {
+    /// `(start_offset, data)` with strictly increasing starts. The head may
+    /// start below `acked` (partially acknowledged chunk); consumers trim it.
+    chunks: VecDeque<(u64, Bytes)>,
+    /// Next offset the backend read loop will produce.
+    total: u64,
+    /// Contiguous downstream position confirmed received by the client.
+    acked: u64,
+    max_pending_bytes: usize,
+    /// Current GET consumer: `(generation, channel into the response body)`.
+    active: Option<(u64, mpsc::Sender<Result<Bytes, std::io::Error>>)>,
+    /// Offsets at or above this value are streamed to the live GET directly;
+    /// everything below was already included in its attach snapshot.
+    deliver_from: u64,
+    /// Dropping this sender aborts the previous GET response body.
+    kill: Option<oneshot::Sender<()>>,
+    /// Set once the backend stream ended; `chunks` may still hold data.
+    backend_closed: bool,
+    /// Bumped on every GET attachment; the producer snapshots it so it can
+    /// detect consumer changes without holding the lock across awaits.
+    generation: u64,
+    /// Wakes the producer when acknowledgements free buffer space.
+    ack_notify: Arc<Notify>,
+}
+
+impl DownlinkState {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            total: 0,
+            acked: 0,
+            max_pending_bytes: MAX_PENDING_BYTES,
+            active: None,
+            deliver_from: 0,
+            kill: None,
+            backend_closed: false,
+            generation: 0,
+            ack_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Record a client acknowledgement. Claims beyond `total` are clamped and
+    /// the value never regresses; fully acknowledged chunks are dropped.
+    fn acknowledge(&mut self, claim: u64) {
+        self.acked = self.acked.max(claim.min(self.total));
+        while let Some((offset, chunk)) = self.chunks.front() {
+            if *offset + chunk.len() as u64 <= self.acked {
+                self.chunks.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.ack_notify.notify_waiters();
+    }
+
+    /// Snapshot the buffered bytes for delivery starting exactly at `from`.
+    /// The concatenation of the returned pieces is exactly `[from, ..)`; a
+    /// head chunk straddling `from` is trimmed so the first piece starts at
+    /// `from` and the client can place the range without re-alignment.
+    fn snapshot_from(&self, from: u64) -> Vec<Bytes> {
+        let mut pieces = Vec::new();
+        for (offset, chunk) in &self.chunks {
+            let end = *offset + chunk.len() as u64;
+            if end <= from {
+                continue;
+            }
+            if *offset < from {
+                let skip = (from - *offset) as usize;
+                if skip < chunk.len() {
+                    pieces.push(chunk.slice(skip..));
+                }
+            } else {
+                pieces.push(chunk.clone());
+            }
+        }
+        pieces
+    }
 }
 struct Packet {
     sequence: u64,
@@ -219,7 +312,7 @@ async fn handler(State(state): State<Arc<ServerState>>, request: Request) -> Res
         {
             stream_one(state, request).await
         }
-        (Some(id), None, Method::GET) => download(state, id).await,
+        (Some(id), None, Method::GET) => download(state, id, request.headers().clone()).await,
         (Some(id), Some(seq), _)
             if matches!(
                 config.mode,
@@ -274,64 +367,85 @@ async fn stream_one(state: Arc<ServerState>, request: Request) -> Response {
     stream_response(read)
 }
 
-async fn download(state: Arc<ServerState>, id: String) -> Response {
+/// End a response body stream as soon as `kill` resolves. Used to terminate
+/// a superseded GET consumer without tearing down the session.
+fn attach_kill_stream<S>(
+    stream: S,
+    kill: oneshot::Receiver<()>,
+) -> impl futures_util::Stream<Item = S::Item>
+where
+    S: futures_util::Stream,
+{
+    #[allow(unused_imports)]
+    use tokio_stream::StreamExt as _;
+    stream.take_until(kill)
+}
+
+async fn download(
+    state: Arc<ServerState>,
+    id: String,
+    headers: HeaderMap,
+) -> Response {
     let Some(session) = get_session(&state, &id) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let mut packets = match session.receiver.lock().await.take() {
-        Some(v) => v,
-        None => return StatusCode::CONFLICT.into_response(),
-    };
     session.connected.store(true, Ordering::Release);
-    let stream = backend(&state);
-    let (mut read, mut write) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
-    let state2 = state.clone();
-    let id2 = id.clone();
-    tokio::spawn(async move {
-        let mut pending = BTreeMap::new();
-        let mut next = 0;
-        while let Some(packet) = packets.recv().await {
-            if packet.sequence < next {
-                continue;
-            }
-            if pending.len() >= state2.config.transport.max_buffered_packets
-                && !pending.contains_key(&packet.sequence)
-            {
-                remove_session(&state2, &id2);
-                return;
-            }
-            pending.insert(packet.sequence, packet.payload);
-            while let Some(payload) = pending.remove(&next) {
-                if write.write_all(&payload).await.is_err() {
-                    remove_session(&state2, &id2);
-                    return;
-                }
-                next += 1
-            }
+
+    // Attach to the session's downlink. The pending byte range is snapshotted
+    // (never drained through the channel) so attaching cannot deadlock on a
+    // full channel no matter how large the backlog is; the snapshot is
+    // delivered as the first segment of the response body.
+    let ack = headers
+        .get("x-dl-ack")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let attach = {
+        let mut dl = session.downlink.lock().await;
+        dl.acknowledge(ack);
+        dl.generation += 1;
+        // Abort the previous GET body; if it is still alive this also stops a
+        // stale consumer from receiving duplicated data.
+        dl.kill = None;
+        let closed_empty = dl.backend_closed && dl.snapshot_from(dl.acked).is_empty();
+        let mut attached = None;
+        if !closed_empty {
+            let (tx, rx) = mpsc::channel(64);
+            dl.active = Some((dl.generation, tx));
+            dl.deliver_from = dl.total;
+            let (kill_tx, kill_rx) = oneshot::channel();
+            dl.kill = Some(kill_tx);
+            attached = Some((rx, kill_rx));
         }
-        let _ = write.shutdown().await;
-    });
-    tokio::spawn(async move {
-        let mut buffer = BytesMut::with_capacity(32 * 1024);
-        loop {
-            buffer.clear();
-            match read.read_buf(&mut buffer).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if tx.send(Ok(buffer.split().freeze())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-        remove_session(&state, &id);
-    });
-    response(Body::from_stream(ReceiverStream::new(rx)))
+        let preload = dl.snapshot_from(dl.acked);
+        (dl.acked, preload, attached)
+    };
+    let (from, preload, attached) = attach;
+    let Some((rx, kill_rx)) = attached else {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("x-session-status", "closed")
+            .header("x-dl-from", from.to_string())
+            .header("cache-control", "no-store")
+            .header("x-accel-buffering", "no")
+            .header("content-type", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+    };
+    let body = attach_kill_stream(
+        tokio_stream::iter(preload.into_iter().map(Ok::<_, std::io::Error>))
+            .chain(ReceiverStream::new(rx)),
+        kill_rx,
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("x-dl-from", from.to_string())
+        .header("x-session-status", "streaming")
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no")
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(body))
+        .unwrap()
 }
 
 async fn packet_upload(
@@ -341,6 +455,9 @@ async fn packet_upload(
     request: Request,
 ) -> Response {
     let headers = request.headers().clone();
+    let client_wants_piggyback =
+        headers.get("x-h1-piggyback").and_then(|v| v.to_str().ok()) == Some("1");
+
     let body =
         match axum::body::to_bytes(request.into_body(), state.config.transport.max_packet_size)
             .await
@@ -351,12 +468,14 @@ async fn packet_upload(
     let payload = match protocol::extract_payload_bytes(&state.config.transport, &headers, body) {
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };    if payload.len() > state.config.transport.max_packet_size {
+    };
+    if payload.len() > state.config.transport.max_packet_size {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     let Some(session) = get_session(&state, &id) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    session.connected.store(true, Ordering::Release);
     if session
         .sender
         .send(Packet { sequence, payload })
@@ -365,13 +484,67 @@ async fn packet_upload(
     {
         return StatusCode::CONFLICT.into_response();
     }
-    StatusCode::OK.into_response()
+
+    let ack_seq = session.ack_seq.load(Ordering::Relaxed);
+    if state.config.transport.h1_enable_piggyback && client_wants_piggyback {
+        let dl_ack = headers
+            .get("x-dl-ack")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let piggyback = {
+            let mut dl = session.downlink.lock().await;
+            dl.acknowledge(dl_ack);
+            // Skip while a GET consumer is attached: it owns delivery, and
+            // skipping avoids double-sending the same bytes. Chunks are NOT
+            // removed here; they stay buffered until the client acknowledges
+            // them, so a lost piggyback response is recoverable.
+            if dl.active.is_none() && !dl.chunks.is_empty() {
+                let from = dl.acked;
+                let mut combined = BytesMut::new();
+                for (offset, chunk) in dl.chunks.iter() {
+                    let end = *offset + chunk.len() as u64;
+                    if end <= from {
+                        continue;
+                    }
+                    if *offset < from {
+                        let skip = (from - *offset) as usize;
+                        combined.extend_from_slice(&chunk[skip..]);
+                    } else {
+                        combined.extend_from_slice(chunk);
+                    }
+                    if combined.len() >= 32 * 1024 {
+                        break;
+                    }
+                }
+                (!combined.is_empty()).then_some((from, combined.freeze()))
+            } else {
+                None
+            }
+        };
+        if let Some((from, payload)) = piggyback {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/octet-stream")
+                .header("x-dl-from", from.to_string())
+                .header("x-ack-seq", ack_seq.to_string())
+                .body(Body::from(payload))
+                .unwrap();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("x-ack-seq", ack_seq.to_string())
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn stream_upload(state: Arc<ServerState>, id: String, request: Request) -> Response {
     let Some(session) = get_session(&state, &id) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    session.connected.store(true, Ordering::Release);
     let mut input = request.into_body().into_data_stream();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     tokio::spawn(async move {
@@ -408,11 +581,14 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
     {
         return None;
     }
-    let (sender, receiver) = mpsc::channel(state.config.transport.max_buffered_packets);
+    let (sender, mut receiver) =
+        mpsc::channel::<Packet>(state.config.transport.max_buffered_packets);
+    let downlink = Arc::new(Mutex::new(DownlinkState::new()));
     let session = Arc::new(Session {
         sender,
-        receiver: Mutex::new(Some(receiver)),
+        downlink: downlink.clone(),
         connected: AtomicBool::new(false),
+        ack_seq: AtomicU64::new(0),
     });
     match state.sessions.entry(id.to_owned()) {
         Entry::Occupied(v) => {
@@ -423,6 +599,161 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
             v.insert(session.clone());
         }
     }
+
+    let front = backend(state);
+    let (mut backend_read, mut backend_write) = tokio::io::split(front);
+
+    let state_upload = Arc::downgrade(state);
+    let id_upload = id.to_owned();
+    let max_buffered = state.config.transport.max_buffered_packets;
+    let session_ack = session.clone();
+
+    tokio::spawn(async move {
+        let mut pending = BTreeMap::new();
+        let mut next = 0;
+        while let Some(packet) = receiver.recv().await {
+            if packet.sequence < next {
+                continue;
+            }
+            if pending.len() >= max_buffered && !pending.contains_key(&packet.sequence) {
+                if let Some(state) = state_upload.upgrade() {
+                    remove_session(&state, &id_upload);
+                }
+                return;
+            }
+            pending.insert(packet.sequence, packet.payload);
+            while let Some(payload) = pending.remove(&next) {
+                if backend_write.write_all(&payload).await.is_err() {
+                    if let Some(state) = state_upload.upgrade() {
+                        remove_session(&state, &id_upload);
+                    }
+                    return;
+                }
+                session_ack.ack_seq.store(next, Ordering::Relaxed);
+                next += 1;
+            }
+        }
+        let _ = backend_write.shutdown().await;
+    });
+
+    let downlink_for_read = downlink;
+    let state_downlink = Arc::downgrade(state);
+    let id_downlink = id.to_owned();
+    tokio::spawn(async move {
+        let mut buffer = BytesMut::with_capacity(32 * 1024);
+        'read: loop {
+            // Backpressure: pause reading while the unacknowledged window is
+            // full. The lock is never held across the wait.
+            while {
+                let dl = downlink_for_read.lock().await;
+                dl.total - dl.acked > dl.max_pending_bytes as u64
+            } {
+                let notify = downlink_for_read.lock().await.ack_notify.clone();
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+            buffer.clear();
+            match backend_read.read_buf(&mut buffer).await {
+                Ok(0) => break 'read,
+                Ok(_) => {
+                    let chunk = buffer.split().freeze();
+                    // Append to the range store, then hand the chunk to the
+                    // live GET if it falls into that consumer's range. The
+                    // send happens OUTSIDE the lock so a stalled consumer
+                    // cannot block attaches or piggyback handling; on
+                    // consumer death the chunk stays buffered and is
+                    // re-delivered by the next attach.
+                    let target = {
+                        let mut dl = downlink_for_read.lock().await;
+                        let offset = dl.total;
+                        dl.total += chunk.len() as u64;
+                        dl.chunks.push_back((offset, chunk.clone()));
+                        dl.active
+                            .as_ref()
+                            .filter(|_| offset >= dl.deliver_from)
+                            .map(|(generation, tx)| (*generation, tx.clone()))
+                    };
+                    if let Some((generation, tx)) = target {
+                        let send_failed = tx.send(Ok(chunk)).await.is_err();
+                        if send_failed {
+                            let mut dl = downlink_for_read.lock().await;
+                            if dl.active.as_ref().is_some_and(|(g, _)| *g == generation) {
+                                dl.active = None;
+                                dl.kill = None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let target = {
+                        let mut dl = downlink_for_read.lock().await;
+                        let active = dl.active.take();
+                        let kill = dl.kill.take();
+                        active.map(|(_, tx)| (tx, kill))
+                    };
+                    if let Some((tx, _)) = target {
+                        let _ = tx.send(Err(e)).await;
+                    }
+                    break 'read;
+                }
+            }
+        }
+        // Backend closed: hand the remaining range to the live consumer, then
+        // end its body. Chunks that cannot be delivered stay buffered for a
+        // later attachment (within the session lifetime).
+        loop {
+            let attempt = {
+                let mut dl = downlink_for_read.lock().await;
+                dl.backend_closed = true;
+                match (dl.active.as_ref(), dl.chunks.front()) {
+                    (Some((generation, tx)), Some((_, chunk))) => Some((
+                        *generation,
+                        tx.clone(),
+                        chunk.clone(),
+                    )),
+                    _ => None,
+                }
+            };
+            match attempt {
+                Some((generation, tx, chunk)) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        tx.send(Ok(chunk.clone())),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            let mut dl = downlink_for_read.lock().await;
+                            dl.chunks.pop_front();
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            let mut dl = downlink_for_read.lock().await;
+                            if dl.active.as_ref().is_some_and(|(g, _)| *g == generation) {
+                                dl.active = None;
+                                dl.kill = None;
+                            }
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        {
+            let mut dl = downlink_for_read.lock().await;
+            dl.backend_closed = true;
+            dl.active = None;
+            dl.kill = None;
+        }
+        if let Some(state) = state_downlink.upgrade() {
+            let timeout = state.config.transport.session_timeout();
+            tokio::time::sleep(timeout).await;
+            remove_session(&state, &id_downlink);
+        }
+    });
+
     let weak = Arc::downgrade(state);
     let id = id.to_owned();
     let timeout = state.config.transport.session_timeout();
@@ -543,6 +874,21 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap()
     }
+
+    /// Read exactly `wanted` bytes from a body stream, with a hard timeout per
+    /// chunk so a stalled stream fails the test instead of hanging it.
+    async fn read_exact_stream(body: &mut axum::body::BodyDataStream, wanted: usize) -> Vec<u8> {
+        let mut assembled = Vec::new();
+        while assembled.len() < wanted {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("stream must deliver buffered data promptly")
+                .unwrap()
+                .unwrap();
+            assembled.extend_from_slice(&chunk);
+        }
+        assembled
+    }
     async fn round_trip(mode: Mode) {
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
@@ -602,6 +948,10 @@ mod tests {
             return;
         };
         let echo_addr = echo.local_addr().unwrap();
+        if tokio::net::TcpStream::connect(echo_addr).await.is_err() {
+            return;
+        }
+        let _ = echo.accept().await;
         tokio::spawn(async move {
             let (mut stream, _) = echo.accept().await.unwrap();
             let (mut read, mut write) = stream.split();
@@ -730,7 +1080,7 @@ mod tests {
         .unwrap();
         let first = get_session(&server.state, "first").unwrap();
         assert!(get_session(&server.state, "second").is_none());
-        let response = download(server.state.clone(), "first".into()).await;
+        let response = download(server.state.clone(), "first".into(), HeaderMap::new()).await;
         first
             .sender
             .send(Packet {
@@ -1005,4 +1355,951 @@ mod tests {
         assert_eq!(&result, b"http3");
         task.abort();
     }
+
+    #[tokio::test]
+    async fn h1_piggyback_delivers_payload_in_post_response() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_piggyback: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "piggy-test").unwrap();
+        // Insert pending bytes into the downlink store
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.chunks
+                .push_back((0, Bytes::from_static(b"piggyback-data")));
+            dl.total = 14;
+        }
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/xhttp/piggy-test/0")
+            .header("x-h1-piggyback", "1")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(vec![1, 2, 3]))
+            .unwrap();
+
+        let response = packet_upload(server.state.clone(), "piggy-test".into(), 0, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers().get("x-ack-seq").unwrap(), "0");
+        assert_eq!(response.headers().get("x-dl-from").unwrap(), "0");
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body_bytes.as_ref(), b"piggyback-data");
+
+        // Piggyback delivery does not consume the store; the bytes stay
+        // buffered until the client acknowledges them.
+        {
+            let dl = session.downlink.lock().await;
+            assert_eq!(dl.chunks.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn h1_session_resumption_reconnects_download_stream() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_session_resumption: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "resume-test").unwrap();
+        let res1 = download(server.state.clone(), "resume-test".into(), HeaderMap::new()).await;
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // Upload first packet
+        session
+            .sender
+            .send(Packet {
+                sequence: 0,
+                payload: Bytes::from_static(b"chunk1"),
+            })
+            .await
+            .unwrap();
+
+        let mut body1 = res1.into_body().into_data_stream();
+        let chunk1 = body1.next().await.unwrap().unwrap();
+        assert_eq!(chunk1.as_ref(), b"chunk1");
+
+        // Simulate GET disconnect by dropping body1
+        drop(body1);
+
+        // Upload second packet while GET is disconnected
+        session
+            .sender
+            .send(Packet {
+                sequence: 1,
+                payload: Bytes::from_static(b"chunk2"),
+            })
+            .await
+            .unwrap();
+
+        // Give echo server a moment to echo into pending queue
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Reconnect GET stream with the same session id, acknowledging chunk1
+        // (the resumed response must start exactly after the acked offset).
+        let mut ack_headers = HeaderMap::new();
+        ack_headers.insert("x-dl-ack", axum::http::HeaderValue::from_static("6"));
+        let res2 = download(server.state.clone(), "resume-test".into(), ack_headers).await;
+        assert_eq!(res2.status(), StatusCode::OK);
+        assert_eq!(res2.headers().get("x-dl-from").unwrap(), "6");
+        let mut body2 = res2.into_body().into_data_stream();
+        let chunk2 = body2.next().await.unwrap().unwrap();
+        assert_eq!(chunk2.as_ref(), b"chunk2");
+    }
+
+    #[tokio::test]
+    async fn h1_piggyback_client_server_full_duplex_e2e() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = echo.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let listen = free_addr().await;
+        let transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_coalesce_delay_ms: 2,
+            h1_enable_session_resumption: true,
+            padding_min: 8,
+            padding_max: 8,
+            packet_interval_ms: 0,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: transport.clone(),
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+        let client = Client::new(ClientConfig {
+            listen: String::new(),
+            server: format!("http://{listen}/xhttp"),
+            connect_addr: None,
+            transport,
+            tls: ClientTlsConfig::default(),
+        })
+        .unwrap();
+
+        let mut stream = loop {
+            match client.connect().await {
+                Ok(v) => break v,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        stream.write_all(b"e2e-piggyback").await.unwrap();
+        let mut result = [0; 13];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_exact(&mut result),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&result, b"e2e-piggyback");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn h1_backward_compat_non_piggyback_client() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        // Server has piggyback enabled
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_piggyback: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let _session = get_session(&server.state, "compat-test").unwrap();
+        let get_resp = download(server.state.clone(), "compat-test".into(), HeaderMap::new()).await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        // Upload packet WITHOUT x-h1-piggyback header (like legacy client)
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/xhttp/compat-test/0")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(b"legacy-client-data".to_vec()))
+            .unwrap();
+
+        let post_resp = packet_upload(server.state.clone(), "compat-test".into(), 0, request).await;
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        // POST response body MUST be empty because client didn't ask for piggybacking!
+        let post_body = axum::body::to_bytes(post_resp.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            post_body.is_empty(),
+            "legacy client should not receive piggybacked body"
+        );
+
+        // GET stream MUST receive all echoed bytes intact
+        let mut get_body = get_resp.into_body().into_data_stream();
+        let chunk = get_body.next().await.unwrap().unwrap();
+        assert_eq!(chunk.as_ref(), b"legacy-client-data");
+    }
+
+    #[tokio::test]
+    async fn h1_multi_disconnect_session_resumption_stress() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_session_resumption: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "multi-resume-test").unwrap();
+
+        // Round 1: Connect GET #1, send seq 0, read chunk, drop GET #1
+        let get1 = download(server.state.clone(), "multi-resume-test".into(), HeaderMap::new()).await;
+        session
+            .sender
+            .send(Packet {
+                sequence: 0,
+                payload: Bytes::from_static(b"packet-zero"),
+            })
+            .await
+            .unwrap();
+        let mut body1 = get1.into_body().into_data_stream();
+        assert_eq!(
+            read_exact_stream(&mut body1, 11).await.as_slice(),
+            b"packet-zero"
+        );
+        drop(body1); // Disconnect #1
+
+        // Round 2: Send seq 1 while disconnected, wait for echo, connect GET #2
+        // (acknowledging the 11 delivered bytes), read chunk, drop GET #2
+        session
+            .sender
+            .send(Packet {
+                sequence: 1,
+                payload: Bytes::from_static(b"packet-one"),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut ack11 = HeaderMap::new();
+        ack11.insert("x-dl-ack", axum::http::HeaderValue::from_static("11"));
+        let get2 = download(server.state.clone(), "multi-resume-test".into(), ack11).await;
+        assert_eq!(get2.headers().get("x-dl-from").unwrap(), "11");
+        let mut body2 = get2.into_body().into_data_stream();
+        assert_eq!(
+            read_exact_stream(&mut body2, 10).await.as_slice(),
+            b"packet-one"
+        );
+        drop(body2); // Disconnect #2
+
+        // Round 3: Send seq 2 while disconnected, connect GET #3 (acked through
+        // offset 22), read chunk
+        session
+            .sender
+            .send(Packet {
+                sequence: 2,
+                payload: Bytes::from_static(b"packet-two"),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut ack21 = HeaderMap::new();
+        ack21.insert("x-dl-ack", axum::http::HeaderValue::from_static("21"));
+        let get3 = download(server.state.clone(), "multi-resume-test".into(), ack21).await;
+        assert_eq!(get3.headers().get("x-dl-from").unwrap(), "21");
+        let mut body3 = get3.into_body().into_data_stream();
+        assert_eq!(
+            read_exact_stream(&mut body3, 10).await.as_slice(),
+            b"packet-two"
+        );
+    }
+
+    #[tokio::test]
+    async fn h1_large_payload_bidirectional_stress() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = echo.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let listen = free_addr().await;
+        let transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_coalesce_delay_ms: 2,
+            h1_enable_session_resumption: true,
+            padding_min: 8,
+            padding_max: 8,
+            packet_interval_ms: 0,
+            max_packet_size: 16 * 1024,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: transport.clone(),
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+        let client = Client::new(ClientConfig {
+            listen: String::new(),
+            server: format!("http://{listen}/xhttp"),
+            connect_addr: None,
+            transport,
+            tls: ClientTlsConfig::default(),
+        })
+        .unwrap();
+
+        let stream = loop {
+            match client.connect().await {
+                Ok(v) => break v,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        // Send 64KB in chunks
+        let total_size = 64 * 1024;
+        let payload: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+        let payload_clone = payload.clone();
+
+        let (mut client_read, mut client_write) = tokio::io::split(stream);
+        let write_task = tokio::spawn(async move {
+            for chunk in payload_clone.chunks(4096) {
+                client_write.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            client_write.shutdown().await.unwrap();
+        });
+
+        let mut received = vec![0u8; total_size];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client_read.read_exact(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        write_task.await.unwrap();
+        assert_eq!(received, payload);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn vless_over_h1_piggyback_and_resumption() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let listen = free_addr().await;
+        let user = "e07c0f3b-5ff4-4fd7-833b-df2f4cc90963";
+        let transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_coalesce_delay_ms: 2,
+            h1_enable_session_resumption: true,
+            padding_min: 8,
+            padding_max: 8,
+            packet_interval_ms: 0,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: String::new(),
+            users: vec![user.into()],
+            transport: transport.clone(),
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let client = Client::new(ClientConfig {
+            listen: String::new(),
+            server: format!("http://{listen}/xhttp"),
+            connect_addr: None,
+            transport,
+            tls: ClientTlsConfig::default(),
+        })
+        .unwrap();
+
+        let mut stream = loop {
+            match client.connect().await {
+                Ok(v) => break v,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        vless::connect(
+            &mut stream,
+            user,
+            &vless::parse_destination("127.0.0.1", echo_addr.port()),
+        )
+        .await
+        .unwrap();
+
+        stream.write_all(b"vless-h1-enhanced").await.unwrap();
+        let mut result = [0; 17];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut result),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&result, b"vless-h1-enhanced");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn h1_client_disabled_piggyback_uses_pure_get() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+
+        let server_transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_enable_session_resumption: true,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: server_transport,
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+
+        let client_transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: false,
+            h1_enable_session_resumption: true,
+            ..Default::default()
+        };
+
+        let client = Client::new(ClientConfig {
+            listen: String::new(),
+            server: format!("http://{listen}/xhttp"),
+            connect_addr: None,
+            transport: client_transport,
+            tls: ClientTlsConfig::default(),
+        })
+        .unwrap();
+
+        let mut stream = loop {
+            match client.connect().await {
+                Ok(v) => break v,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        stream.write_all(b"pure-get-stream-payload").await.unwrap();
+        let mut buf = [0u8; 23];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&buf, b"pure-get-stream-payload");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn h1_adaptive_coalescing_merges_small_writes() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+
+        let transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_coalesce_delay_ms: 25,
+            h1_enable_session_resumption: true,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: transport.clone(),
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+
+        let client = Client::new(ClientConfig {
+            listen: String::new(),
+            server: format!("http://{listen}/xhttp"),
+            connect_addr: None,
+            transport,
+            tls: ClientTlsConfig::default(),
+        })
+        .unwrap();
+
+        let mut stream = loop {
+            match client.connect().await {
+                Ok(v) => break v,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        for i in 1..=5 {
+            stream
+                .write_all(format!("chunk{i}").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut received = vec![0u8; 30];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&received, b"chunk1chunk2chunk3chunk4chunk5");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn h1_concurrent_sessions_piggyback_isolation() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = echo.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+
+        let transport = TransportConfig {
+            mode: Mode::PacketUp,
+            h1_enable_piggyback: true,
+            h1_enable_session_resumption: true,
+            ..Default::default()
+        };
+
+        let server = Server::new(ServerConfig {
+            listen: listen.to_string(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: transport.clone(),
+            tls: None,
+        })
+        .unwrap();
+
+        let task = tokio::spawn(server.run());
+
+        let mut handles = Vec::new();
+        for client_id in 0..4 {
+            let listen_str = listen.to_string();
+            let transport_cfg = transport.clone();
+            handles.push(tokio::spawn(async move {
+                let client = Client::new(ClientConfig {
+                    listen: String::new(),
+                    server: format!("http://{listen_str}/xhttp"),
+                    connect_addr: None,
+                    transport: transport_cfg,
+                    tls: ClientTlsConfig::default(),
+                })
+                .unwrap();
+
+                let mut stream = loop {
+                    match client.connect().await {
+                        Ok(v) => break v,
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                    }
+                };
+
+                let msg = format!("concurrent-client-{client_id}-test-payload");
+                stream.write_all(msg.as_bytes()).await.unwrap();
+
+                let mut buf = vec![0u8; msg.len()];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    stream.read_exact(&mut buf),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+                assert_eq!(buf, msg.as_bytes());
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn h1_server_downlink_pending_queue_bounded_capacity() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_piggyback: true,
+                h1_enable_session_resumption: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "bounded-queue-test").unwrap();
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.max_pending_bytes = 1024;
+            assert_eq!(dl.acked, 0);
+
+            let chunk1 = Bytes::from(vec![1u8; 512]);
+            dl.chunks.push_back((0, chunk1));
+            dl.total = 512;
+            assert_eq!(dl.total - dl.acked, 512);
+
+            let chunk2 = Bytes::from(vec![2u8; 512]);
+            dl.chunks.push_back((512, chunk2));
+            dl.total = 1024;
+            assert_eq!(dl.total - dl.acked, 1024);
+
+            assert!(dl.total - dl.acked >= dl.max_pending_bytes as u64);
+        }
+
+        let get_resp =
+            download(server.state.clone(), "bounded-queue-test".into(), HeaderMap::new()).await;
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        let mut body = get_resp.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let second = body.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), 512);
+        assert_eq!(second.len(), 512);
+        assert_eq!(first.as_ref(), &[1u8; 512][..]);
+        assert_eq!(second.as_ref(), &[2u8; 512][..]);
+    }
+
+    #[tokio::test]
+    async fn h1_get_attach_with_large_backlog_does_not_deadlock() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        // Fill the store with far more chunks than the old pre-drain channel
+        // capacity (16); attaching must never block on channel capacity.
+        let session = get_session(&server.state, "backlog-test").unwrap();
+        {
+            let mut dl = session.downlink.lock().await;
+            for index in 0..64u32 {
+                let offset = (index * 4096) as u64;
+                dl.chunks
+                    .push_back((offset, Bytes::from(vec![index as u8; 4096])));
+            }
+            dl.total = 64 * 4096;
+        }
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            download(server.state.clone(), "backlog-test".into(), HeaderMap::new()),
+        )
+        .await
+        .expect("download attach must not deadlock with a large backlog");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-dl-from").unwrap(), "0");
+
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        while received.len() < 64 * 4096 {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .expect("backlog must stream out without deadlock")
+                .unwrap()
+                .unwrap();
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received.len(), 64 * 4096);
+        assert_eq!(received[0], 0);
+        assert_eq!(received[4096], 1);
+        assert_eq!(received[63 * 4096], 63);
+    }
+
+    #[tokio::test]
+    async fn h1_get_swap_is_gap_free_and_duplicate_free() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "swap-test").unwrap();
+
+        // partA is buffered before the first GET attaches.
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.chunks.push_back((0, Bytes::from_static(b"partA")));
+            dl.total = 5;
+        }
+
+        // GET #1 attaches and receives partA from its snapshot.
+        let get1 = download(server.state.clone(), "swap-test".into(), HeaderMap::new()).await;
+        assert_eq!(get1.headers().get("x-dl-from").unwrap(), "0");
+        let mut body1 = get1.into_body().into_data_stream();
+        assert_eq!(read_exact_stream(&mut body1, 5).await.as_slice(), b"partA");
+        drop(body1); // client-side abort; partA was never acknowledged
+
+        // GET #2 attaches WITHOUT acking partA: unacknowledged bytes are
+        // still buffered, so it re-delivers partA and continues with partB.
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.chunks.push_back((5, Bytes::from_static(b"partB")));
+            dl.total = 10;
+        }
+        let get2 = download(server.state.clone(), "swap-test".into(), HeaderMap::new()).await;
+        assert_eq!(get2.headers().get("x-dl-from").unwrap(), "0");
+        let mut body2 = get2.into_body().into_data_stream();
+        assert_eq!(
+            read_exact_stream(&mut body2, 10).await.as_slice(),
+            b"partApartB"
+        );
+        drop(body2);
+
+        // GET #3 acknowledges everything produced so far: the server trims
+        // the store and the new snapshot starts exactly at the acked offset.
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.chunks.push_back((10, Bytes::from_static(b"partC")));
+            dl.total = 15;
+        }
+        let mut ack_headers = HeaderMap::new();
+        ack_headers.insert("x-dl-ack", axum::http::HeaderValue::from_static("10"));
+        let get3 = download(server.state.clone(), "swap-test".into(), ack_headers).await;
+        assert_eq!(get3.headers().get("x-dl-from").unwrap(), "10");
+        let mut body3 = get3.into_body().into_data_stream();
+        assert_eq!(read_exact_stream(&mut body3, 5).await.as_slice(), b"partC");
+    }
+
+    #[test]
+    fn downlink_acknowledge_clamps_and_trims() {
+        let mut dl = DownlinkState::new();
+        dl.chunks.push_back((0, Bytes::from(vec![0u8; 100])));
+        dl.chunks.push_back((100, Bytes::from(vec![1u8; 100])));
+        dl.total = 200;
+
+        // Acknowledging past the produced range is clamped.
+        dl.acknowledge(500);
+        assert_eq!(dl.acked, 200);
+        // Both chunks are fully covered and trimmed.
+        assert!(dl.chunks.is_empty());
+
+        dl.chunks.push_back((200, Bytes::from(vec![2u8; 10])));
+        dl.total = 210;
+        // Acknowledgements never regress.
+        dl.acknowledge(5);
+        assert_eq!(dl.acked, 200);
+        assert_eq!(dl.chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn h1_session_closed_status_header_graceful_shutdown() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_session_resumption: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let session = get_session(&server.state, "graceful-close-test").unwrap();
+        {
+            let mut dl = session.downlink.lock().await;
+            dl.backend_closed = true;
+        }
+
+        let resp = download(server.state.clone(), "graceful-close-test".into(), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-session-status")
+                .and_then(|v| v.to_str().ok()),
+            Some("closed")
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body_bytes.is_empty());
+    }
 }
+

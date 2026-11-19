@@ -288,6 +288,30 @@ Implemented rule-set sources:
   the configured path and restored on startup, with a periodic saver. Remote
   rule-sets are cached on disk, loaded before any network round trip at
   startup, and refreshed with `If-None-Match`/304 conditional requests.
+- `experimental.cache_file` also persists selector group choices (BoltDB
+  `selected` bucket) and restores them on startup.
+
+### XHTTP h1 reliability (packet_up mode)
+
+The h1 download path survives GET stream loss instead of tearing down the
+session:
+
+- the server keeps every downstream byte between the client-acknowledged
+  offset and the produced offset buffered per session; GET attachments and
+  POST piggyback responses are range deliveries labelled `x-dl-from` and never
+  remove unacknowledged bytes, so a reconnecting GET re-delivers exactly the
+  unacked window (no gaps, duplicates are removed by the client's offset
+  assembler);
+- a broken GET no longer kills the session: the producer keeps buffering, and
+  a new GET reattaches (bounded by `max_pending_bytes` of unacked data; the
+  producer pauses instead of growing past it);
+- the client re-establishes its GET automatically when
+  `h1_enable_session_resumption` is set (default), reporting its contiguous
+  position via `x-dl-ack` on every request;
+- POST responses can carry downlink data piggybacked (`x-h1-piggyback`,
+  `h1_enable_piggyback`, default on) so data does not wait for the GET poll;
+- `h1_coalesce_delay_ms` (default 0, max 1000) batches small upload reads into
+  one packet to cut request count.
 
 ## Source map
 

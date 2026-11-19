@@ -130,6 +130,9 @@ pub struct TransportConfig {
     pub max_sessions: usize,
     pub max_session_id_length: usize,
     pub xmux: XmuxConfig,
+    pub h1_enable_piggyback: bool,
+    pub h1_coalesce_delay_ms: u64,
+    pub h1_enable_session_resumption: bool,
 }
 
 impl Default for TransportConfig {
@@ -164,6 +167,9 @@ impl Default for TransportConfig {
             max_sessions: 4096,
             max_session_id_length: 256,
             xmux: XmuxConfig::default(),
+            h1_enable_piggyback: true,
+            h1_coalesce_delay_ms: 0,
+            h1_enable_session_resumption: true,
         }
     }
 }
@@ -194,6 +200,9 @@ impl TransportConfig {
             || self.max_session_id_length == 0
         {
             bail!("packet limits must be greater than zero");
+        }
+        if self.h1_coalesce_delay_ms > 1000 {
+            bail!("h1_coalesce_delay_ms must not exceed 1000ms");
         }
         if !matches!(
             self.session_placement,

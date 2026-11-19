@@ -526,6 +526,15 @@ pub struct XHttpTransport {
     pub no_grpc_header: bool,
     pub no_sse_header: bool,
     pub xmux: crate::config::XmuxConfig,
+    #[serde(alias = "h1EnablePiggyback", alias = "h1_enable_piggyback")]
+    pub h1_enable_piggyback: Option<bool>,
+    #[serde(alias = "h1CoalesceDelayMs", alias = "h1_coalesce_delay_ms")]
+    pub h1_coalesce_delay_ms: Option<u64>,
+    #[serde(
+        alias = "h1EnableSessionResumption",
+        alias = "h1_enable_session_resumption"
+    )]
+    pub h1_enable_session_resumption: Option<bool>,
 }
 
 impl XHttpTransport {
@@ -633,6 +642,15 @@ impl XHttpTransport {
         }
         if let Some(v) = self.sc_max_buffered_posts {
             c.max_buffered_packets = v
+        }
+        if let Some(v) = self.h1_enable_piggyback {
+            c.h1_enable_piggyback = v;
+        }
+        if let Some(v) = self.h1_coalesce_delay_ms {
+            c.h1_coalesce_delay_ms = v;
+        }
+        if let Some(v) = self.h1_enable_session_resumption {
+            c.h1_enable_session_resumption = v;
         }
         c.xmux = self.xmux.clone();
         c.validate()?;
