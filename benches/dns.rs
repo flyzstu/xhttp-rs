@@ -1,5 +1,11 @@
+//! DNS resolver benchmarks against the real `xhttp::dns::DnsResolver`.
+//! A local UDP echo server answers queries; no public network is used.
+
+#[path = "common/mod.rs"]
+mod common;
+
+use common::{Config, Measurement, measure_async, print_header};
 use std::{
-    future::Future,
     hint::black_box,
     net::{SocketAddr, UdpSocket},
     sync::{
@@ -26,12 +32,15 @@ fn main() {
         .build()
         .expect("build benchmark runtime");
     runtime.block_on(async {
+        let cfg = Config::new(1_000, CACHE_ITERATIONS, 7);
+        print_header("dns resolver");
+
         let cached = resolver(server.address, false);
         cached
             .lookup("cached.example")
             .await
             .expect("warm lookup cache");
-        measure("lookup cache hit", CACHE_ITERATIONS, || async {
+        measure_async("lookup cache hit", &cfg, || async {
             black_box(
                 cached
                     .lookup(black_box("cached.example"))
@@ -39,12 +48,13 @@ fn main() {
                     .expect("cached lookup"),
             );
         })
-        .await;
+        .await
+        .report();
 
         let query = build_query(1, "wire.example", 16);
         cached.exchange(&query).await.expect("warm wire cache");
         let mut id = 2u16;
-        measure("raw exchange cache hit", CACHE_ITERATIONS, || {
+        measure_async("raw exchange cache hit", &cfg, || {
             let mut query = query.clone();
             query[..2].copy_from_slice(&id.to_be_bytes());
             id = id.wrapping_add(1);
@@ -58,11 +68,13 @@ fn main() {
                 );
             }
         })
-        .await;
+        .await
+        .report();
 
         let uncached = resolver(server.address, true);
+        let net_cfg = Config::new(200, NETWORK_ITERATIONS, 5);
         let mut sequence = 0usize;
-        measure("UDP multiplexed miss", NETWORK_ITERATIONS, || {
+        measure_async("UDP multiplexed miss", &net_cfg, || {
             let query = build_query(sequence as u16, &format!("q{sequence}.example"), 16);
             sequence += 1;
             let resolver = &uncached;
@@ -70,58 +82,43 @@ fn main() {
                 black_box(resolver.exchange(&query).await.expect("UDP exchange"));
             }
         })
-        .await;
+        .await
+        .report();
 
         let concurrent = resolver(server.address, true);
-        let started = Instant::now();
-        let mut workers = Vec::new();
-        for worker in 0..CONCURRENCY {
-            let resolver = concurrent.clone();
-            workers.push(tokio::spawn(async move {
-                let iterations = CONCURRENT_ITERATIONS / CONCURRENCY;
-                for index in 0..iterations {
-                    let sequence = worker * iterations + index;
-                    let query = build_query(sequence as u16, &format!("c{sequence}.example"), 16);
-                    black_box(
-                        resolver
-                            .exchange(&query)
-                            .await
-                            .expect("concurrent exchange"),
-                    );
-                }
-            }));
+        let mut samples_ns = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let started = Instant::now();
+            let mut workers = Vec::new();
+            for worker in 0..CONCURRENCY {
+                let resolver = concurrent.clone();
+                workers.push(tokio::spawn(async move {
+                    let iterations = CONCURRENT_ITERATIONS / CONCURRENCY;
+                    for index in 0..iterations {
+                        let sequence = worker * iterations + index;
+                        let query =
+                            build_query(sequence as u16, &format!("c{sequence}.example"), 16);
+                        black_box(
+                            resolver
+                                .exchange(&query)
+                                .await
+                                .expect("concurrent exchange"),
+                        );
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.await.expect("join benchmark worker");
+            }
+            samples_ns.push(started.elapsed().as_nanos());
         }
-        for worker in workers {
-            worker.await.expect("join benchmark worker");
+        Measurement {
+            name: "UDP 64-way concurrent",
+            iterations: CONCURRENT_ITERATIONS,
+            samples_ns,
         }
-        let completed = (CONCURRENT_ITERATIONS / CONCURRENCY) * CONCURRENCY;
-        let elapsed = started.elapsed();
-        println!(
-            "{:24} {completed:>9} operations in {:>8.3}s: {:>12.0} ops/s, {:>9.2} us/op",
-            "UDP 64-way concurrent",
-            elapsed.as_secs_f64(),
-            completed as f64 / elapsed.as_secs_f64(),
-            elapsed.as_secs_f64() * 1_000_000.0 / completed as f64,
-        );
+        .report();
     });
-}
-
-async fn measure<F, Fut>(name: &str, iterations: usize, mut operation: F)
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let started = Instant::now();
-    for _ in 0..iterations {
-        operation().await;
-    }
-    let elapsed = started.elapsed();
-    println!(
-        "{name:24} {iterations:>9} operations in {:>8.3}s: {:>12.0} ops/s, {:>9.2} us/op",
-        elapsed.as_secs_f64(),
-        iterations as f64 / elapsed.as_secs_f64(),
-        elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64,
-    );
 }
 
 fn resolver(address: SocketAddr, disable_cache: bool) -> DnsResolver {

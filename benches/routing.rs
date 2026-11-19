@@ -1,184 +1,134 @@
-//! Routing benchmark for xhttp-rs
-//!
-//! Tests rule compilation and matching performance.
+//! Routing benchmarks against the REAL `xhttp::routing::Router` engine.
+//! The previous version used simulated matchers; this one compiles and queries
+//! production `RouteConfig`/`RouteRule`/`Router` so regressions in rule
+//! compilation or matching are actually caught.
 
-use std::net::IpAddr;
-use std::str::FromStr;
-use std::time::Instant;
+#[path = "common/mod.rs"]
+mod common;
+
+use common::{Config, measure_sync, print_header};
+use std::hint::black_box;
+use xhttp::{
+    routing::{RouteContext, Router},
+    singbox::{RouteConfig, RouteRule},
+};
+
+fn config() -> RouteConfig {
+    RouteConfig {
+        rules: vec![
+            RouteRule {
+                domain_suffix: vec![".example.com".into(), ".example.net".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            },
+            RouteRule {
+                domain_keyword: vec!["ads".into(), "tracker".into(), "analytics".into()],
+                action: Some("reject".into()),
+                ..Default::default()
+            },
+            RouteRule {
+                ip_cidr: vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()],
+                outbound: Some("direct".into()),
+                ..Default::default()
+            },
+            RouteRule {
+                port: vec![80, 443, 8080],
+                network: vec!["tcp".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            },
+            RouteRule {
+                domain_regex: vec![r"^api[0-9]+\.example\.com$".into()],
+                outbound: Some("api".into()),
+                ..Default::default()
+            },
+        ],
+        final_outbound: Some("direct".into()),
+        ..Default::default()
+    }
+}
 
 fn main() {
-    println!("============================================================");
-    println!("Routing Performance Benchmark - Rust (xhttp-rs)");
-    println!("============================================================");
+    let cfg = Config::new(2_000, 50_000, 7);
+    let router = Router::compile(&config(), "direct").expect("compile benchmark router");
 
-    // Benchmark 1: Domain suffix matching
-    println!("\nTest 1: Domain suffix matching");
-    let iterations = 500_000;
-    let suffixes = ["com", "org", "net", "io", "dev"];
-    let start = Instant::now();
-    for i in 0..iterations {
-        let domain = format!("www{}.example.com", i % 1000);
-        let _ = matches_domain_suffix(&domain, &suffixes);
-    }
-    let elapsed = start.elapsed();
-    print_result("domain suffix match", iterations, elapsed);
-
-    // Benchmark 2: IP CIDR matching
-    println!("\nTest 2: IP CIDR matching");
-    let iterations = 500_000;
-    let ips: Vec<IpAddr> = (0..100)
-        .map(|i| IpAddr::from_str(&format!("192.168.{}.{}", i / 256, i % 256)).unwrap())
+    let domains: Vec<String> = (0..1_000).map(|i| format!("www{i}.example.com")).collect();
+    let matching_domains: Vec<String> = (0..1_000).map(|i| format!("ads{i}.com")).collect();
+    let ips: Vec<std::net::IpAddr> = (0..1_000)
+        .map(|i| {
+            format!("10.0.{}.{}", (i / 256) % 256, i % 256)
+                .parse()
+                .unwrap()
+        })
         .collect();
-    let cidrs = [
-        "10.0.0.0/8".parse::<ipnet::IpNet>().unwrap(),
-        "172.16.0.0/12".parse::<ipnet::IpNet>().unwrap(),
-        "192.168.0.0/16".parse::<ipnet::IpNet>().unwrap(),
-    ];
-    let start = Instant::now();
-    for i in 0..iterations {
-        let ip = ips[i % ips.len()];
-        let _ = matches_ip_cidr(ip, &cidrs);
-    }
-    let elapsed = start.elapsed();
-    print_result("IP CIDR match", iterations, elapsed);
 
-    // Benchmark 3: Port range matching
-    println!("\nTest 3: Port range matching");
-    let iterations = 500_000;
-    let ports: Vec<u16> = (1..=65535).step_by(7).take(1000).collect();
-    let ranges: Vec<std::ops::RangeInclusive<u16>> =
-        vec![80..=80, 443..=443, 8000..=9000, 10000..=11000];
-    let start = Instant::now();
-    for i in 0..iterations {
-        let port = ports[i % ports.len()];
-        let _ = matches_port_range(port, &ranges);
-    }
-    let elapsed = start.elapsed();
-    print_result("port range match", iterations, elapsed);
+    print_header("routing (real Router)");
 
-    // Benchmark 4: Domain keyword matching
-    println!("\nTest 4: Domain keyword matching");
-    let iterations = 500_000;
-    let keywords = ["ads", "tracker", "analytics", "telemetry"];
-    let start = Instant::now();
-    for i in 0..iterations {
-        let domain = format!("www{}.example.com", i % 1000);
-        let _ = matches_domain_keyword(&domain, &keywords);
-    }
-    let elapsed = start.elapsed();
-    print_result("domain keyword match", iterations, elapsed);
-
-    // Benchmark 5: Regex domain matching
-    println!("\nTest 5: Regex domain matching");
-    let iterations = 100_000;
-    let pattern = regex::Regex::new(r"^.*\.(com|org|net)$").unwrap();
-    let start = Instant::now();
-    for i in 0..iterations {
-        let domain = format!("www{}.example.com", i % 1000);
-        let _ = pattern.is_match(&domain);
-    }
-    let elapsed = start.elapsed();
-    print_result("regex domain match", iterations, elapsed);
-
-    // Benchmark 6: Full route evaluation simulation
-    println!("\nTest 6: Full route evaluation (simulated router)");
-    let iterations = 200_000;
-    let rules = build_simulated_rules();
-    let start = Instant::now();
-    for i in 0..iterations {
-        let domain = format!("host{}.example.com", i % 500);
-        let ip = IpAddr::from_str(&format!("10.0.{}.{}", (i / 256) % 256, i % 256)).unwrap();
-        let port = ports[i % ports.len()];
-        let _ = simulate_route_evaluation(&domain, ip, port, &rules);
-    }
-    let elapsed = start.elapsed();
-    print_result("full route evaluation", iterations, elapsed);
-}
-
-fn print_result(name: &str, iterations: usize, elapsed: std::time::Duration) {
-    let ops_per_sec = iterations as f64 / elapsed.as_secs_f64();
-    let us_per_op = elapsed.as_secs_f64() * 1e6 / iterations as f64;
-    println!(
-        "{:28} {:>9} operations in {:>8.3}s: {:>12.0} ops/s, {:>9.2} us/op",
-        name,
-        iterations,
-        elapsed.as_secs_f64(),
-        ops_per_sec,
-        us_per_op
-    );
-}
-
-fn matches_domain_suffix(domain: &str, suffixes: &[&str]) -> bool {
-    suffixes.iter().any(|suf| {
-        domain.ends_with(suf) || domain.strip_suffix(suf).is_some_and(|r| r.ends_with('.'))
+    measure_sync("compile Router (50 rules)", &Config::new(0, 50, 7), || {
+        let big = RouteConfig {
+            rules: (0..50)
+                .map(|i| RouteRule {
+                    domain_suffix: vec![format!(".suffix{i}.example")],
+                    outbound: Some(format!("out{i}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        black_box(Router::compile(&big, "direct").unwrap());
     })
-}
+    .report();
 
-fn matches_ip_cidr(ip: IpAddr, cidrs: &[ipnet::IpNet]) -> bool {
-    cidrs.iter().any(|net| net.contains(&ip))
-}
+    measure_sync("route domain suffix hit", &cfg, || {
+        let ctx = RouteContext {
+            domain: Some(black_box(&domains[1])),
+            network: Some("tcp"),
+            destination_port: Some(443),
+            ..Default::default()
+        };
+        black_box(router.route(&ctx));
+    })
+    .report();
 
-fn matches_port_range(port: u16, ranges: &[std::ops::RangeInclusive<u16>]) -> bool {
-    ranges.iter().any(|r| r.contains(&port))
-}
+    measure_sync("route domain keyword hit", &cfg, || {
+        let ctx = RouteContext {
+            domain: Some(black_box(&matching_domains[1])),
+            network: Some("tcp"),
+            ..Default::default()
+        };
+        black_box(router.route(&ctx));
+    })
+    .report();
 
-fn matches_domain_keyword(domain: &str, keywords: &[&str]) -> bool {
-    keywords.iter().any(|kw| domain.contains(kw))
-}
+    measure_sync("route ip cidr hit", &cfg, || {
+        let ctx = RouteContext {
+            destination_ip: Some(black_box(ips[1])),
+            network: Some("tcp"),
+            ..Default::default()
+        };
+        black_box(router.route(&ctx));
+    })
+    .report();
 
-#[derive(Clone)]
-enum SimulatedRule {
-    DomainSuffix(String, String),                     // suffix -> outbound
-    IpCidr(ipnet::IpNet, String),                     // cidr -> outbound
-    PortRange(std::ops::RangeInclusive<u16>, String), // port range -> outbound
-}
+    measure_sync("route port rule hit", &cfg, || {
+        let ctx = RouteContext {
+            domain: Some(black_box(&domains[1])),
+            destination_port: Some(black_box(443)),
+            network: Some("tcp"),
+            ..Default::default()
+        };
+        black_box(router.route(&ctx));
+    })
+    .report();
 
-struct SimulatedRouter {
-    rules: Vec<SimulatedRule>,
-    default: String,
-}
-
-fn build_simulated_rules() -> SimulatedRouter {
-    SimulatedRouter {
-        rules: vec![
-            SimulatedRule::DomainSuffix(".example.com".into(), "proxy".into()),
-            SimulatedRule::DomainSuffix(".google.com".into(), "direct".into()),
-            SimulatedRule::DomainSuffix(".github.com".into(), "proxy".into()),
-            SimulatedRule::IpCidr("10.0.0.0/8".parse().unwrap(), "direct".into()),
-            SimulatedRule::IpCidr("172.16.0.0/12".parse().unwrap(), "direct".into()),
-            SimulatedRule::IpCidr("192.168.0.0/16".parse().unwrap(), "direct".into()),
-            SimulatedRule::PortRange(80..=80, "bypass".into()),
-            SimulatedRule::PortRange(443..=443, "bypass".into()),
-            SimulatedRule::PortRange(8000..=9000, "proxy".into()),
-        ],
-        default: "direct".into(),
-    }
-}
-
-fn simulate_route_evaluation<'a>(
-    domain: &str,
-    ip: IpAddr,
-    port: u16,
-    router: &'a SimulatedRouter,
-) -> &'a str {
-    for rule in &router.rules {
-        match rule {
-            SimulatedRule::DomainSuffix(suffix, outbound) => {
-                if domain.ends_with(suffix) {
-                    return outbound;
-                }
-            }
-            SimulatedRule::IpCidr(cidr, outbound) => {
-                if cidr.contains(&ip) {
-                    return outbound;
-                }
-            }
-            SimulatedRule::PortRange(range, outbound) => {
-                if range.contains(&port) {
-                    return outbound;
-                }
-            }
-        }
-    }
-    &router.default
+    measure_sync("route final (no match)", &cfg, || {
+        let ctx = RouteContext {
+            domain: Some("nomatch.unknown"),
+            destination_port: Some(9999),
+            network: Some("udp"),
+            ..Default::default()
+        };
+        black_box(router.route(&ctx));
+    })
+    .report();
 }

@@ -24,6 +24,14 @@ harness = false
 name = "routing"
 harness = false
 
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "vless"
+harness = false
+
 [dependencies]
 anyhow = "1"
 anytls-rs = { git = "https://github.com/flyzstu/anytls-rs.git", rev = "122cf57e7ce5304756c09188fdf214bac47dd96f", default-features = false }
