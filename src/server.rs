@@ -243,7 +243,12 @@ async fn handler(State(state): State<Arc<ServerState>>, request: Request) -> Res
         "access-control-allow-origin",
         axum::http::HeaderValue::from_static("*"),
     );
-    if config.no_sse_header {
+    if config.no_sse_header
+        && result
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v == "text/event-stream")
+    {
         result.headers_mut().remove("content-type");
     }
     result
