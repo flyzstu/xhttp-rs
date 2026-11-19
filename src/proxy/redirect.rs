@@ -20,6 +20,12 @@ use tokio::net::TcpListener;
 #[cfg(target_os = "linux")]
 pub fn get_original_destination<F: AsRawFd>(fd: &F) -> std::io::Result<SocketAddr> {
     let raw_fd = fd.as_raw_fd();
+    // SAFETY: `raw_fd` is a live socket fd owned by the caller (`&F` keeps
+    // `F` alive for this call). Both `getsockopt` calls pass a correctly
+    // aligned, zero-initialized `sockaddr` out-parameter with a matching
+    // `socklen_t` length, and we only read fields whose types the kernel
+    // writes when the call succeeds (`ret == 0`). `getsockopt` is a libc FFI
+    // call that requires unsafe to invoke.
     unsafe {
         // Try IPv4 SO_ORIGINAL_DST first
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
