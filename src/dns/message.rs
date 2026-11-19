@@ -663,6 +663,40 @@ pub(super) fn predefined_response(
     response[6..8].copy_from_slice(&written.to_be_bytes());
     Ok(response)
 }
+
+pub(super) fn build_response(
+    name: &str,
+    qtype: u16,
+    addresses: &[IpAddr],
+    ttl: u32,
+) -> Result<Vec<u8>> {
+    let mut response = build_query(0x1234, name, qtype)?;
+    response[2] = 0x81;
+    response[3] = 0x80;
+    let filtered_addrs: Vec<&IpAddr> = addresses
+        .iter()
+        .filter(|addr| matches!((qtype, addr), (1, IpAddr::V4(_)) | (28, IpAddr::V6(_))))
+        .collect();
+    response[6..8].copy_from_slice(&(filtered_addrs.len() as u16).to_be_bytes());
+    response[8..12].fill(0);
+    for address in filtered_addrs {
+        response.extend([0xc0, 0x0c]);
+        response.extend(qtype.to_be_bytes());
+        response.extend(1u16.to_be_bytes());
+        response.extend(ttl.to_be_bytes());
+        match address {
+            IpAddr::V4(addr) => {
+                response.extend(4u16.to_be_bytes());
+                response.extend(addr.octets());
+            }
+            IpAddr::V6(addr) => {
+                response.extend(16u16.to_be_bytes());
+                response.extend(addr.octets());
+            }
+        }
+    }
+    Ok(response)
+}
 pub(super) fn parse_client_subnet(value: &str) -> Result<IpNet> {
     value
         .parse::<IpNet>()

@@ -39,18 +39,18 @@ pub(super) enum CacheValue {
 /// Serializable snapshot of the cache for `cache_file` persistence.
 #[derive(Serialize, Deserialize)]
 pub(super) struct PersistentCache {
-    entries: Vec<PersistentEntry>,
+    pub(super) entries: Vec<PersistentEntry>,
 }
 #[derive(Serialize, Deserialize)]
-struct PersistentEntry {
-    key: PersistentKey,
-    value: PersistentValue,
+pub(super) struct PersistentEntry {
+    pub(super) key: PersistentKey,
+    pub(super) value: PersistentValue,
     /// Absolute expiry as seconds since the Unix epoch; entries already
     /// expired are dropped on restore.
-    expires_at: u64,
+    pub(super) expires_at: u64,
 }
 #[derive(Serialize, Deserialize)]
-enum PersistentKey {
+pub(super) enum PersistentKey {
     Lookup {
         name: String,
         qtype: u16,
@@ -66,7 +66,7 @@ enum PersistentKey {
     },
 }
 #[derive(Serialize, Deserialize)]
-enum PersistentValue {
+pub(super) enum PersistentValue {
     Addresses(Vec<IpAddr>),
     Wire(Vec<u8>),
 }

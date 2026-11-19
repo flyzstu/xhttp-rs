@@ -671,9 +671,6 @@ pub async fn build_runtime(
         .map(|config| DnsResolver::with_rule_sets(config, Some(rule_set_slot.clone())))
         .transpose()?
         .map(Arc::new);
-    if let (Some(resolver), Some(path)) = (&resolver, dns_cache_path) {
-        resolver.start_persistence(&path);
-    }
     let mut dialers = HashMap::new();
     let mut groups = HashMap::new();
     for outbound in outbounds {
@@ -822,6 +819,30 @@ pub async fn build_runtime(
     let provider = Arc::new(DetourProvider::new(dialers.clone(), resolver.clone()));
     if let Some(resolver) = &resolver {
         resolver.set_detour(provider.clone());
+    }
+
+    let selected_groups = if let (Some(resolver), Some(path)) = (&resolver, &dns_cache_path) {
+        resolver.start_persistence(path)
+    } else {
+        None
+    };
+    if let Some(selected_map) = selected_groups {
+        for (group_tag, member_tag) in selected_map {
+            if let Some(group) = groups.get(&group_tag)
+                && group.select(&member_tag)
+            {
+                tracing::info!(group = %group_tag, selected = %member_tag, "restored group selection from cache");
+            }
+        }
+    }
+    if let (Some(resolver), Some(_)) = (&resolver, &dns_cache_path) {
+        let groups_clone = groups.clone();
+        resolver.set_selected_provider(Arc::new(move || {
+            groups_clone
+                .iter()
+                .map(|(k, v)| (k.clone(), v.now()))
+                .collect()
+        }));
     }
     let prefetched = prefetch_rule_sets(&route_config, &http_clients, &provider).await;
     let compile_config = route_config.clone();
@@ -1655,5 +1676,37 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"final!");
         assert!(!not_modified);
+    }
+
+    #[test]
+    fn restored_selected_groups_switches_selector_selection() {
+        let group = Arc::new(
+            Group::new(
+                GroupKind::Selector,
+                vec!["node1".into(), "node2".into()],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(group.now(), "node1");
+
+        let mut groups = HashMap::new();
+        groups.insert("proxy".to_string(), group.clone());
+
+        let mut selected_map = HashMap::new();
+        selected_map.insert("proxy".to_string(), "node2".to_string());
+
+        for (group_tag, member_tag) in selected_map {
+            if let Some(group) = groups.get(&group_tag)
+                && group.select(&member_tag)
+            {
+                // restored
+            }
+        }
+
+        assert_eq!(group.now(), "node2");
     }
 }

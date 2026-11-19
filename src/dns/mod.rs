@@ -1,5 +1,6 @@
 mod cache;
 mod message;
+mod persistence;
 pub(crate) mod transport;
 
 use anyhow::{Context, Result, bail};
@@ -35,6 +36,8 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_POOL_SIZE: usize = 32;
 const MAX_DNS_MESSAGE: usize = u16::MAX as usize;
 
+pub(crate) type SelectedProvider = Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct DnsResolver {
     inner: Arc<Inner>,
@@ -52,6 +55,7 @@ struct Inner {
     http: reqwest::Client,
     rule_sets: Option<Arc<RwLock<CompiledRuleSetMap>>>,
     detour: std::sync::RwLock<Option<Arc<dyn transport::DnsUdpDetour>>>,
+    selected_provider: std::sync::RwLock<Option<SelectedProvider>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,6 +156,7 @@ impl DnsResolver {
                     .build()?,
                 rule_sets,
                 detour: std::sync::RwLock::new(None),
+                selected_provider: std::sync::RwLock::new(None),
             }),
         })
     }
@@ -165,32 +170,23 @@ impl DnsResolver {
         *self.inner.detour.write().expect("DNS detour lock poisoned") = Some(detour);
     }
 
+    /// Set a callback that supplies currently selected outbound tags for groups.
+    pub(crate) fn set_selected_provider(&self, provider: SelectedProvider) {
+        *self
+            .inner
+            .selected_provider
+            .write()
+            .expect("DNS selected provider lock poisoned") = Some(provider);
+    }
+
     /// Load persisted DNS cache entries from the `cache_file` path, and
-    /// spawn a periodic saver that writes back every 60 seconds.
-    pub(crate) fn start_persistence(&self, path: &std::path::Path) {
-        match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<cache::PersistentCache>(&bytes) {
-                Ok(snapshot) => {
-                    self.inner
-                        .cache
-                        .lock()
-                        .expect("DNS cache lock poisoned")
-                        .restore(snapshot);
-                    tracing::info!("restored DNS cache from {}", path.display());
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "discarding unreadable persisted DNS cache at {}",
-                    path.display()
-                ),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(
-                %error,
-                "failed to read persisted DNS cache at {}",
-                path.display()
-            ),
-        }
+    /// spawn a periodic saver that writes back every 60 seconds. Returns
+    /// any restored selector group mappings if loaded from BoltDB.
+    pub(crate) fn start_persistence(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<HashMap<String, String>> {
+        let restored_selected = persistence::load_persisted(path, &self.inner.cache);
         let resolver = self.clone();
         let path = path.to_owned();
         tokio::spawn(async move {
@@ -199,23 +195,19 @@ impl DnsResolver {
                 resolver.save_cache(&path);
             }
         });
+        restored_selected
     }
 
-    fn save_cache(&self, path: &std::path::Path) {
-        let snapshot = self
+    pub(crate) fn save_cache(&self, path: &std::path::Path) {
+        let selected = self
             .inner
-            .cache
-            .lock()
-            .expect("DNS cache lock poisoned")
-            .snapshot();
-        let Ok(bytes) = serde_json::to_vec(&snapshot) else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        if let Err(error) = std::fs::write(path, bytes) {
-            tracing::warn!(%error, "failed to persist DNS cache");
+            .selected_provider
+            .read()
+            .ok()
+            .and_then(|p| p.as_ref().map(|f| f()));
+        if let Err(error) = persistence::save_persisted(path, &self.inner.cache, selected.as_ref())
+        {
+            tracing::warn!(error = %format!("{error:#}"), "failed to persist DNS cache");
         }
     }
     pub async fn lookup(&self, domain: &str) -> Result<Vec<IpAddr>> {
