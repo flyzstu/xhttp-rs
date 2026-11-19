@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -40,7 +40,6 @@ struct Session {
     sender: mpsc::Sender<Packet>,
     downlink: Arc<Mutex<DownlinkState>>,
     connected: AtomicBool,
-    ack_seq: AtomicU64,
 }
 
 /// Downstream delivery state for one session.
@@ -477,7 +476,6 @@ async fn packet_upload(
         return StatusCode::CONFLICT.into_response();
     }
 
-    let ack_seq = session.ack_seq.load(Ordering::Relaxed);
     if state.config.transport.h1_enable_piggyback && client_wants_piggyback {
         let dl_ack = headers
             .get("x-dl-ack")
@@ -519,7 +517,6 @@ async fn packet_upload(
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
                 .header("x-dl-from", from.to_string())
-                .header("x-ack-seq", ack_seq.to_string())
                 .body(Body::from(payload))
                 .unwrap();
         }
@@ -527,7 +524,6 @@ async fn packet_upload(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header("x-ack-seq", ack_seq.to_string())
         .body(Body::empty())
         .unwrap()
 }
@@ -582,7 +578,6 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
         sender,
         downlink: downlink.clone(),
         connected: AtomicBool::new(false),
-        ack_seq: AtomicU64::new(0),
     });
     match state.sessions.entry(id.to_owned()) {
         Entry::Occupied(v) => {
@@ -600,7 +595,6 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
     let state_upload = Arc::downgrade(state);
     let id_upload = id.to_owned();
     let max_buffered = state.config.transport.max_buffered_packets;
-    let session_ack = session.clone();
 
     tokio::spawn(async move {
         let mut pending = BTreeMap::new();
@@ -623,7 +617,7 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
                     }
                     return;
                 }
-                session_ack.ack_seq.store(next, Ordering::Relaxed);
+
                 next += 1;
             }
         }
@@ -1394,7 +1388,7 @@ mod tests {
             response.headers().get("content-type").unwrap(),
             "application/octet-stream"
         );
-        assert_eq!(response.headers().get("x-ack-seq").unwrap(), "0");
+        assert!(response.headers().get("x-ack-seq").is_none());
         assert_eq!(response.headers().get("x-dl-from").unwrap(), "0");
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
