@@ -1,0 +1,189 @@
+{
+  "generated_at": "2026-11-19T19:48:25+0800",
+  "client": "/root/dev/xhttp/xhttp-rs/target/release/xhttp",
+  "size_mb": 5,
+  "samples": 2,
+  "target": "xhttp-box (ansible sing_box.yml, image 0.3.0)",
+  "results": [
+    {
+      "host": "hkg",
+      "mode": "upload-direct",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 1.02,
+      "mbps_all": [
+        0.91,
+        1.13
+      ]
+    },
+    {
+      "host": "hkg",
+      "mode": "upload-xhttp-packet-up",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.1,
+      "mbps_all": [
+        0.1,
+        0.1
+      ]
+    },
+    {
+      "host": "hkg",
+      "mode": "upload-xhttp-packet-up+tuned",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.11,
+      "mbps_all": [
+        0.11,
+        0.1
+      ]
+    },
+    {
+      "host": "iad",
+      "mode": "upload-direct",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 2.01,
+      "mbps_all": [
+        2.03,
+        2.0
+      ]
+    },
+    {
+      "host": "iad",
+      "mode": "upload-xhttp-packet-up",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.21,
+      "mbps_all": [
+        0.2,
+        0.22
+      ]
+    },
+    {
+      "host": "iad",
+      "mode": "upload-xhttp-packet-up+tuned",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.25,
+      "mbps_all": [
+        0.25,
+        0.25
+      ]
+    },
+    {
+      "host": "sin",
+      "mode": "upload-direct",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 1.85,
+      "mbps_all": [
+        1.84,
+        1.85
+      ]
+    },
+    {
+      "host": "sin",
+      "mode": "upload-xhttp-packet-up",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.23,
+      "mbps_all": [
+        0.22,
+        0.23
+      ]
+    },
+    {
+      "host": "sin",
+      "mode": "upload-xhttp-packet-up+tuned",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.27,
+      "mbps_all": [
+        0.27,
+        0.27
+      ]
+    },
+    {
+      "host": "lax",
+      "mode": "upload-direct",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 1.86,
+      "mbps_all": [
+        1.84,
+        1.89
+      ]
+    },
+    {
+      "host": "lax",
+      "mode": "upload-xhttp-packet-up",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.24,
+      "mbps_all": [
+        0.24,
+        0.24
+      ]
+    },
+    {
+      "host": "lax",
+      "mode": "upload-xhttp-packet-up+tuned",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.24,
+      "mbps_all": [
+        0.23,
+        0.25
+      ]
+    },
+    {
+      "host": "lax2",
+      "mode": "upload-direct",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.89,
+      "mbps_all": [
+        0.89,
+        0.88
+      ]
+    },
+    {
+      "host": "lax2",
+      "mode": "upload-xhttp-packet-up",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.38,
+      "mbps_all": [
+        0.38,
+        0.38
+      ]
+    },
+    {
+      "host": "lax2",
+      "mode": "upload-xhttp-packet-up+tuned",
+      "samples": 2,
+      "ok_samples": 2,
+      "size_mb": 5,
+      "mbps_median": 0.38,
+      "mbps_all": [
+        0.38,
+        0.38
+      ]
+    }
+  ]
+}

@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """Real-link benchmark for deployed xhttp-box servers.
 
-Measures download throughput and time-to-first-byte (TTFB) through:
-  * direct         - raw link, no tunnel (TUN bypassed) - the control baseline
-  * xhttp-<mode>   - xhttp-rs SOCKS -> xhttp-box XHTTP inbound. The deployed
-                     inbound is hardcoded to packet-up (server.json.j2:52),
-                     so only xhttp-packet-up connects.
-  * anytls         - xhttp-rs SOCKS -> xhttp-box AnyTLS inbound
+Measures download and upload throughput through:
+  * direct             - raw link, no tunnel (TUN bypassed) - the control
+  * xhttp-<mode>       - xhttp-rs SOCKS -> xhttp-box XHTTP inbound. The
+                         deployed inbound is packet-up (server.json.j2:52).
+  * anytls             - xhttp-rs SOCKS -> xhttp-box AnyTLS inbound
+  * upload-<mode>      - upload direction: POST a sparse payload to a
+                         temporary discard receiver on the origin host.
+                         The 4 client-side knobs (packet interval, chunk
+                         size, coalescing, xmux connections) affect uploads,
+                         so upload mode is required to measure their effect.
+  * <mode>+tuned       - A/B variant with client-only tunables applied:
+                         packet_interval_ms=0, h1_coalesce_delay_ms=10,
+                         xmux.max_connections=4. max_packet_size is left at
+                         1e6: the Go server rejects larger posts.
 
-The download target is each host's own nginx /__down?file=100mb, so the
-server->nginx leg is local. The client->server leg is the real Internet link,
-which is exactly what the tunnel adds overhead to. Comparing tunnel modes
-against the direct baseline isolates tunnel cost from link variance.
+Downloads use each host's nginx /__down?file=100mb; uploads use a temporary
+python discard receiver deployed via SSH. The client->server leg is the real
+Internet link; comparing tunnel modes against direct isolates tunnel cost.
+Interleave baseline and +tuned within a host to cancel link variance.
 
 Hosts and credentials come from ansible/hosts + ansible/{sing_box.yml,
 server.json.j2}. The TUN-capture bypass is the transient ip rule used by
@@ -86,10 +94,27 @@ def tun_unbypass(ip):
 
 def write_config(path, mode, host):
     ip = HOSTS[host]
-    if mode.startswith("xhttp"):
-        xmode = mode.split("-", 1)[1]
+    tuned = mode.endswith("+tuned")
+    base = mode.removesuffix("+tuned")
+    transport_mode = base.removeprefix("upload-")
+    if transport_mode.startswith("xhttp"):
+        xmode = transport_mode.split("-", 1)[1]
         # Connect to the origin IP:443; nginx SNI-routes <host>.piccdn.click
         # to the xhttp-box vless inbound. This is the validated path.
+        transport = {"type": "xhttp", "host": f"{host}.piccdn.click",
+                     "path": f"{XHTTP_PATH}?k={XHTTP_TOKEN}", "mode": xmode}
+        if tuned:
+            # Client-only knobs; the deployed Go server needs no change.
+            # Config is parsed by SingBoxConfig (main.rs:103), so use the
+            # sing-box field name sc_min_posts_interval_ms, NOT the native
+            # packet_interval_ms (which would be silently ignored).
+            # max_packet_size is left at 1e6: the Go server rejects larger
+            # posts (scMaxPost=1e6), so the default is the hard ceiling.
+            transport.update({
+                "sc_min_posts_interval_ms": {"from": 0, "to": 0},
+                "h1_coalesce_delay_ms": 10,
+                "xmux": {"max_connections": {"from": 4, "to": 4}},
+            })
         cfg = {
             "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1",
                           "listen_port": SOCKS_PORT}],
@@ -98,12 +123,11 @@ def write_config(path, mode, host):
                 "server": ip, "server_port": 443,
                 "uuid": UUID,
                 "tls": {"enabled": True, "server_name": f"{host}.piccdn.click", "alpn": "h2"},
-                "transport": {"type": "xhttp", "host": f"{host}.piccdn.click",
-                              "path": f"{XHTTP_PATH}?k={XHTTP_TOKEN}", "mode": xmode},
+                "transport": transport,
             }],
             "route": {"final": "out"},
         }
-    elif mode == "anytls":
+    elif transport_mode == "anytls":
         cfg = {
             "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1",
                           "listen_port": SOCKS_PORT}],
@@ -171,19 +195,83 @@ def curl_download(mode, ip, size_mb, timeout):
         "total_s": round(float(parts[3]), 3),
     }
 
+UPLOAD_PORT = 18190
+RECEIVER_REMOTE = "/tmp/xhbench-recv.py"
+RECEIVER_PID = "/tmp/xhbench-recv.pid"
+
+
+def ssh_cmd(ip, script, timeout=15):
+    return run([
+        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes", f"root@{ip}", script,
+    ], timeout=timeout)
+
+
+def deploy_receiver(ip):
+    content = (Path(__file__).resolve().parent / "upload_receiver.py").read_text()
+    subprocess.run([
+        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+        "-o", "BatchMode=yes", f"root@{ip}", f"cat > {RECEIVER_REMOTE}",
+    ], input=content, text=True, capture_output=True, timeout=20, check=True)
+    # Kill by recorded PID only; pkill -f would match the SSH shell itself.
+    ssh_cmd(ip, f"[ -f {RECEIVER_PID} ] && kill $(cat {RECEIVER_PID}) 2>/dev/null || true; "
+                f"nohup python3 {RECEIVER_REMOTE} </dev/null >/dev/null 2>&1 & "
+                f"echo $! > {RECEIVER_PID}; sleep 0.5")
+
+
+def remove_receiver(ip):
+    ssh_cmd(ip, f"[ -f {RECEIVER_PID} ] && kill $(cat {RECEIVER_PID}) 2>/dev/null || true; "
+                f"rm -f {RECEIVER_PID} {RECEIVER_REMOTE}")
+
+
+def make_payload(size_mb, tmp):
+    payload = tmp / f"upload-{size_mb}mb.bin"
+    if not payload.exists():
+        with open(payload, "wb") as handle:
+            handle.truncate(size_mb * 1024 * 1024)  # sparse
+    return payload
+
+
+def curl_upload(ip, size_mb, timeout, payload, mode):
+    url = f"http://{ip}:{UPLOAD_PORT}/upload"
+    cmd = ["curl", "-sS", "-o", os.devnull]
+    if mode != "upload-direct":
+        cmd += ["--socks5", f"127.0.0.1:{SOCKS_PORT}"]
+    cmd += [
+        "--max-time", str(timeout), "-X", "POST", "--data-binary", f"@{payload}",
+        "-w", "%{http_code} %{speed_upload} %{time_total}", url,
+    ]
+    result = run(cmd, timeout=timeout + 5)
+    if result.returncode != 0:
+        return {"ok": False, "error": result.stderr.strip()[:200]}
+    parts = result.stdout.strip().split()
+    if len(parts) != 3 or parts[0] != "200":
+        return {"ok": False, "error": f"bad result: {result.stdout.strip()[:120]}"}
+    return {"ok": True, "mbps": round(float(parts[1]) / 1e6, 2),
+            "total_s": round(float(parts[2]), 3)}
+
 
 def bench(host, mode, size_mb, samples, timeout, tmp):
     ip = HOSTS[host]
+    is_upload = mode.startswith("upload-")
+    transport_mode = mode.removeprefix("upload-")
     rule = tun_bypass(ip)
     proc = None
+    payload = None
     try:
-        if mode != "direct":
+        if is_upload:
+            deploy_receiver(ip)
+            payload = make_payload(size_mb, tmp)
+        if transport_mode != "direct":
             cfg = tmp / f"{host}-{mode}.json"
             write_config(cfg, mode, host)
             proc = start_client(cfg)
         results = []
         for _ in range(samples):
-            results.append(curl_download(mode, ip, size_mb, timeout))
+            if is_upload:
+                results.append(curl_upload(ip, size_mb, timeout, payload, mode))
+            else:
+                results.append(curl_download(mode, ip, size_mb, timeout))
         good = [r for r in results if r["ok"]]
         out = {
             "host": host, "mode": mode, "samples": samples,
@@ -192,8 +280,9 @@ def bench(host, mode, size_mb, samples, timeout, tmp):
         if good:
             out["mbps_median"] = round(statistics.median(r["mbps"] for r in good), 2)
             out["mbps_all"] = [r["mbps"] for r in good]
-            out["ttfb_s_median"] = round(statistics.median(r["ttfb_s"] for r in good), 3)
-            out["total_s_median"] = round(statistics.median(r["total_s"] for r in good), 3)
+            if not is_upload:
+                out["ttfb_s_median"] = round(statistics.median(r["ttfb_s"] for r in good), 3)
+                out["total_s_median"] = round(statistics.median(r["total_s"] for r in good), 3)
         else:
             out["errors"] = [r["error"] for r in results]
         return out
@@ -204,6 +293,8 @@ def bench(host, mode, size_mb, samples, timeout, tmp):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if is_upload:
+            remove_receiver(ip)
         tun_unbypass(ip)
         del rule
 
@@ -226,10 +317,11 @@ def main():
 
     if not Path(CLIENT).exists():
         ap.error(f"xhttp client not found: {CLIENT} (set XHTTP_BENCH_CLIENT)")
-    if any(m.startswith("xhttp") for m in modes) and not XHTTP_TOKEN:
+    transport_modes = [m.removeprefix("upload-") for m in modes]
+    if any(m.startswith("xhttp") for m in transport_modes) and not XHTTP_TOKEN:
         ap.error("XHTTP_TOKEN is required for xhttp modes "
                  "(source it from ansible/sing_box.yml; see module header)")
-    if "anytls" in modes and not ANYTLS_PASSWORD:
+    if "anytls" in transport_modes and not ANYTLS_PASSWORD:
         ap.error("ANYTLS_PASSWORD is required for anytls mode "
                  "(source it from ansible/sing_box.yml; see module header)")
     results = []

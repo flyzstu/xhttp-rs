@@ -91,3 +91,43 @@ direct，除公网开销外，默认 2 MiB 背压窗口也是重要因素**（�
 本机对照与真实链路的比值不能直接相减：本机 direct 是内存级 3.2 GB/s，隧道在如此高的基线
 下占比自然很小；真实链路 direct 只有 1–7 MB/s，隧道封装与握手开销占比被放大。但两者一致地
 显示：**xhttp 的开销显著大于 anytls**（本机 8.8% vs 20.6%，真实链路 43–62% vs 波动 57–377%）。
+
+## 客户端旋钮 A/B（upload 方向，5 主机）
+
+用户列出的 4 个「现在就能调」的客户端旋钮里，只有 3 个真正可由客户端调优：
+
+| 旋钮 | native 字段（config.rs） | sing-box 字段（singbox.rs 映射） | 能否调 |
+|---|---|---|---|
+| packet interval | `packet_interval_ms` | `sc_min_posts_interval_ms` | 可：30ms → 0 |
+| 单次 POST 大小 | `max_packet_size` | `sc_max_each_post_bytes` | **不可**：Go server `scMaxPost=1e6`，超过即 HTTP 400；默认 1e6 已是硬上限 |
+| H1 合并延迟 | `h1_coalesce_delay_ms` | `h1_coalesce_delay_ms` | 可：0 → 10ms（上限 1000ms） |
+| xmux 连接数 | `xmux.max_connections` | `xmux.max_connections` | 可：0 → 4 |
+
+这些旋钮全部作用于 **upload 路径**（client.rs 的 packet_upload sleep / 合并 / 连接池），
+download 的 Go server 根本不读 x-dl-ack，所以只在 download 上测不出效果。因此本轮在 harness
+里新增 `upload-<mode>` 与 `+tuned` 变体：在 origin 主机临时起 discard receiver（端口 18190），
+客户端经 SOCKS 上传 5 MB × 2 次取中位数；`+tuned` 应用 packet_interval_ms=0、
+h1_coalesce_delay_ms=10、xmux.max_connections=4。为避免链路抖动误判，per host 内基线/tuned
+交替执行。原始数据：`tests/bench_xhttp_box_results_upload_ab.json`。
+
+旋钮确实生效的诊断：`sc_max_each_post_bytes=8192` + interval=200ms 时 5 MB 上传 90s 超时
+（0 字节），而默认 0.24 MB/s；`h1_coalesce_delay_ms=5000` 被 `xhttp check` 拒绝
+（must not exceed 1000ms）。证明字段被解析并应用，而非被静默忽略。
+
+| 主机 | upload-direct | xhttp 基线 | xhttp tuned | tuned/基线 |
+|---|---:|---:|---:|---:|
+| hkg | 1.02 | 0.10 | 0.11 | +10% |
+| iad | 2.01 | 0.21 | 0.25 | +19% |
+| sin | 1.85 | 0.23 | 0.27 | +17% |
+| lax | 1.86 | 0.24 | 0.24 | 0% |
+| lax2 | 0.89 | 0.38 | 0.38 | 0% |
+
+**结论（如实）**：tuned 相对基线在 hkg/iad/sin 有 +10~19% 的小幅提升，lax/lax2 无差异；
+但样本的标准差极小（如 sin 基线 [0.22,0.23]、tuned [0.27,0.27]），提升方向一致。原因是
+1e6 字节分块下 5 MB 只有 ~5 个 POST，30ms 间隔本就微乎其微；旋钮真正受益的是小包高频
+场景（诊断里把块降到 8192 字节后影响被放大到超时）。因此这 3 个旋钮是**廉价但有限的优化**：
+对大块 bulk 上传只有个位数到十几个百分点的收益，值得保留为默认值，但不要期待数量级改善。
+第 4 个旋钮（POST 大小）受 Go server 硬限制，客户端无法单方面提高。
+
+另一个不变的观察：tunneled upload 普遍只有 direct 的 10~40%（hkg 0.10 vs 1.02，iad 0.21
+vs 2.01），瓶颈在跨域链路的不对称上行 + XHTTP 请求/响应往返，不在这些旋钮。
