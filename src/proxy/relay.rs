@@ -12,6 +12,7 @@ use tokio::{
     sync::mpsc,
 };
 
+use super::dial_outbound;
 use super::direct::{connect_direct, direct_udp_socket};
 use super::route::{
     RouteEvaluation, RouteInput, evaluate_stream_tcp_route, evaluate_udp_route,
@@ -170,7 +171,11 @@ where
         mut options,
         resolved_addresses,
     } = evaluation;
-    if let Some(mark) = runtime.tun_output_mark {
+    if let Some(mark) = *runtime
+        .tun_output_mark
+        .read()
+        .expect("tun output mark lock poisoned")
+    {
         options.routing_mark = Some(mark);
     }
     if decision == RouteDecision::HijackDns {
@@ -189,51 +194,30 @@ where
         RouteDecision::Reject => bail!("TUN TCP connection rejected by route"),
         RouteDecision::HijackDns => unreachable!(),
     };
-    match &runtime
+    let dialer = runtime
         .dialer_for(&tag)
-        .with_context(|| format!("unknown outbound: {tag}"))?
-    {
-        Dialer::Direct => {
-            let mut target = tokio::time::timeout(
-                options
-                    .connect_timeout
-                    .as_deref()
-                    .map(|value| parse_duration(Some(value)))
-                    .unwrap_or_else(|| std::time::Duration::from_secs(5)),
-                connect_direct(
-                    &destination,
-                    runtime.resolver.as_deref(),
-                    &options,
-                    &resolved_addresses,
-                ),
-            )
-            .await
-            .context("TUN target connect timeout")??;
-            if !initial.is_empty() {
-                write_first_packet(&mut target, &initial, &options).await?;
-            }
-            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
-        }
-        Dialer::AnyTls { client } => {
-            let encoded = anytls::encode_address(&to_anytls_destination(&destination))?;
-            let mut target = client.create_stream(&encoded).await?;
-            if !initial.is_empty() {
-                target.write_all(&initial).await?;
-            }
-            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
-        }
-        Dialer::Vless { client, user, .. } => {
-            let mut target = client.connect().await?;
-            vless::write_request(&mut target, user, &destination).await?;
-            vless::read_response(&mut target).await?;
-            if !initial.is_empty() {
-                target.write_all(&initial).await?;
-            }
-            tokio::io::copy_bidirectional(&mut stream, &mut target).await?;
-        }
-        Dialer::Block => bail!("TUN TCP connection blocked by outbound"),
-        Dialer::Group(_) => unreachable!("group dialers are resolved before match"),
+        .with_context(|| format!("unknown outbound: {tag}"))?;
+    let timeout = options
+        .connect_timeout
+        .as_deref()
+        .map(|value| parse_duration(Some(value)))
+        .unwrap_or_else(|| std::time::Duration::from_secs(5));
+    let mut target = tokio::time::timeout(
+        timeout,
+        dial_outbound(
+            &dialer,
+            &destination,
+            runtime.resolver.as_deref(),
+            &options,
+            &resolved_addresses,
+        ),
+    )
+    .await
+    .context("TUN target connect timeout")??;
+    if !initial.is_empty() {
+        write_first_packet(&mut *target, &initial, &options).await?;
     }
+    tokio::io::copy_bidirectional(&mut stream, &mut *target).await?;
     Ok(())
 }
 pub(crate) async fn relay_anytls_udp(
@@ -609,7 +593,11 @@ pub(crate) async fn relay_tun_udp(
         mut options,
         resolved_addresses: _,
     } = evaluation;
-    if let Some(mark) = runtime.tun_output_mark {
+    if let Some(mark) = *runtime
+        .tun_output_mark
+        .read()
+        .expect("tun output mark lock poisoned")
+    {
         options.routing_mark = Some(mark);
     }
     if decision == RouteDecision::HijackDns {

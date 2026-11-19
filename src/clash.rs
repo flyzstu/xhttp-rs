@@ -142,29 +142,35 @@ async fn ensure_ui(
         .context("external UI download task failed")??
     };
     tracing::info!("downloaded {} bytes of Yacd-meta dashboard", bytes.len());
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).context("open external UI archive")?;
-    for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .context("read external UI archive entry")?;
-        // Yacd-meta's gh-pages zip nests everything under a single directory.
-        let relative = file.name().split('/').skip(1).collect::<Vec<_>>().join("/");
-        if relative.is_empty() {
-            continue;
+    let ui_dir = ui_dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor).context("open external UI archive")?;
+        for index in 0..archive.len() {
+            let mut file = archive
+                .by_index(index)
+                .context("read external UI archive entry")?;
+            // Yacd-meta's gh-pages zip nests everything under a single directory.
+            let relative = file.name().split('/').skip(1).collect::<Vec<_>>().join("/");
+            if relative.is_empty() {
+                continue;
+            }
+            let path = std::path::Path::new(&ui_dir).join(&relative);
+            if file.is_dir() {
+                std::fs::create_dir_all(&path).ok();
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let mut output = std::fs::File::create(&path)
+                .with_context(|| format!("create UI file {}", path.display()))?;
+            std::io::copy(&mut file, &mut output).context("extract UI archive entry")?;
         }
-        let path = std::path::Path::new(ui_dir).join(&relative);
-        if file.is_dir() {
-            std::fs::create_dir_all(&path).ok();
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let mut output = std::fs::File::create(&path)
-            .with_context(|| format!("create UI file {}", path.display()))?;
-        std::io::copy(&mut file, &mut output).context("extract UI archive entry")?;
-    }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("external UI extraction task failed")??;
     Ok(())
 }
 

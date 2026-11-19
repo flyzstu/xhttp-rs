@@ -1,14 +1,70 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 const INTERFACE_CACHE_TTL: Duration = Duration::from_secs(5);
+const SOCKET_CACHE_TTL: Duration = Duration::from_millis(500);
+
+/// Decode a `/proc/net/tcp(6)` hex endpoint (e.g. `0100007F:1F90` or its
+/// IPv6 equivalent) into a `SocketAddr`.
+fn parse_proc_endpoint(value: &str, ipv6: bool) -> Option<SocketAddr> {
+    let (address, port) = value.rsplit_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let ip = if ipv6 {
+        let octets = (0..4)
+            .map(|word| -> Option<[u8; 4]> {
+                Some(
+                    u32::from_str_radix(address.get(word * 8..word * 8 + 8)?, 16)
+                        .ok()?
+                        .to_ne_bytes(),
+                )
+            })
+            .collect::<Option<Vec<_>>>()?
+            .concat();
+        IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(octets.as_slice()).ok()?,
+        ))
+    } else {
+        // IPv4 addresses in /proc/net/tcp are little-endian.
+        IpAddr::V4(Ipv4Addr::from(
+            u32::from_str_radix(address, 16).ok()?.swap_bytes(),
+        ))
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+/// Compare one `/proc/net/tcp(6)` endpoint with a flow endpoint. A wildcard
+/// address is accepted for a local endpoint captured before the socket was
+/// fully bound; remote endpoints must match exactly.
+fn endpoint_matches(entry: SocketAddr, expected: SocketAddr, local: bool) -> bool {
+    if entry.port() != expected.port() {
+        return false;
+    }
+    let entry_ip = entry.ip().to_canonical();
+    let expected_ip = expected.ip().to_canonical();
+    entry_ip == expected_ip || (local && entry_ip.is_unspecified())
+}
+
+/// Match a `/proc/net/tcp(6)` entry against the flow's full 4-tuple. Both
+/// endpoints' addresses and ports must match, not just the ports. Both
+/// orientations are accepted because callers historically passed the peer and
+/// proxy sockets in either order.
+fn socket_matches_flow(
+    entry_local: SocketAddr,
+    entry_remote: SocketAddr,
+    peer: SocketAddr,
+    proxy: SocketAddr,
+) -> bool {
+    (endpoint_matches(entry_local, proxy, true) && endpoint_matches(entry_remote, peer, false))
+        || (endpoint_matches(entry_local, peer, true)
+            && endpoint_matches(entry_remote, proxy, false))
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinuxMetadataScope {
@@ -120,38 +176,129 @@ pub fn collect_tcp(
     metadata
 }
 
-fn find_socket_owner(peer: SocketAddr, proxy: SocketAddr) -> Option<(u64, u32)> {
-    ["/proc/net/tcp", "/proc/net/tcp6"]
-        .into_iter()
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .flat_map(|content| {
-            content
-                .lines()
-                .skip(1)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .find_map(|line| {
+#[derive(Clone)]
+/// A single parsed `/proc/net/tcp(6)` entry: the inode, uid, and the entry's
+/// full local/remote 4-tuple.
+struct SocketEntry {
+    inode: u64,
+    uid: u32,
+    local: SocketAddr,
+    remote: SocketAddr,
+}
+
+fn parse_proc_socket_table(ipv6: bool) -> Vec<SocketEntry> {
+    let path = if ipv6 {
+        "/proc/net/tcp6"
+    } else {
+        "/proc/net/tcp"
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            let local_port = fields
-                .get(1)?
-                .rsplit_once(':')
-                .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())?;
-            let remote_port = fields
-                .get(2)?
-                .rsplit_once(':')
-                .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())?;
-            if local_port != peer.port() || remote_port != proxy.port() {
-                return None;
-            }
-            let uid = fields.get(7)?.parse().ok()?;
-            let inode = fields.get(9)?.parse().ok()?;
-            Some((inode, uid))
+            let local = parse_proc_endpoint(fields.get(1)?, ipv6)?;
+            let remote = parse_proc_endpoint(fields.get(2)?, ipv6)?;
+            Some(SocketEntry {
+                inode: fields.get(9)?.parse().ok()?,
+                uid: fields.get(7)?.parse().ok()?,
+                local,
+                remote,
+            })
         })
+        .collect()
+}
+
+/// Find the socket entry whose full 4-tuple matches this flow. Falls back to
+/// a port-only match when the addresses cannot be parsed from the proc table.
+fn find_socket_entry(peer: SocketAddr, proxy: SocketAddr) -> Option<SocketEntry> {
+    let entries = [
+        parse_proc_socket_table(false),
+        parse_proc_socket_table(true),
+    ]
+    .concat();
+    entries
+        .iter()
+        .find(|entry| socket_matches_flow(entry.local, entry.remote, peer, proxy))
+        .or_else(|| {
+            entries.iter().find(|entry| {
+                (entry.local.port() == peer.port() && entry.remote.port() == proxy.port())
+                    || (entry.local.port() == proxy.port() && entry.remote.port() == peer.port())
+            })
+        })
+        .cloned()
+}
+
+fn find_socket_owner(peer: SocketAddr, proxy: SocketAddr) -> Option<(u64, u32)> {
+    let entry = find_socket_entry(peer, proxy)?;
+    Some((entry.inode, entry.uid))
+}
+
+type InodeProcessCache = Mutex<Option<Cached<HashMap<u32, HashSet<u64>>>>>;
+/// Cached per-process set of socket inodes. Each refresh scans `/proc/<pid>/fd`
+/// once; lookups within the TTL skip all rescanning.
+static INODE_PROCESS_CACHE: LazyLock<InodeProcessCache> = LazyLock::new(|| Mutex::new(None));
+
+fn process_inode_map(pid: u32) -> Option<HashSet<u64>> {
+    let guard = INODE_PROCESS_CACHE
+        .lock()
+        .expect("inode process cache lock poisoned");
+    if guard
+        .as_ref()
+        .is_some_and(|cached| cached.captured.elapsed() < SOCKET_CACHE_TTL)
+    {
+        let result = guard.as_ref()?.value.get(&pid).cloned();
+        if result.is_some() {
+            return result;
+        }
+    }
+    drop(guard);
+    let inodes = fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .map(|descriptors| {
+            descriptors
+                .flatten()
+                .filter_map(|descriptor| {
+                    let target = fs::read_link(descriptor.path()).ok()?;
+                    let name = target.to_str()?;
+                    name.strip_prefix("socket:[")?
+                        .strip_suffix(']')?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .collect::<HashSet<_>>()
+        })?;
+    let mut guard = INODE_PROCESS_CACHE
+        .lock()
+        .expect("inode process cache lock poisoned");
+    guard
+        .get_or_insert_with(|| Cached {
+            value: HashMap::new(),
+            captured: Instant::now(),
+        })
+        .value
+        .insert(pid, inodes.clone());
+    Some(inodes)
 }
 
 fn find_inode_process(inode: u64) -> Option<u32> {
-    let target = format!("socket:[{inode}]");
+    let guard = INODE_PROCESS_CACHE
+        .lock()
+        .expect("inode process cache lock poisoned");
+    if let Some(cached) = guard.as_ref()
+        && cached.captured.elapsed() < SOCKET_CACHE_TTL
+        && let Some(pid) = cached
+            .value
+            .iter()
+            .find_map(|(pid, inodes)| inodes.contains(&inode).then_some(*pid))
+    {
+        return Some(pid);
+    }
+    drop(guard);
+
     for entry in fs::read_dir("/proc").ok()?.flatten() {
         let file_name = entry.file_name();
         let Some(file_name) = file_name.to_str() else {
@@ -160,16 +307,10 @@ fn find_inode_process(inode: u64) -> Option<u32> {
         let Ok(pid) = file_name.parse::<u32>() else {
             continue;
         };
-        let Ok(descriptors) = fs::read_dir(entry.path().join("fd")) else {
-            continue;
-        };
-        for descriptor in descriptors.flatten() {
-            if fs::read_link(descriptor.path())
-                .ok()
-                .is_some_and(|value| value == Path::new(&target))
-            {
-                return Some(pid);
-            }
+        if let Some(inodes) = process_inode_map(pid)
+            && inodes.contains(&inode)
+        {
+            return Some(pid);
         }
     }
     None
@@ -394,5 +535,32 @@ mod tests {
             hostname: true,
         };
         assert_eq!(scope.union(scope), scope);
+    }
+
+    #[test]
+    fn parse_proc_endpoint_decodes_little_endian_addresses() {
+        assert_eq!(
+            parse_proc_endpoint("0100007F:1F90", false),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(
+            parse_proc_endpoint("00000000000000000000000001000000:01BB", true),
+            Some("[::1]:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn socket_match_requires_both_addresses_and_ports() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.10:50000".parse().unwrap();
+        let wrong_address: SocketAddr = "192.0.2.11:50000".parse().unwrap();
+        let wrong_port: SocketAddr = "192.0.2.10:50001".parse().unwrap();
+
+        assert!(socket_matches_flow(local, remote, remote, local));
+        assert!(!socket_matches_flow(local, remote, wrong_address, local));
+        assert!(!socket_matches_flow(local, remote, wrong_port, local));
+        // Both peer/proxy orderings are accepted, so the reverse of a valid
+        // flow is still a match — not a mismatch.
+        assert!(socket_matches_flow(local, remote, local, remote));
     }
 }

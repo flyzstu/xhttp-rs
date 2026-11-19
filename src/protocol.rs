@@ -11,6 +11,13 @@ use crate::config::{Placement, TransportConfig};
 
 pub const PADDING_QUERY_KEY: &str = "x_padding";
 
+/// XHTTP wire contract: headers carrying downlink acknowledgement, delivery
+/// range, HTTP/1 piggyback requests, and session status.
+pub const HEADER_DL_ACK: &str = "x-dl-ack";
+pub const HEADER_DL_FROM: &str = "x-dl-from";
+pub const HEADER_H1_PIGGYBACK: &str = "x-h1-piggyback";
+pub const HEADER_SESSION_STATUS: &str = "x-session-status";
+
 pub fn add_common_headers(config: &TransportConfig, headers: &mut HeaderMap) -> Result<()> {
     for (name, value) in &config.headers {
         headers.insert(

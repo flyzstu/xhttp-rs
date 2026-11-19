@@ -14,6 +14,9 @@ use crate::singbox::{RouteConfig, RouteRule};
 /// Compiled rule-set storage shared between the router and the DNS resolver.
 pub(crate) type CompiledRuleSetMap = HashMap<String, Vec<CompiledRule>>;
 
+// Re-exports of rule-set I/O helpers that now live in `crate::srs`.
+pub(crate) use crate::srs::{rule_set_cache_path, rule_set_format_for, write_rule_set_cache};
+
 #[derive(Debug, Clone, Default)]
 pub struct RouteContext<'a> {
     pub domain: Option<&'a str>,
@@ -916,11 +919,6 @@ impl CompiledRule {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct SourceRuleSet {
-    rules: Vec<RouteRule>,
-}
-
 fn load_rule_sets(
     config: &RouteConfig,
     fetch_remote: bool,
@@ -940,7 +938,7 @@ fn load_rule_sets(
                     .with_context(|| format!("local rule-set {} requires path", set.tag))?;
                 let data =
                     std::fs::read(path).with_context(|| format!("read route rule-set {path}"))?;
-                decode_rule_set(&data, rule_set_format_for(set, path)?)
+                crate::srs::decode_rule_set(&data, crate::srs::rule_set_format_for(set, path)?)
                     .with_context(|| format!("parse route rule-set {path}"))?
             }
             "remote" => {
@@ -949,13 +947,13 @@ fn load_rule_sets(
                 } else if let Some(prefetched) = prefetched
                     && let Some(data) = prefetched.get(&set.tag)
                 {
-                    decode_rule_set(
+                    crate::srs::decode_rule_set(
                         data,
-                        rule_set_format_for(set, set.url.as_deref().unwrap_or(""))?,
+                        crate::srs::rule_set_format_for(set, set.url.as_deref().unwrap_or(""))?,
                     )
                     .with_context(|| format!("parse remote rule-set {}", set.tag))?
                 } else {
-                    load_remote_rule_set(set)?
+                    crate::srs::load_remote_rule_set(set)?
                 }
             }
             value => bail!("unsupported route rule-set type: {value}"),
@@ -1000,109 +998,6 @@ fn collect_destination_cidrs(rule: &CompiledRule, cidrs: &mut Vec<IpNet>) {
     }
     for nested in &rule.logical_rules {
         collect_destination_cidrs(nested, cidrs);
-    }
-}
-
-fn load_remote_rule_set(set: &crate::singbox::RuleSetConfig) -> Result<Vec<RouteRule>> {
-    if set
-        .download_detour
-        .as_deref()
-        .is_some_and(|tag| !tag.is_empty())
-    {
-        bail!("remote rule-set download_detour is not supported")
-    }
-    let url = set
-        .url
-        .as_deref()
-        .with_context(|| format!("remote rule-set {} requires url", set.tag))?;
-    let format = rule_set_format_for(set, url)?;
-    let cache_path = rule_set_cache_path(url, format);
-    // Prefer the on-disk cache: the background updater refreshes it, so at
-    // startup we can route immediately without a network round trip.
-    if let Ok(data) = std::fs::read(&cache_path)
-        && let Ok(rules) = decode_rule_set(&data, format)
-    {
-        return Ok(rules);
-    }
-    let fetched = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?
-        .get(url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .and_then(|response| response.bytes());
-    let data = match fetched {
-        Ok(data) => {
-            if data.len() > 64 * 1024 * 1024 {
-                bail!("remote rule-set {} exceeds 64 MiB", set.tag)
-            }
-            write_rule_set_cache(&cache_path, &data)?;
-            data.to_vec()
-        }
-        Err(error) => std::fs::read(&cache_path).with_context(|| {
-            format!(
-                "download remote rule-set {} ({error}) and read cache {}",
-                set.tag,
-                cache_path.display()
-            )
-        })?,
-    };
-    decode_rule_set(&data, format).with_context(|| format!("parse remote rule-set {}", set.tag))
-}
-
-pub(crate) fn rule_set_cache_path(url: &str, format: &str) -> std::path::PathBuf {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-        path::PathBuf,
-    };
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    let cache_root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("xhttp-cache"));
-    cache_root.join("rule-set").join(format!(
-        "{:016x}.{}",
-        hasher.finish(),
-        if format == "binary" { "srs" } else { "json" }
-    ))
-}
-
-pub(crate) fn write_rule_set_cache(cache_path: &std::path::Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create rule-set cache {}", parent.display()))?;
-    }
-    std::fs::write(cache_path, data)
-        .with_context(|| format!("write rule-set cache {}", cache_path.display()))
-}
-
-pub(crate) fn rule_set_format_for<'a>(
-    set: &'a crate::singbox::RuleSetConfig,
-    location: &str,
-) -> Result<&'a str> {
-    let format = set.format.as_deref().unwrap_or_else(|| {
-        if location
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|path| path.ends_with(".srs"))
-        {
-            "binary"
-        } else {
-            "source"
-        }
-    });
-    match format {
-        "source" | "binary" => Ok(format),
-        value => bail!("unsupported route rule-set format: {value}"),
-    }
-}
-
-fn decode_rule_set(data: &[u8], format: &str) -> Result<Vec<RouteRule>> {
-    match format {
-        "source" => Ok(serde_json::from_slice::<SourceRuleSet>(data)?.rules),
-        "binary" => crate::srs::decode(data),
-        _ => unreachable!("rule-set format was validated"),
     }
 }
 
@@ -1787,35 +1682,5 @@ mod tests {
         assert!(rule.domain_fields_match(Some("www.example.com")));
         assert!(!rule.domain_fields_match(Some("www.elsewhere.net")));
         assert!(!rule.domain_fields_match(None));
-    }
-
-    #[test]
-    fn remote_rule_set_loads_from_disk_cache_first() {
-        // Redirect the cache root so the test owns it.
-        let cache_dir =
-            std::env::temp_dir().join(format!("xhttp-rs-cache-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache_dir);
-        // SAFETY: single-threaded test; no other code reads this variable.
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &cache_dir) };
-
-        let url = "http://127.0.0.1:1/rules.json";
-        let set = crate::singbox::RuleSetConfig {
-            r#type: "remote".into(),
-            tag: "cached".into(),
-            format: Some("source".into()),
-            url: Some(url.into()),
-            ..Default::default()
-        };
-        let cache_path = rule_set_cache_path(url, "source");
-        write_rule_set_cache(
-            &cache_path,
-            br#"{"rules":[{"domain_suffix":["cached.example"]}]}"#,
-        )
-        .unwrap();
-
-        // The URL points at an unused port; a cache hit must not touch it.
-        let rules = load_remote_rule_set(&set).unwrap();
-        assert_eq!(rules.len(), 1);
-        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

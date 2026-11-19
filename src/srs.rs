@@ -1,10 +1,121 @@
-use crate::singbox::RouteRule;
+use crate::singbox::{RouteRule, RuleSetConfig};
 use anyhow::{Context, Result, bail};
 use flate2::read::ZlibDecoder;
 use std::{
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
 };
+
+/// Decoded source-format rule set (JSON with a `rules` array).
+#[derive(serde::Deserialize)]
+struct SourceRuleSet {
+    rules: Vec<RouteRule>,
+}
+
+/// Decode rule-set bytes in either source (JSON) or binary (SRS) format.
+pub(crate) fn decode_rule_set(data: &[u8], format: &str) -> Result<Vec<RouteRule>> {
+    match format {
+        "source" => Ok(serde_json::from_slice::<SourceRuleSet>(data)?.rules),
+        "binary" => decode(data),
+        _ => unreachable!("rule-set format was validated"),
+    }
+}
+
+/// Determine the rule-set format from an explicit setting or the location's file extension.
+pub(crate) fn rule_set_format_for<'a>(set: &'a RuleSetConfig, location: &str) -> Result<&'a str> {
+    let format = set.format.as_deref().unwrap_or_else(|| {
+        if location
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|path| path.ends_with(".srs"))
+        {
+            "binary"
+        } else {
+            "source"
+        }
+    });
+    match format {
+        "source" | "binary" => Ok(format),
+        value => bail!("unsupported route rule-set format: {value}"),
+    }
+}
+
+/// On-disk cache path for a remote rule set, keyed by URL hash.
+pub(crate) fn rule_set_cache_path(url: &str, format: &str) -> PathBuf {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("xhttp-cache"));
+    cache_root.join("rule-set").join(format!(
+        "{:016x}.{}",
+        hasher.finish(),
+        if format == "binary" { "srs" } else { "json" }
+    ))
+}
+
+/// Write fetched rule-set bytes to the on-disk cache.
+pub(crate) fn write_rule_set_cache(cache_path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create rule-set cache {}", parent.display()))?;
+    }
+    std::fs::write(cache_path, data)
+        .with_context(|| format!("write rule-set cache {}", cache_path.display()))
+}
+
+/// Load a remote rule set, preferring the on-disk cache over a network fetch.
+pub(crate) fn load_remote_rule_set(set: &RuleSetConfig) -> Result<Vec<RouteRule>> {
+    if set
+        .download_detour
+        .as_deref()
+        .is_some_and(|tag| !tag.is_empty())
+    {
+        bail!("remote rule-set download_detour is not supported")
+    }
+    let url = set
+        .url
+        .as_deref()
+        .with_context(|| format!("remote rule-set {} requires url", set.tag))?;
+    let format = rule_set_format_for(set, url)?;
+    let cache_path = rule_set_cache_path(url, format);
+    // Prefer the on-disk cache: the background updater refreshes it, so at
+    // startup we can route immediately without a network round trip.
+    if let Ok(data) = std::fs::read(&cache_path)
+        && let Ok(rules) = decode_rule_set(&data, format)
+    {
+        return Ok(rules);
+    }
+    let fetched = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .and_then(|response| response.bytes());
+    let data = match fetched {
+        Ok(data) => {
+            if data.len() > 64 * 1024 * 1024 {
+                bail!("remote rule-set {} exceeds 64 MiB", set.tag)
+            }
+            write_rule_set_cache(&cache_path, &data)?;
+            data.to_vec()
+        }
+        Err(error) => std::fs::read(&cache_path).with_context(|| {
+            format!(
+                "download remote rule-set {} ({error}) and read cache {}",
+                set.tag,
+                cache_path.display()
+            )
+        })?,
+    };
+    decode_rule_set(&data, format).with_context(|| format!("parse remote rule-set {}", set.tag))
+}
 
 pub(crate) fn decode(data: &[u8]) -> Result<Vec<RouteRule>> {
     if data.get(..3) != Some(b"SRS") {
@@ -376,7 +487,9 @@ fn range_to_cidrs(from: IpAddr, to: IpAddr) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, range_to_cidrs};
+    use super::{
+        decode, load_remote_rule_set, range_to_cidrs, rule_set_cache_path, write_rule_set_cache,
+    };
     use base64::Engine;
     use std::net::IpAddr;
 
@@ -410,5 +523,35 @@ mod tests {
         assert_eq!(rules[1].r#type, "logical");
         assert_eq!(rules[1].mode.as_deref(), Some("or"));
         assert!(rules[1].invert);
+    }
+
+    #[test]
+    fn remote_rule_set_loads_from_disk_cache_first() {
+        // Redirect the cache root so the test owns it.
+        let cache_dir =
+            std::env::temp_dir().join(format!("xhttp-rs-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        // SAFETY: single-threaded test; no other code reads this variable.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &cache_dir) };
+
+        let url = "http://127.0.0.1:1/rules.json";
+        let set = crate::singbox::RuleSetConfig {
+            r#type: "remote".into(),
+            tag: "cached".into(),
+            format: Some("source".into()),
+            url: Some(url.into()),
+            ..Default::default()
+        };
+        let cache_path = rule_set_cache_path(url, "source");
+        write_rule_set_cache(
+            &cache_path,
+            br#"{"rules":[{"domain_suffix":["cached.example"]}]}"#,
+        )
+        .unwrap();
+
+        // The URL points at an unused port; a cache hit must not touch it.
+        let rules = load_remote_rule_set(&set).unwrap();
+        assert_eq!(rules.len(), 1);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

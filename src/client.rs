@@ -267,7 +267,7 @@ impl Client {
                             Err(_) => break,
                         };
                         headers.insert(
-                            "x-dl-ack",
+                            protocol::HEADER_DL_ACK,
                             axum::http::HeaderValue::from_str(&format!(
                                 "{}",
                                 dl_cursor.load(Ordering::Relaxed)
@@ -301,11 +301,11 @@ impl Client {
 
                         let is_closed = response
                             .headers()
-                            .get("x-session-status")
+                            .get(protocol::HEADER_SESSION_STATUS)
                             .is_some_and(|v| v == "closed");
                         let from = response
                             .headers()
-                            .get("x-dl-from")
+                            .get(protocol::HEADER_DL_FROM)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(0);
@@ -400,10 +400,13 @@ impl Client {
             }
             let (url, mut headers) = self.request(Some(session), Some(sequence))?;
             if self.config.transport.h1_enable_piggyback {
-                headers.insert("x-h1-piggyback", axum::http::HeaderValue::from_static("1"));
+                headers.insert(
+                    protocol::HEADER_H1_PIGGYBACK,
+                    axum::http::HeaderValue::from_static("1"),
+                );
             }
             headers.insert(
-                "x-dl-ack",
+                protocol::HEADER_DL_ACK,
                 axum::http::HeaderValue::from_str(&format!(
                     "{}",
                     dl_cursor.load(Ordering::Relaxed)
@@ -423,7 +426,7 @@ impl Client {
             if self.config.transport.h1_enable_piggyback {
                 let from = response
                     .headers()
-                    .get("x-dl-from")
+                    .get(protocol::HEADER_DL_FROM)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(0);
