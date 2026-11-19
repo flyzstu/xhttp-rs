@@ -202,6 +202,9 @@ Rust smoltcp data plane; the native `system` stack is not implemented.
 - bounded reusable TCP and DoT connection pools with stale-connection retry
 - one prebuilt native-root TLS configuration shared by all DoT pools
 - singleflight coalescing for concurrent identical lookups and raw exchanges
+- a cancelled singleflight leader always completes and unregisters its
+  flight, so follower lookups are woken and later lookups never join a dead
+  flight
 - TTL-based lookup and raw-message caching with response TTL aging
 - bounded O(1)-amortized LRU eviction and an expiry heap
 - per-domain upstream selection by exact domain, suffix, or keyword

@@ -58,6 +58,35 @@ struct Inner {
     selected_provider: std::sync::RwLock<Option<SelectedProvider>>,
 }
 
+/// Ensures a singleflight leader always resolves and unregisters its flight,
+/// even when `load()` is cancelled by a caller's `tokio::time::timeout`.
+/// Without this, followers wait forever on a flight nobody completes, and
+/// later lookups for the same key keep joining that dead flight.
+struct FlightGuard<'a> {
+    resolver: &'a DnsResolver,
+    key: CacheKey,
+    flight: Arc<Flight>,
+    result: Option<std::result::Result<CacheValue, String>>,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        // Complete before removing: a follower that already grabbed the Arc
+        // must still be woken even after the map entry is gone.
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err("DNS singleflight leader cancelled".into()));
+        self.flight.complete(result);
+        self.resolver
+            .inner
+            .flights
+            .lock()
+            .expect("DNS flight lock poisoned")
+            .remove(&self.key);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LookupOptions<'a> {
     pub server: Option<&'a str>,
@@ -583,6 +612,15 @@ impl DnsResolver {
         if !leader {
             return flight.wait().await;
         }
+        // The guard owns completion + unregistration on every path, including
+        // cancellation of `load().await` by a caller timeout: without it the
+        // flight would stay registered and followers would wait forever.
+        let mut guard = FlightGuard {
+            resolver: self,
+            key,
+            flight,
+            result: None,
+        };
         let result = load().await;
         let shared = match result {
             Ok((value, ttl)) => {
@@ -591,18 +629,13 @@ impl DnsResolver {
                         .cache
                         .lock()
                         .expect("DNS cache lock poisoned")
-                        .insert(key.clone(), value.clone(), ttl);
+                        .insert(guard.key.clone(), value.clone(), ttl);
                 }
                 Ok(value)
             }
             Err(error) => Err(format!("{error:#}")),
         };
-        flight.complete(shared.clone());
-        self.inner
-            .flights
-            .lock()
-            .expect("DNS flight lock poisoned")
-            .remove(&key);
+        guard.result = Some(shared.clone());
         shared.map_err(anyhow::Error::msg)
     }
     /// A per-domain ECH handle returned when the static config is absent.
@@ -948,6 +981,63 @@ mod tests {
             assert!(task.await.unwrap().contains(&"1.2.3.4".parse().unwrap()));
         }
         assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn singleflight_leader_timeout_does_not_hang_followers() {
+        // UDP server that receives but never answers queries.
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            loop {
+                let _ = socket.recv_from(&mut buffer).await;
+            }
+        });
+        let resolver = DnsResolver::new(&test_server("udp", address)).unwrap();
+
+        // Leader starts first and is cancelled mid-query by its timeout.
+        let leader_resolver = resolver.clone();
+        let leader = tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(50),
+                leader_resolver.lookup("cancelled.example"),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Follower joins the same flight; it must be woken by the leader's
+        // cancellation instead of hanging until its own timeout.
+        let follower_resolver = resolver.clone();
+        let follower = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                follower_resolver.lookup("cancelled.example"),
+            )
+            .await
+        });
+        leader.await.unwrap();
+
+        let outcome = follower.await.unwrap();
+        // Ok(inner) means the lookup completed (inner error is fine);
+        // Err(Elapsed) would mean the follower hung on the dead flight.
+        assert!(
+            outcome.is_ok(),
+            "follower must not hang on the cancelled flight"
+        );
+
+        // The cancelled leader must have unregistered its flight, otherwise
+        // every later lookup for this key would join the dead flight.
+        assert!(
+            resolver
+                .inner
+                .flights
+                .lock()
+                .expect("DNS flight lock poisoned")
+                .is_empty(),
+            "cancelled leader's flight must be removed from the map"
+        );
     }
 
     #[tokio::test]
