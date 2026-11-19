@@ -684,7 +684,10 @@ mod tests {
         let mut assembler = DownlinkAssembler::default();
         assert_eq!(assembler.feed(0, Bytes::from_static(b"hello ")).len(), 1);
         let out = assembler.feed(0, Bytes::from_static(b"hello world"));
-        assert_eq!(out.iter().map(|b| b.as_ref()).collect::<Vec<_>>(), vec![&b"world"[..]]);
+        assert_eq!(
+            out.iter().map(|b| b.as_ref()).collect::<Vec<_>>(),
+            vec![&b"world"[..]]
+        );
         assert_eq!(assembler.cursor, 11);
 
         // A segment entirely below the cursor produces nothing.

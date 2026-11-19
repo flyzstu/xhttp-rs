@@ -21,7 +21,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use futures_util::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, mpsc, oneshot, Notify},
+    sync::{Mutex, Notify, mpsc, oneshot},
 };
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -381,11 +381,7 @@ where
     stream.take_until(kill)
 }
 
-async fn download(
-    state: Arc<ServerState>,
-    id: String,
-    headers: HeaderMap,
-) -> Response {
+async fn download(state: Arc<ServerState>, id: String, headers: HeaderMap) -> Response {
     let Some(session) = get_session(&state, &id) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -708,11 +704,9 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
                 let mut dl = downlink_for_read.lock().await;
                 dl.backend_closed = true;
                 match (dl.active.as_ref(), dl.chunks.front()) {
-                    (Some((generation, tx)), Some((_, chunk))) => Some((
-                        *generation,
-                        tx.clone(),
-                        chunk.clone(),
-                    )),
+                    (Some((generation, tx)), Some((_, chunk))) => {
+                        Some((*generation, tx.clone(), chunk.clone()))
+                    }
                     _ => None,
                 }
             };
@@ -1630,7 +1624,12 @@ mod tests {
         let session = get_session(&server.state, "multi-resume-test").unwrap();
 
         // Round 1: Connect GET #1, send seq 0, read chunk, drop GET #1
-        let get1 = download(server.state.clone(), "multi-resume-test".into(), HeaderMap::new()).await;
+        let get1 = download(
+            server.state.clone(),
+            "multi-resume-test".into(),
+            HeaderMap::new(),
+        )
+        .await;
         session
             .sender
             .send(Packet {
@@ -2102,8 +2101,12 @@ mod tests {
             assert!(dl.total - dl.acked >= dl.max_pending_bytes as u64);
         }
 
-        let get_resp =
-            download(server.state.clone(), "bounded-queue-test".into(), HeaderMap::new()).await;
+        let get_resp = download(
+            server.state.clone(),
+            "bounded-queue-test".into(),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(get_resp.status(), StatusCode::OK);
 
         let mut body = get_resp.into_body().into_data_stream();
@@ -2152,7 +2155,11 @@ mod tests {
 
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            download(server.state.clone(), "backlog-test".into(), HeaderMap::new()),
+            download(
+                server.state.clone(),
+                "backlog-test".into(),
+                HeaderMap::new(),
+            ),
         )
         .await
         .expect("download attach must not deadlock with a large backlog");
@@ -2289,7 +2296,12 @@ mod tests {
             dl.backend_closed = true;
         }
 
-        let resp = download(server.state.clone(), "graceful-close-test".into(), HeaderMap::new()).await;
+        let resp = download(
+            server.state.clone(),
+            "graceful-close-test".into(),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -2302,4 +2314,3 @@ mod tests {
         assert!(body_bytes.is_empty());
     }
 }
-
