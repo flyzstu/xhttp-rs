@@ -23,7 +23,7 @@ struct DockerRule {
 }
 
 impl LinuxTunRedirect {
-    pub(crate) fn install(config: &TunConfig) -> Result<Self> {
+    pub(crate) fn install(config: &TunConfig, redirect_port: Option<u16>) -> Result<Self> {
         let table = table_name(&config.interface_name)?;
         let lock_path = format!("/run/xhttp-rs-{table}.lock");
         let mut lock = OpenOptions::new()
@@ -66,13 +66,14 @@ impl LinuxTunRedirect {
             guard.enable_sysctl("/proc/sys/net/ipv6/conf/all/forwarding")?;
         }
         guard.persist_sysctl_state()?;
-        run_nft_script(&build_nft_script(config, &guard.table)?)?;
+        run_nft_script(&build_nft_script(config, &guard.table, redirect_port)?)?;
         guard.table_installed = true;
         guard.install_docker_compatibility(config);
         tracing::info!(
             table = %guard.table,
             input_mark = format_args!("0x{:x}", config.redirect_input_mark),
             output_mark = format_args!("0x{:x}", config.redirect_output_mark),
+            redirect_port = ?redirect_port,
             "Linux TUN nftables auto_redirect installed"
         );
         Ok(guard)
@@ -255,7 +256,7 @@ fn table_name(interface: &str) -> Result<String> {
     Ok(format!("xhttp_{}", interface.replace(['-', '.'], "_")))
 }
 
-fn build_nft_script(config: &TunConfig, table: &str) -> Result<String> {
+fn build_nft_script(config: &TunConfig, table: &str, redirect_port: Option<u16>) -> Result<String> {
     let mut lines = vec![format!("add table inet {table}")];
     let local = local_prefixes(&config.interface_name);
     add_address_set(
@@ -339,33 +340,165 @@ fn build_nft_script(config: &TunConfig, table: &str) -> Result<String> {
             .map(ToString::to_string),
     );
 
-    lines.push(format!(
-        "add chain inet {table} prerouting {{ type filter hook prerouting priority mangle; policy accept; }}"
-    ));
-    lines.push(format!(
-        "add chain inet {table} output {{ type route hook output priority mangle; policy accept; }}"
-    ));
     let interface = nft_string(&config.interface_name);
-    lines.push(format!(
-        "add rule inet {table} prerouting iifname {interface} return"
-    ));
-    add_common_exclusions(&mut lines, table, "prerouting", config, false);
-    lines.push(format!(
-        "add rule inet {table} prerouting meta l4proto {{ tcp, udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
-        config.redirect_input_mark
-    ));
-    lines.push(format!(
-        "add rule inet {table} output meta mark 0x{:x} return",
-        config.redirect_output_mark
-    ));
-    lines.push(format!(
-        "add rule inet {table} output oifname {interface} return"
-    ));
-    add_common_exclusions(&mut lines, table, "output", config, true);
-    lines.push(format!(
-        "add rule inet {table} output meta l4proto {{ tcp, udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
-        config.redirect_input_mark
-    ));
+
+    if let Some(port) = redirect_port {
+        // TCP NAT output chain (priority -150)
+        lines.push(format!(
+            "add chain inet {table} output {{ type nat hook output priority -150; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} output meta mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output ct mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output oifname {interface} return"
+        ));
+        lines.push(format!("add rule inet {table} output tcp sport 22 return"));
+        lines.push(format!("add rule inet {table} output tcp dport 22 return"));
+        lines.push(format!(
+            "add rule inet {table} output fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "output", config, true);
+        lines.push(format!(
+            "add rule inet {table} output meta l4proto tcp redirect to :{port}"
+        ));
+
+        // TCP NAT prerouting chain (priority -99)
+        lines.push(format!(
+            "add chain inet {table} prerouting {{ type nat hook prerouting priority -99; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting ct mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting iifname {interface} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting tcp dport 22 return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting tcp sport 22 return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "prerouting", config, false);
+        lines.push(format!(
+            "add rule inet {table} prerouting meta l4proto tcp redirect to :{port}"
+        ));
+
+        // UDP/ICMP route output chain (priority -150)
+        lines.push(format!(
+            "add chain inet {table} output_udp_icmp {{ type route hook output priority -150; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp meta l4proto != {{ icmp, udp, ipv6-icmp }} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp meta mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp ct mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp oifname {interface} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "output_udp_icmp", config, true);
+        lines.push(format!(
+            "add rule inet {table} output_udp_icmp meta l4proto {{ udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
+            config.redirect_input_mark
+        ));
+
+        // UDP/ICMP filter prerouting chain (priority -98)
+        lines.push(format!(
+            "add chain inet {table} prerouting_udp_icmp {{ type filter hook prerouting priority -98; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting_udp_icmp iifname {interface} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting_udp_icmp meta l4proto != {{ icmp, udp, ipv6-icmp }} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting_udp_icmp fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "prerouting_udp_icmp", config, false);
+        lines.push(format!(
+            "add rule inet {table} prerouting_udp_icmp meta l4proto {{ udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
+            config.redirect_input_mark
+        ));
+
+        // Security filter for redirect port (reject non-DNAT packets)
+        lines.push(format!(
+            "add chain inet {table} input {{ type filter hook input priority 0; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} input tcp dport {port} ct status ! dnat reject with tcp reset"
+        ));
+    } else {
+        lines.push(format!(
+            "add chain inet {table} prerouting {{ type filter hook prerouting priority mangle; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add chain inet {table} output {{ type route hook output priority mangle; policy accept; }}"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting iifname {interface} return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting tcp dport 22 return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting tcp sport 22 return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} prerouting fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "prerouting", config, false);
+        lines.push(format!(
+            "add rule inet {table} prerouting meta l4proto {{ tcp, udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
+            config.redirect_input_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output meta mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output ct mark 0x{:x} return",
+            config.redirect_output_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output oifname {interface} return"
+        ));
+        lines.push(format!("add rule inet {table} output tcp sport 22 return"));
+        lines.push(format!("add rule inet {table} output tcp dport 22 return"));
+        lines.push(format!(
+            "add rule inet {table} output ct mark 0x{:x} meta mark set ct mark return",
+            config.redirect_input_mark
+        ));
+        lines.push(format!(
+            "add rule inet {table} output ct state established,related return"
+        ));
+        lines.push(format!(
+            "add rule inet {table} output fib daddr type local return"
+        ));
+        add_common_exclusions(&mut lines, table, "output", config, true);
+        lines.push(format!(
+            "add rule inet {table} output meta l4proto {{ tcp, udp, icmp, ipv6-icmp }} counter ct mark set 0x{:x} meta mark set ct mark",
+            config.redirect_input_mark
+        ));
+    }
     Ok(lines.join("\n") + "\n")
 }
 
@@ -606,9 +739,12 @@ mod tests {
 
     #[test]
     fn nft_plan_contains_router_filters_marks_and_bypass() {
-        let script = build_nft_script(&config(), "xhttp_xhttp0").unwrap();
-        assert!(script.contains("type filter hook prerouting priority mangle"));
-        assert!(script.contains("type route hook output priority mangle"));
+        let script = build_nft_script(&config(), "xhttp_xhttp0", Some(17503)).unwrap();
+        assert!(script.contains("type nat hook output priority -150"));
+        assert!(script.contains("type nat hook prerouting priority -99"));
+        assert!(script.contains("type route hook output priority -150"));
+        assert!(script.contains("meta l4proto tcp redirect to :17503"));
+        assert!(script.contains("tcp dport 17503 ct status ! dnat reject with tcp reset"));
         assert!(script.contains("iifname != { \"lan0\" } return"));
         assert!(script.contains("ether saddr != { 02:00:00:00:00:02 } return"));
         assert!(script.contains("meta skuid != { 1000, 2000-2999 } return"));
@@ -616,6 +752,17 @@ mod tests {
         assert!(script.contains("ip6 daddr != @route6 return"));
         assert!(script.contains("ct mark set 0x2023 meta mark set ct mark"));
         assert!(script.contains("meta mark 0x2024 return"));
+        assert!(script.contains("tcp sport 22 return"));
+        assert!(script.contains("tcp dport 22 return"));
+        assert!(script.contains("fib daddr type local return"));
+    }
+
+    #[test]
+    fn nft_plan_without_redirect_port_uses_route_marking() {
+        let script = build_nft_script(&config(), "xhttp_xhttp0", None).unwrap();
+        assert!(script.contains("type filter hook prerouting priority mangle"));
+        assert!(script.contains("type route hook output priority mangle"));
+        assert!(script.contains("ct state established,related return"));
     }
 
     #[test]

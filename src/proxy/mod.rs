@@ -1,5 +1,6 @@
 mod direct;
 mod inbound;
+pub mod redirect;
 mod relay;
 mod route;
 pub mod tproxy;

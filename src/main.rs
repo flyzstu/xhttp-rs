@@ -50,7 +50,8 @@ fn init_logging(
     let level = if log.is_some_and(|value| value.disabled) {
         "off"
     } else {
-        log.and_then(|value| value.level.as_deref()).unwrap_or("info")
+        log.and_then(|value| value.level.as_deref())
+            .unwrap_or("info")
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
@@ -145,7 +146,9 @@ async fn run(config: SingBoxConfig) -> Result<()> {
         if inbound.r#type == "tproxy" {
             let dns_cache_path = dns_cache_path.clone();
             if let Some(runtime) = shared_runtime.clone() {
-                tasks.spawn(async move { xhttp::proxy::tproxy::run_tproxy_inbound(inbound, runtime).await });
+                tasks.spawn(async move {
+                    xhttp::proxy::tproxy::run_tproxy_inbound(inbound, runtime).await
+                });
             } else {
                 let outbounds = config.outbounds.clone();
                 let route = config.route.clone();
@@ -153,10 +156,43 @@ async fn run(config: SingBoxConfig) -> Result<()> {
                 let http_clients = config.http_clients.clone();
                 tasks.spawn(async move {
                     let runtime = std::sync::Arc::new(
-                        xhttp::proxy::build_runtime(outbounds, route, dns, http_clients, dns_cache_path)
-                            .await?,
+                        xhttp::proxy::build_runtime(
+                            outbounds,
+                            route,
+                            dns,
+                            http_clients,
+                            dns_cache_path,
+                        )
+                        .await?,
                     );
                     xhttp::proxy::tproxy::run_tproxy_inbound(inbound, runtime).await
+                });
+            }
+            continue;
+        }
+        if inbound.r#type == "redirect" {
+            let dns_cache_path = dns_cache_path.clone();
+            if let Some(runtime) = shared_runtime.clone() {
+                tasks.spawn(async move {
+                    xhttp::proxy::redirect::run_redirect_inbound(inbound, runtime).await
+                });
+            } else {
+                let outbounds = config.outbounds.clone();
+                let route = config.route.clone();
+                let dns = config.dns.clone();
+                let http_clients = config.http_clients.clone();
+                tasks.spawn(async move {
+                    let runtime = std::sync::Arc::new(
+                        xhttp::proxy::build_runtime(
+                            outbounds,
+                            route,
+                            dns,
+                            http_clients,
+                            dns_cache_path,
+                        )
+                        .await?,
+                    );
+                    xhttp::proxy::redirect::run_redirect_inbound(inbound, runtime).await
                 });
             }
             continue;
@@ -167,22 +203,22 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let dns = config.dns.clone();
             let http_clients = config.http_clients.clone();
             if let Some(runtime) = shared_runtime.clone() {
-                tasks.spawn(async move { xhttp::proxy::run_socks_with_runtime(inbound, runtime).await });
+                tasks.spawn(
+                    async move { xhttp::proxy::run_socks_with_runtime(inbound, runtime).await },
+                );
             } else {
                 let dns_cache_path = dns_cache_path.clone();
-                tasks.spawn(
-                    async move {
-                        xhttp::proxy::run_socks(
-                            inbound,
-                            outbounds,
-                            route,
-                            dns,
-                            http_clients,
-                            dns_cache_path,
-                        )
-                        .await
-                    },
-                );
+                tasks.spawn(async move {
+                    xhttp::proxy::run_socks(
+                        inbound,
+                        outbounds,
+                        route,
+                        dns,
+                        http_clients,
+                        dns_cache_path,
+                    )
+                    .await
+                });
             }
             continue;
         }
@@ -192,9 +228,17 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             let dns = config.dns.clone();
             let http_clients = config.http_clients.clone();
             let dns_cache_path = dns_cache_path.clone();
-            tasks.spawn(
-                async move { xhttp::anytls::run_inbound(inbound, outbounds, route, dns, http_clients, dns_cache_path).await },
-            );
+            tasks.spawn(async move {
+                xhttp::anytls::run_inbound(
+                    inbound,
+                    outbounds,
+                    route,
+                    dns,
+                    http_clients,
+                    dns_cache_path,
+                )
+                .await
+            });
             continue;
         }
         if !(inbound.r#type == "vless"

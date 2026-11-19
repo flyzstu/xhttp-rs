@@ -370,15 +370,29 @@ pub async fn run(
         route.auto_detect_interface = Some(false);
     }
     let rule_set_route = route.clone();
-    let mut runtime = proxy::build_runtime(outbounds, Some(route), dns, http_clients, dns_cache_path).await?;
+    let mut runtime =
+        proxy::build_runtime(outbounds, Some(route), dns, http_clients, dns_cache_path).await?;
     if config.auto_redirect {
         runtime.set_tun_output_mark(config.redirect_output_mark);
     }
     let runtime = Arc::new(runtime);
     let device = Arc::new(build_device(&config)?);
+    let redirect_server = if config.auto_redirect {
+        #[cfg(target_os = "linux")]
+        {
+            Some(crate::proxy::redirect::RedirectServer::bind_local()?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    } else {
+        None
+    };
+    let redirect_port = redirect_server.as_ref().map(|server| server.port());
     let redirect_guard = config
         .auto_redirect
-        .then(|| crate::tun_redirect_linux::LinuxTunRedirect::install(&config))
+        .then(|| crate::tun_redirect_linux::LinuxTunRedirect::install(&config, redirect_port))
         .transpose()?
         .map(|guard| Arc::new(Mutex::new(guard)));
     let route_guard = config
@@ -430,6 +444,11 @@ pub async fn run(
         bail!("TUN packet output stream closed")
     });
     tasks.spawn(run_tcp(tcp, runtime.clone(), tag.clone()));
+    if let Some(server) = redirect_server {
+        let runtime = runtime.clone();
+        let tag = tag.clone();
+        tasks.spawn(async move { server.run(runtime, tag).await });
+    }
     tasks.spawn(run_udp(
         udp,
         runtime.clone(),
@@ -754,8 +773,8 @@ fn endpoint_host(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use super::*;
+    use std::net::SocketAddr;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn inbound(json: &str) -> Inbound {
@@ -843,12 +862,18 @@ mod tests {
         let same_address = "192.0.2.1:5353".parse().unwrap();
         let second = "198.51.100.1:53".parse().unwrap();
 
-        assert_eq!(UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first), UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, second));
+        assert_eq!(
+            UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, first),
+            UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, source, second)
+        );
         assert_eq!(
             UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, first),
             UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, same_address)
         );
-        assert_ne!(UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, first), UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, second));
+        assert_ne!(
+            UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, first),
+            UdpNatTable::key_for(UdpNatBehavior::AddressDependent, source, second)
+        );
 
         let mut table = UdpNatTable::new(
             UdpNatBehavior::AddressAndPortDependent,
@@ -863,7 +888,8 @@ mod tests {
         table.insert_sender(key, sender);
 
         let other_source = "172.19.0.3:53000".parse().unwrap();
-        let other_key = UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, other_source, second);
+        let other_key =
+            UdpNatTable::key_for(UdpNatBehavior::EndpointIndependent, other_source, second);
         table.touch_and_sender(other_key, second);
         assert!(!table.contains_key(&key));
         assert!(receiver.recv().await.is_none());

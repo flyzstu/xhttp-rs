@@ -133,15 +133,19 @@ or a partially failed setup. Use custom table/rule indexes when another VPN
 already occupies the defaults, as shown in the example.
 
 `auto_redirect` adds an atomic nftables capture plane for locally generated and
-forwarded IPv4/IPv6 TCP, UDP and ICMP traffic. It supports ingress interface,
-source MAC, UID, route-prefix and proxy/DNS endpoint bypass filters, marks proxy
-outbound sockets to prevent loops, enables forwarding while active, and adds
-Docker `DOCKER-USER` compatibility rules when that chain exists. A deterministic
-table name and process lock recover stale nftables/policy-route state on the
-next start and preserve the forwarding sysctl values that preceded a hard kill.
-Unlike sing-tun, this data plane sends all selected protocols directly to the
-TUN table and therefore does not need a TCP REDIRECT listener or NFQUEUE reset
-path.
+forwarded IPv4/IPv6 traffic. TCP is captured by NAT `redirect` rules into an
+internal listener that resolves each connection's original destination via
+`SO_ORIGINAL_DST`, while UDP and ICMP are marked into the TUN table. It
+supports ingress interface, source MAC, UID, route-prefix and proxy/DNS
+endpoint bypass filters, marks proxy outbound sockets to prevent loops,
+enables forwarding while active, and adds Docker `DOCKER-USER` compatibility
+rules when that chain exists. A deterministic table name and process lock
+recover stale nftables/policy-route state on the next start and preserve the
+forwarding sysctl values that preceded a hard kill.
+
+A standalone `type: "redirect"` inbound exposes the same TCP listener with a
+configured `listen_port`; it requires an external nftables/iptables `REDIRECT`
+rule to divert TCP into it.
 
 The TUN address accepts a scalar or a list of IPv4/IPv6 prefixes. Supported
 stack names are `mixed`, `gvisor` (compatibility aliases) and `smoltcp`; all

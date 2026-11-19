@@ -119,6 +119,11 @@ idle timeout, and close lifecycle.
   NAT table (mapping/filtering/idle/LRU) and outbound relay paths with the
   TUN and SOCKS inbounds. Requires policy routing plus `iptables -t mangle
   -j TPROXY` rules to divert traffic.
+- Linux REDIRECT inbound: transparent TCP interception via `SO_ORIGINAL_DST`,
+  accepting both a standalone `type: "redirect"` inbound (with `listen_port`)
+  and the internal listener that TUN `auto_redirect` uses to receive TCP
+  packets redirected by nftables NAT rules; shares route evaluation and the
+  outbound relay paths with the TUN and SOCKS inbounds
 
 SOCKS5 UDP preserves datagram boundaries and can route through direct,
 classic VLESS UDP, or XUDP paths.
@@ -135,7 +140,10 @@ classic VLESS UDP, or XUDP paths.
 - included/excluded route prefixes, included/excluded ingress interfaces,
   included/excluded UIDs and UID ranges, and strict address-family routing
 - atomic nftables `auto_redirect` for local and forwarded IPv4/IPv6 TCP, UDP
-  and ICMP, with interface/MAC/UID/prefix filtering and outbound mark bypass
+  and ICMP, with interface/MAC/UID/prefix filtering and outbound mark bypass;
+  TCP is captured via NAT `redirect` rules into an internal listener that
+  resolves the original destination, while UDP/ICMP continue through route
+  marking into the TUN table
 - hot `route_address_set` / `route_exclude_address_set` CIDR extraction from
   inline, local, remote source and binary SRS rule-sets
 - independent UDP NAT mapping/filtering modes, idle expiry, memory-aware
@@ -146,6 +154,9 @@ classic VLESS UDP, or XUDP paths.
   UDP and ICMP
 - transactional setup and exact rollback on normal shutdown, cancellation,
   or partially failed installation
+
+The standalone `redirect` inbound requires `listen_port` and an nftables/iptables
+`REDIRECT` rule to divert TCP to it; TLS on a redirect inbound is rejected.
 
 The runtime rejects Android package/user filters, explicit network namespaces,
 loopback remapping, the optional NFQUEUE pre-match controls and deprecated
