@@ -1,0 +1,233 @@
+{
+  "generated_at": "2026-11-19T18:32:04+0800",
+  "client": "/usr/local/bin/xhttp-box",
+  "size_mb": 20,
+  "samples": 3,
+  "target": "xhttp-box (ansible sing_box.yml, image 0.3.0)",
+  "results": [
+    {
+      "host": "hkg",
+      "mode": "direct",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.21,
+      "mbps_all": [
+        1.3,
+        1.21,
+        0.99
+      ],
+      "ttfb_s_median": 1.166,
+      "total_s_median": 17.382
+    },
+    {
+      "host": "hkg",
+      "mode": "xhttp-packet-up",
+      "samples": 3,
+      "ok_samples": 2,
+      "size_mb": 20,
+      "mbps_median": 1.5,
+      "mbps_all": [
+        1.44,
+        1.57
+      ],
+      "ttfb_s_median": 1.964,
+      "total_s_median": 13.95
+    },
+    {
+      "host": "hkg",
+      "mode": "anytls",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.19,
+      "mbps_all": [
+        0.39,
+        1.19,
+        1.68
+      ],
+      "ttfb_s_median": 1.636,
+      "total_s_median": 17.555
+    },
+    {
+      "host": "iad",
+      "mode": "direct",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 2.45,
+      "mbps_all": [
+        2.16,
+        2.45,
+        5.01
+      ],
+      "ttfb_s_median": 0.541,
+      "total_s_median": 8.55
+    },
+    {
+      "host": "iad",
+      "mode": "xhttp-packet-up",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 6.22,
+      "mbps_all": [
+        3.71,
+        6.22,
+        6.52
+      ],
+      "ttfb_s_median": 0.58,
+      "total_s_median": 3.374
+    },
+    {
+      "host": "iad",
+      "mode": "anytls",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 4.21,
+      "mbps_all": [
+        3.07,
+        4.21,
+        6.53
+      ],
+      "ttfb_s_median": 0.702,
+      "total_s_median": 4.986
+    },
+    {
+      "host": "sin",
+      "mode": "direct",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 3.69,
+      "mbps_all": [
+        3.79,
+        3.65,
+        3.69
+      ],
+      "ttfb_s_median": 0.635,
+      "total_s_median": 5.686
+    },
+    {
+      "host": "sin",
+      "mode": "xhttp-packet-up",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.92,
+      "mbps_all": [
+        2.07,
+        1.61,
+        1.92
+      ],
+      "ttfb_s_median": 0.863,
+      "total_s_median": 10.935
+    },
+    {
+      "host": "sin",
+      "mode": "anytls",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 2.07,
+      "mbps_all": [
+        1.91,
+        2.07,
+        2.1
+      ],
+      "ttfb_s_median": 0.368,
+      "total_s_median": 10.117
+    },
+    {
+      "host": "lax",
+      "mode": "direct",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 4.14,
+      "mbps_all": [
+        2.06,
+        6.19,
+        4.14
+      ],
+      "ttfb_s_median": 0.544,
+      "total_s_median": 5.064
+    },
+    {
+      "host": "lax",
+      "mode": "xhttp-packet-up",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 3.23,
+      "mbps_all": [
+        1.53,
+        3.23,
+        3.91
+      ],
+      "ttfb_s_median": 1.297,
+      "total_s_median": 6.494
+    },
+    {
+      "host": "lax",
+      "mode": "anytls",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 9.8,
+      "mbps_all": [
+        3.94,
+        10.01,
+        9.8
+      ],
+      "ttfb_s_median": 0.586,
+      "total_s_median": 2.141
+    },
+    {
+      "host": "lax2",
+      "mode": "direct",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.1,
+      "mbps_all": [
+        1.1,
+        1.11,
+        1.1
+      ],
+      "ttfb_s_median": 0.466,
+      "total_s_median": 18.99
+    },
+    {
+      "host": "lax2",
+      "mode": "xhttp-packet-up",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.12,
+      "mbps_all": [
+        1.08,
+        1.13,
+        1.12
+      ],
+      "ttfb_s_median": 0.487,
+      "total_s_median": 18.685
+    },
+    {
+      "host": "lax2",
+      "mode": "anytls",
+      "samples": 3,
+      "ok_samples": 3,
+      "size_mb": 20,
+      "mbps_median": 1.12,
+      "mbps_all": [
+        1.11,
+        1.13,
+        1.12
+      ],
+      "ttfb_s_median": 0.305,
+      "total_s_median": 18.644
+    }
+  ]
+}
