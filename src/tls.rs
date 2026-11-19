@@ -339,6 +339,85 @@ impl ServerCertVerifier for PinnedOrWebPkiVerifier {
 mod tests {
     use super::*;
 
+    // Shared fixture: a self-signed leaf and a verifier that rejects
+    // everything via WebPKI, so only the exact-leaf-pin path can succeed.
+    struct PinFixture {
+        pinned_der: CertificateDer<'static>,
+        other_der: CertificateDer<'static>,
+        verifier: PinnedOrWebPkiVerifier,
+    }
+
+    impl PinFixture {
+        fn new() -> Self {
+            let rcgen::CertifiedKey { cert, key_pair: _ } =
+                rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+            let pinned_der = CertificateDer::from(cert.der().to_vec());
+
+            #[derive(Debug)]
+            struct RejectVerifier;
+            impl ServerCertVerifier for RejectVerifier {
+                fn verify_server_cert(
+                    &self,
+                    _end_entity: &CertificateDer<'_>,
+                    _intermediates: &[CertificateDer<'_>],
+                    _server_name: &ServerName<'_>,
+                    _ocsp_response: &[u8],
+                    _now: UnixTime,
+                ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+                    Err(rustls::Error::General("untrusted".into()))
+                }
+                fn verify_tls12_signature(
+                    &self,
+                    _message: &[u8],
+                    _certificate: &CertificateDer<'_>,
+                    _signature: &DigitallySignedStruct,
+                ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                    Err(rustls::Error::General("untrusted".into()))
+                }
+                fn verify_tls13_signature(
+                    &self,
+                    _message: &[u8],
+                    _certificate: &CertificateDer<'_>,
+                    _signature: &DigitallySignedStruct,
+                ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                    Err(rustls::Error::General("untrusted".into()))
+                }
+                fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                    vec![]
+                }
+            }
+
+            let rcgen::CertifiedKey {
+                cert: other_cert,
+                key_pair: _,
+            } = rcgen::generate_simple_self_signed(vec!["other.com".into()]).unwrap();
+            let other_der = CertificateDer::from(other_cert.der().to_vec());
+
+            Self {
+                verifier: PinnedOrWebPkiVerifier {
+                    pinned_certs: vec![pinned_der.clone()],
+                    webpki: Arc::new(RejectVerifier),
+                },
+                pinned_der,
+                other_der,
+            }
+        }
+
+        fn verify(
+            &self,
+            cert: &CertificateDer<'_>,
+            name: &str,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            self.verifier.verify_server_cert(
+                cert,
+                &[],
+                &ServerName::try_from(name).unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+        }
+    }
+
     #[test]
     fn sing_box_ech_pem_is_accepted() {
         parse_ech_config(
@@ -399,90 +478,25 @@ mod tests {
     }
 
     #[test]
-    fn pinned_leaf_certificate_is_trusted() {
-        let rcgen::CertifiedKey { cert, key_pair: _ } =
-            rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
-        let cert_der = CertificateDer::from(cert.der().to_vec());
+    fn pinned_leaf_certificate_is_trusted_for_matching_server_name() {
+        let fixture = PinFixture::new();
+        assert!(fixture.verify(&fixture.pinned_der, "example.com").is_ok());
+    }
 
-        #[derive(Debug)]
-        struct RejectVerifier;
-        impl ServerCertVerifier for RejectVerifier {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: UnixTime,
-            ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-                Err(rustls::Error::General("untrusted".into()))
-            }
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _certificate: &CertificateDer<'_>,
-                _signature: &DigitallySignedStruct,
-            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-                Err(rustls::Error::General("untrusted".into()))
-            }
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _certificate: &CertificateDer<'_>,
-                _signature: &DigitallySignedStruct,
-            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-                Err(rustls::Error::General("untrusted".into()))
-            }
-            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                vec![]
-            }
-        }
-
-        let verifier = PinnedOrWebPkiVerifier {
-            pinned_certs: vec![cert_der.clone()],
-            webpki: Arc::new(RejectVerifier),
-        };
-
-        let server_name = ServerName::try_from("example.com").unwrap();
+    #[test]
+    fn pinned_leaf_certificate_is_rejected_for_wrong_server_name() {
+        let fixture = PinFixture::new();
         assert!(
-            verifier
-                .verify_server_cert(
-                    &cert_der,
-                    &[],
-                    &server_name,
-                    &[],
-                    rustls::pki_types::UnixTime::now(),
-                )
-                .is_ok()
-        );
-        assert!(
-            verifier
-                .verify_server_cert(
-                    &cert_der,
-                    &[],
-                    &ServerName::try_from("wrong.invalid").unwrap(),
-                    &[],
-                    rustls::pki_types::UnixTime::now(),
-                )
+            fixture
+                .verify(&fixture.pinned_der, "wrong.invalid")
                 .is_err()
         );
+    }
 
-        let rcgen::CertifiedKey {
-            cert: other_cert,
-            key_pair: _,
-        } = rcgen::generate_simple_self_signed(vec!["other.com".into()]).unwrap();
-        let other_der = CertificateDer::from(other_cert.der().to_vec());
-        assert!(
-            verifier
-                .verify_server_cert(
-                    &other_der,
-                    &[],
-                    &server_name,
-                    &[],
-                    rustls::pki_types::UnixTime::now(),
-                )
-                .is_err()
-        );
+    #[test]
+    fn different_leaf_certificate_is_rejected_even_with_matching_name() {
+        let fixture = PinFixture::new();
+        assert!(fixture.verify(&fixture.other_der, "example.com").is_err());
     }
 
     #[test]
