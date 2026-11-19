@@ -178,8 +178,8 @@ fn authenticated(headers: &HeaderMap, secret: Option<&str>) -> bool {
         .is_some_and(|value| value == format!("Bearer {secret}"))
 }
 
-async fn version(State(state): State<ApiState>) -> Response {
-    if !authenticated(&HeaderMap::new(), state.secret.as_deref()) {
+async fn version(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if !authenticated(&headers, state.secret.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     json_response(json!({
@@ -189,8 +189,8 @@ async fn version(State(state): State<ApiState>) -> Response {
     }))
 }
 
-async fn get_configs(State(state): State<ApiState>) -> Response {
-    if !authenticated(&HeaderMap::new(), state.secret.as_deref()) {
+async fn get_configs(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if !authenticated(&headers, state.secret.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     json_response(json!({
@@ -574,6 +574,58 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("*")
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clash_api_secret_authenticates_all_read_endpoints() {
+        let runtime = selector_runtime().await;
+        let port = free_port().await;
+        let config = ClashApiConfig {
+            external_controller: Some(format!("127.0.0.1:{port}")),
+            secret: Some("test-secret".into()),
+            external_ui: None,
+            external_ui_download_url: None,
+            external_ui_download_detour: None,
+            access_control_allow_origin: vec![],
+            access_control_allow_private_network: false,
+        };
+        let server = tokio::spawn(run(config, runtime));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+        for endpoint in ["/version", "/configs"] {
+            let url = format!("http://127.0.0.1:{port}{endpoint}");
+            let unauthorized = client.get(&url).send().await.unwrap().status();
+            assert_eq!(
+                unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "{endpoint} without token"
+            );
+
+            let authorized = client
+                .get(&url)
+                .header("authorization", "Bearer test-secret")
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(authorized, StatusCode::OK, "{endpoint} with token");
+
+            let wrong = client
+                .get(&url)
+                .header("authorization", "Bearer wrong-secret")
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(
+                wrong,
+                StatusCode::UNAUTHORIZED,
+                "{endpoint} with wrong token"
+            );
+        }
 
         server.abort();
     }
