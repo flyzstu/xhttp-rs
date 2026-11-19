@@ -214,8 +214,8 @@ impl Dialer {
             Self::Direct | Self::Block | Self::Group(_) => Ok(()),
             Self::AnyTls { client } => {
                 let destination = vless::Destination::Ip(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
-                    1,
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                    53,
                 );
                 let destination = crate::proxy::udp::to_anytls_destination(&destination);
                 let mut stream = client
@@ -226,8 +226,8 @@ impl Dialer {
             }
             Self::Vless { client, user, .. } => {
                 let destination = vless::Destination::Ip(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1)),
-                    1,
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+                    53,
                 );
                 let mut stream = client.connect().await?;
                 vless::write_request(&mut stream, user, &destination).await?;
@@ -403,6 +403,43 @@ impl DetourProvider {
         .await
     }
 
+    async fn resolve_destination(&self, destination: &vless::Destination) -> vless::Destination {
+        let (host, port) = match destination {
+            vless::Destination::Domain(host, port) => (host, *port),
+            vless::Destination::Ip(..) => return destination.clone(),
+        };
+        if let Some(resolver) = &self.resolver
+            && let Ok(Ok(ips)) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), resolver.lookup(host)).await
+            && let Some(ip) = ips
+                .iter()
+                .find(|ip| ip.is_ipv4())
+                .copied()
+                .or_else(|| ips.first().copied())
+        {
+            tracing::debug!(host, resolved = %ip, "resolved domain destination to IP for detour outbound");
+            return vless::Destination::Ip(ip, port);
+        }
+        if let Ok(Ok(mut addrs)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        {
+            let ips: Vec<_> = addrs.by_ref().map(|a| a.ip()).collect();
+            if let Some(ip) = ips
+                .iter()
+                .find(|ip| ip.is_ipv4())
+                .copied()
+                .or_else(|| ips.first().copied())
+            {
+                tracing::debug!(host, resolved = %ip, "fallback resolved domain destination to IP for detour outbound");
+                return vless::Destination::Ip(ip, port);
+            }
+        }
+        destination.clone()
+    }
+
     async fn connect_tcp_destination(
         &self,
         tag: &str,
@@ -411,10 +448,12 @@ impl DetourProvider {
         let dialer = self
             .resolve(tag)
             .with_context(|| format!("unknown detour outbound: {tag}"))?;
+        let resolved = self.resolve_destination(destination).await;
+        let target_dest = &resolved;
         match dialer {
             Dialer::Direct => Ok(Box::new(
                 crate::proxy::direct::connect_direct(
-                    destination,
+                    target_dest,
                     self.resolver.as_deref(),
                     &Default::default(),
                     &[],
@@ -423,12 +462,12 @@ impl DetourProvider {
             )),
             Dialer::Vless { client, user, .. } => {
                 let mut stream = client.connect().await?;
-                vless::write_request(&mut stream, &user, destination).await?;
+                vless::write_request(&mut stream, &user, target_dest).await?;
                 vless::read_response(&mut stream).await?;
                 Ok(Box::new(stream))
             }
             Dialer::AnyTls { client } => {
-                let anytls_dest = udp::to_anytls_destination(destination);
+                let anytls_dest = udp::to_anytls_destination(target_dest);
                 let stream = client
                     .create_stream(&anytls::encode_address(&anytls_dest)?)
                     .await?;
@@ -501,8 +540,10 @@ impl DetourProvider {
             self.connect_tcp_destination(tag, &destination),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("connect rule-set host through outbound timed out"))?
-        .context("connect rule-set host through outbound")?;
+        .map_err(|_| {
+            anyhow::anyhow!("connect rule-set host {host}:{port} through outbound {tag} timed out")
+        })?
+        .with_context(|| format!("connect rule-set host {host}:{port} through outbound {tag}"))?;
 
         let mut stream: Box<dyn crate::dns::transport::DnsIo> = if scheme == "https" {
             let mut roots = rustls::RootCertStore::empty();
@@ -523,8 +564,8 @@ impl DetourProvider {
                 connector.connect(name, tcp),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("TLS handshake with rule-set host timed out"))?
-            .context("TLS handshake with rule-set host")?;
+            .map_err(|_| anyhow::anyhow!("TLS handshake with {host}:{port} timed out"))?
+            .with_context(|| format!("TLS handshake with {host}:{port}"))?;
             Box::new(tls_stream)
         } else {
             tcp
@@ -844,6 +885,34 @@ pub async fn build_runtime(
                 .collect()
         }));
     }
+
+    // Pre-warm detours referenced by http_clients before routing compilation and rule-set prefetch
+    for client in &http_clients {
+        if let Some(detour) = client.detour.as_deref().filter(|s| !s.is_empty())
+            && let Some(dialer) = provider.dialer(detour)
+        {
+            tracing::info!(detour, client = %client.tag, "pre-warming http_client detour");
+            for attempt in 1u8..=3 {
+                match dialer.warm_up().await {
+                    Ok(()) => {
+                        tracing::info!(detour, "detour warmed up successfully");
+                        break;
+                    }
+                    Err(error) if attempt < 3 => {
+                        tracing::debug!(error = %format!("{error:#}"), attempt, detour, "detour warm-up retry");
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            300 * u64::from(attempt),
+                        ))
+                        .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %format!("{error:#}"), detour, "detour warm-up failed after 3 attempts");
+                    }
+                }
+            }
+        }
+    }
+
     let prefetched = prefetch_rule_sets(&route_config, &http_clients, &provider).await;
     let compile_config = route_config.clone();
     let compile_default = default.clone();
@@ -1078,12 +1147,12 @@ async fn prefetch_rule_sets(
             match dialer.warm_up().await {
                 Ok(()) => break,
                 Err(error) if attempt < 3 => {
-                    tracing::debug!(%error, attempt, detour, "detour warm-up failed, retrying");
+                    tracing::debug!(error = %format!("{error:#}"), attempt, detour, "detour warm-up failed, retrying");
                     tokio::time::sleep(std::time::Duration::from_millis(300 * u64::from(attempt)))
                         .await;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, attempt, detour, "detour warm-up failed after 3 attempts");
+                    tracing::warn!(error = %format!("{error:#}"), attempt, detour, "detour warm-up failed after 3 attempts");
                 }
             }
         }
@@ -1126,18 +1195,18 @@ async fn prefetch_rule_sets(
                         "prefetched remote rule-set through http_client"
                     );
                     if let Err(error) = crate::routing::write_rule_set_cache(&cache_path, &data) {
-                        tracing::warn!(%error, tag = %tag, "failed to write rule-set cache");
+                        tracing::warn!(error = %format!("{error:#}"), tag = %tag, "failed to write rule-set cache");
                     }
                     if let Some(etag) = new_etag
                         && let Err(error) = std::fs::write(cache_path.with_extension("etag"), etag)
                     {
-                        tracing::warn!(%error, tag = %tag, "failed to write rule-set etag");
+                        tracing::warn!(error = %format!("{error:#}"), tag = %tag, "failed to write rule-set etag");
                     }
                     Some((tag, data))
                 }
                 Err(error) => {
                     tracing::warn!(
-                        %error,
+                        error = %format!("{error:#}"),
                         tag = %tag,
                         "failed to prefetch remote rule-set through http_client; falling back to direct download"
                     );
