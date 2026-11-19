@@ -1,6 +1,7 @@
 mod cache;
-mod message;
+mod codec;
 mod persistence;
+mod rules;
 pub(crate) mod transport;
 
 use anyhow::{Context, Result, bail};
@@ -19,16 +20,20 @@ use crate::singbox::DnsConfig;
 use crate::util::parse_duration;
 
 use self::cache::{CacheKey, CacheValue, DnsCache, Flight};
-use self::message::{
+use self::codec::{
     add_client_subnet, build_query, build_query_with_subnet, canonical_query, dns_id,
-    dns_rule_matches, local_response, normalize, optimistic_enabled, parse_client_subnet,
-    parse_https_ech, parse_question, parse_response, predefined_response, refused_response,
-    response_ttl, rewrite_response_ttls, validate_dns_rule, validate_response, validate_strategy,
+    local_response, normalize, optimistic_enabled, parse_client_subnet, parse_https_ech,
+    parse_question, parse_response, refused_response, response_ttl, rewrite_response_ttls,
+    validate_response, validate_strategy,
+};
+use self::rules::{
+    CompiledDnsRule, dns_rule_address_limit_matches, dns_rule_has_address_limit, dns_rule_matches,
+    parse_dns_record, parse_rcode, predefined_response, validate_dns_rule,
 };
 use self::transport::Upstream;
 
 #[cfg(feature = "fuzzing")]
-pub use self::message::fuzz_dns_message;
+pub use self::codec::fuzz_dns_message;
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -44,7 +49,7 @@ pub struct DnsResolver {
 }
 struct Inner {
     servers: HashMap<String, Arc<Upstream>>,
-    rules: Vec<self::message::CompiledDnsRule>,
+    rules: Vec<CompiledDnsRule>,
     final_tag: String,
     cache: Mutex<DnsCache>,
     flights: Mutex<HashMap<CacheKey, Arc<Flight>>>,
@@ -163,7 +168,7 @@ impl DnsResolver {
                 rules: config
                     .rules
                     .iter()
-                    .map(self::message::CompiledDnsRule::compile)
+                    .map(CompiledDnsRule::compile)
                     .collect::<Result<Vec<_>>>()?,
                 final_tag,
                 cache: Mutex::new(DnsCache::new(
@@ -323,14 +328,14 @@ impl DnsResolver {
             return refused_response(request, question_end);
         }
         if let Some(rule) = rule.filter(|rule| rule.raw.action.as_deref() == Some("predefined")) {
-            let rcode = self::message::parse_rcode(rule.raw.rcode.as_ref())?;
+            let rcode = parse_rcode(rule.raw.rcode.as_ref())?;
             let records = rule
                 .raw
                 .answer
                 .iter()
                 .chain(&rule.raw.ns)
                 .chain(&rule.raw.extra)
-                .map(|record| self::message::parse_dns_record(record))
+                .map(|record| parse_dns_record(record))
                 .collect::<Result<Vec<_>>>()?;
             return predefined_response(request, question_end, rcode, &records);
         }
@@ -454,7 +459,7 @@ impl DnsResolver {
             bail!("DNS lookup rejected by rule")
         }
         if let Some(rule) = rule.filter(|rule| rule.raw.action.as_deref() == Some("predefined")) {
-            let rcode = self::message::parse_rcode(rule.raw.rcode.as_ref())?;
+            let rcode = parse_rcode(rule.raw.rcode.as_ref())?;
             if rcode != 0 {
                 bail!("DNS lookup rejected by rule with rcode {rcode}")
             }
@@ -466,7 +471,7 @@ impl DnsResolver {
                 .chain(&rule.raw.ns)
                 .chain(&rule.raw.extra)
             {
-                let record = self::message::parse_dns_record(record)?;
+                let record = parse_dns_record(record)?;
                 match (qtype, record.kind) {
                     (1, 1) => {
                         let [a, b, c, d] = record.rdata[..] else {
@@ -570,14 +575,9 @@ impl DnsResolver {
         let Some(rule) = rule else {
             return Ok(addresses);
         };
-        let has_limit = self::message::dns_rule_has_address_limit(rule, rule_sets_guard.as_deref());
+        let has_limit = dns_rule_has_address_limit(rule, rule_sets_guard.as_deref());
         if has_limit
-            && !self::message::dns_rule_address_limit_matches(
-                rule,
-                name,
-                &addresses,
-                rule_sets_guard.as_deref(),
-            )
+            && !dns_rule_address_limit_matches(rule, name, &addresses, rule_sets_guard.as_deref())
         {
             tracing::debug!(%name, %qtype, "DNS response addresses rejected by rule-set address limit");
             bail!("DNS response rejected by rule-set address limit for {name}")
@@ -649,7 +649,7 @@ impl DnsResolver {
         }
     }
 
-    fn select_rule(&self, name: &str, qtype: u16) -> Option<&self::message::CompiledDnsRule> {
+    fn select_rule(&self, name: &str, qtype: u16) -> Option<&CompiledDnsRule> {
         let rule_sets = self
             .inner
             .rule_sets
@@ -687,17 +687,13 @@ pub struct EchHandle {
 }
 
 /// Shared, TTL-cached ECH config provider for outbounds whose ECH comes
-/// from DNS. `Clone` shares the underlying state, so one HTTPS query serves
-/// every connection of every outbound using the same domain, with
-/// singleflight refresh on expiry.
-type EchState = Arc<Mutex<Option<(Vec<u8>, std::time::Instant)>>>;
-
+/// from DNS. `Clone` shares the underlying resolver, so one HTTPS query
+/// serves every connection of every outbound using the same domain, with
+/// singleflight refresh on expiry via the shared DNS cache.
 #[derive(Clone)]
 pub struct EchCache {
     resolver: DnsResolver,
     domain: String,
-    state: EchState,
-    flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl EchHandle {
@@ -717,8 +713,6 @@ impl EchHandle {
         EchCache {
             resolver: self.resolver.clone(),
             domain: self.domain.clone(),
-            state: Arc::new(Mutex::new(None)),
-            flight: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -732,27 +726,7 @@ impl EchCache {
     /// Resolve the current ECH config. The HTTPS record TTL bounds how long
     /// a fetched config is reused; concurrent refreshes share one query.
     pub async fn config(&self) -> Result<Vec<u8>> {
-        {
-            let state = self.state.lock().expect("ECH cache lock poisoned");
-            if let Some((config, expires)) = state.as_ref()
-                && *expires > std::time::Instant::now()
-            {
-                return Ok(config.clone());
-            }
-        }
-        let _guard = self.flight.lock().await;
-        if let Some((config, expires)) =
-            self.state.lock().expect("ECH cache lock poisoned").as_ref()
-            && *expires > std::time::Instant::now()
-        {
-            return Ok(config.clone());
-        }
-        let (config, ttl) = self.resolver.ech_config(&self.domain).await?;
-        *self.state.lock().expect("ECH cache lock poisoned") = Some((
-            config.clone(),
-            std::time::Instant::now() + ttl.max(Duration::from_secs(1)),
-        ));
-        Ok(config)
+        self.resolver.cached_ech_config(&self.domain).await
     }
 }
 
@@ -824,12 +798,12 @@ mod tests {
             domain_regex: vec![r"^api\d+\.example$".into()],
             ..Default::default()
         };
-        let compiled = self::message::CompiledDnsRule::compile(&rule).unwrap();
+        let compiled = CompiledDnsRule::compile(&rule).unwrap();
         assert!(dns_rule_matches(&compiled, "api12.example", 65, None));
         assert!(!dns_rule_matches(&compiled, "api12.example", 1, None));
         assert!(!dns_rule_matches(&compiled, "www.example", 65, None));
         assert!(dns_rule_matches(
-            &self::message::CompiledDnsRule::compile(&DnsRule {
+            &CompiledDnsRule::compile(&DnsRule {
                 invert: true,
                 ..rule
             })
@@ -892,7 +866,7 @@ mod tests {
     }
     #[test]
     fn rule_suffix() {
-        let r = self::message::CompiledDnsRule::compile(&DnsRule {
+        let r = CompiledDnsRule::compile(&DnsRule {
             domain_suffix: vec!["example.com".into()],
             ..Default::default()
         })
@@ -1173,7 +1147,7 @@ mod tests {
         sets.insert("geosite-cn".into(), set);
         let rule_sets = Arc::new(RwLock::new(sets));
 
-        let rule = self::message::CompiledDnsRule::compile(&DnsRule {
+        let rule = CompiledDnsRule::compile(&DnsRule {
             rule_set: vec!["geosite-cn".into()],
             server: Some("dns_local".into()),
             ..Default::default()

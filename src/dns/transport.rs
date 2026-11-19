@@ -19,7 +19,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::singbox::DnsServer;
 
-use super::message::dns_id;
+use super::codec::dns_id;
 use super::{DNS_TIMEOUT, MAX_DNS_MESSAGE, STREAM_IDLE_TIMEOUT, STREAM_POOL_SIZE};
 
 pub(crate) type DetourUdpFuture<'a> =

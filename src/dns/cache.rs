@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
-use super::message::age_response_ttls;
+use super::codec::age_response_ttls;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) enum CacheKey {
@@ -373,7 +373,7 @@ mod tests {
         let CacheValue::Wire(first_bytes) = first else {
             panic!()
         };
-        let ttl_offsets = super::super::message::ttl_offsets(&first_bytes).unwrap();
+        let ttl_offsets = super::super::codec::ttl_offsets(&first_bytes).unwrap();
         assert_eq!(ttl_offsets[0].2, 100);
         // Force expiry of the entry and confirm it is gone.
         std::thread::sleep(Duration::from_millis(5));

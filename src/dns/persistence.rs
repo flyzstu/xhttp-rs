@@ -9,7 +9,7 @@ use std::{
 };
 
 use super::cache::{CacheKey, CacheValue, DnsCache, PersistentCache};
-use super::message::parse_response;
+use super::codec::parse_response;
 
 /// Sub-bucket reserved for entries resolved via the local resolver (`server: None`).
 ///
@@ -267,7 +267,7 @@ fn save_boltdb(
                     super::cache::PersistentKey::Wire { query, server },
                     super::cache::PersistentValue::Wire(wire),
                 ) => {
-                    if let Ok((name, qtype, _)) = super::message::parse_question(query) {
+                    if let Ok((name, qtype, _)) = super::codec::parse_question(query) {
                         (
                             qtype,
                             std::borrow::Cow::Owned(name),
@@ -297,7 +297,7 @@ fn save_boltdb(
             let ttl = entry.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32;
             let wire_bytes: std::borrow::Cow<'_, [u8]> = if let Some(wire) = wire_opt {
                 std::borrow::Cow::Borrowed(wire)
-            } else if let Ok(built) = super::message::build_response(&name, qtype, addresses, ttl) {
+            } else if let Ok(built) = super::codec::build_response(&name, qtype, addresses, ttl) {
                 std::borrow::Cow::Owned(built)
             } else {
                 continue;
@@ -416,7 +416,7 @@ mod tests {
         query.extend_from_slice(&1u16.to_be_bytes());
         query.extend_from_slice(&1u16.to_be_bytes());
 
-        let wire_response = super::super::message::build_response(
+        let wire_response = super::super::codec::build_response(
             "rust-lang.org",
             1,
             &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
