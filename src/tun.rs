@@ -21,6 +21,47 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+// Linux route/redirect guards are compiled only on Linux. TUN inbound itself
+// is Linux-only (from_inbound() bails elsewhere), but these types must still
+// resolve on other platforms so the module compiles. The stubs are inert:
+// no code path reaches them because TUN never runs off Linux.
+#[cfg(target_os = "linux")]
+use crate::tun_redirect_linux::LinuxTunRedirect;
+#[cfg(target_os = "linux")]
+use crate::tun_route_linux::LinuxTunRoutes;
+
+#[cfg(not(target_os = "linux"))]
+mod platform_guards {
+    use anyhow::Result;
+
+    use crate::tun::TunConfig;
+
+    pub struct LinuxTunRedirect;
+
+    impl LinuxTunRedirect {
+        pub(crate) fn install(_config: &TunConfig, _port: Option<u16>) -> Result<Self> {
+            Ok(Self)
+        }
+        pub(crate) fn replace_route_sets(&self, _config: &TunConfig) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    pub struct LinuxTunRoutes;
+
+    impl LinuxTunRoutes {
+        pub(crate) fn install(_config: &TunConfig) -> Result<Self> {
+            Ok(Self)
+        }
+        pub(crate) fn replace(&mut self, _config: &TunConfig) -> Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+use platform_guards::{LinuxTunRedirect, LinuxTunRoutes};
+
 const DEFAULT_MTU: u16 = 9000;
 const MAX_PACKET_SIZE: usize = 65_535;
 
@@ -392,12 +433,12 @@ pub async fn run(
     let redirect_port = redirect_server.as_ref().map(|server| server.port());
     let redirect_guard = config
         .auto_redirect
-        .then(|| crate::tun_redirect_linux::LinuxTunRedirect::install(&config, redirect_port))
+        .then(|| LinuxTunRedirect::install(&config, redirect_port))
         .transpose()?
         .map(|guard| Arc::new(Mutex::new(guard)));
     let route_guard = config
         .auto_route
-        .then(|| crate::tun_route_linux::LinuxTunRoutes::install(&config))
+        .then(|| LinuxTunRoutes::install(&config))
         .transpose()?
         .map(|guard| Arc::new(Mutex::new(guard)));
     let (stack, runner, udp, tcp) = StackBuilder::default()
@@ -487,8 +528,8 @@ pub async fn run(
 }
 
 struct TunRuntimeTasks {
-    redirect: Option<Arc<Mutex<crate::tun_redirect_linux::LinuxTunRedirect>>>,
-    routes: Option<Arc<Mutex<crate::tun_route_linux::LinuxTunRoutes>>>,
+    redirect: Option<Arc<Mutex<LinuxTunRedirect>>>,
+    routes: Option<Arc<Mutex<LinuxTunRoutes>>>,
     tasks: tokio::task::JoinSet<Result<()>>,
 }
 
@@ -501,8 +542,8 @@ async fn run_rule_set_updater(
     exclude_tags: Vec<String>,
     route_config: RouteConfig,
     runtime: Arc<ProxyRuntime>,
-    routes: Option<Weak<Mutex<crate::tun_route_linux::LinuxTunRoutes>>>,
-    redirect: Option<Weak<Mutex<crate::tun_redirect_linux::LinuxTunRedirect>>>,
+    routes: Option<Weak<Mutex<LinuxTunRoutes>>>,
+    redirect: Option<Weak<Mutex<LinuxTunRedirect>>>,
 ) -> Result<()> {
     let interval = route_config
         .rule_set
