@@ -2,6 +2,34 @@
 
 All notable changes to xhttp-rs are documented in this file.
 
+## [0.2.0] - 2026-11-19
+
+### Added
+
+- Linux `redirect` inbound: native TCP transparent proxy using
+  `SO_ORIGINAL_DST`, usable standalone or as TUN `auto_redirect`'s internal
+  listener; nftables NAT rules redirect TCP while UDP/ICMP keep the
+  route-marking path.
+- Configurable h1 downlink pending window (`h1_max_pending_bytes`) and
+  coalescing delay (`h1_coalesce_delay_ms`).
+- Persistent DNS cache and selector choices in a BoltDB `cache_file`, with
+  symmetric storage of local-resolver `None` entries.
+
+### Fixed
+
+- H1 packet-up download now survives GET loss: a large backlog no longer
+  deadlocks the attach GET, and the download cannot lose already-buffered
+  chunks. Cancelling a singleflight leader no longer strands its followers.
+- DNS `ipv4_only`/`ipv6_only` strategies answer empty NOERROR when the queried
+  type is excluded; BoltDB persistence no longer downgrades a real `dns_local`
+  selector to the absent-entry sentinel.
+- TLS trusts pinned leaf certificates from `ca_pem` alongside WebPKI, while
+  still verifying `server_name` on an exact pin match.
+- Local rule-set fetch hosts resolve through the bootstrap resolver; outbound
+  connection pools stay warm with shorter idle timeouts.
+- SSE responses with no explicit header no longer expose a misleading
+  `content-type`.
+
 ## [0.1.2] - 2026-08-15
 
 ### Added
@@ -131,5 +159,6 @@ First public preview release.
 - Android-specific TUN filters, explicit network namespaces, loopback address
   remapping, and Tailscale integration are not included in this release.
 
+[0.2.0]: https://github.com/flyzstu/xhttp-rs/releases/tag/v0.2.0
 [0.1.1]: https://github.com/flyzstu/xhttp-rs/releases/tag/v0.1.1
 [0.1.0]: https://github.com/flyzstu/xhttp-rs/releases/tag/v0.1.0
