@@ -18,6 +18,8 @@ RUN mkdir -p src benches \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/dns.rs \
     && echo "fn main() {}" > benches/routing.rs \
+    && echo "fn main() {}" > benches/protocol.rs \
+    && echo "fn main() {}" > benches/vless.rs \
     && cargo build --release --bin xhttp \
     && rm -rf src benches
 
