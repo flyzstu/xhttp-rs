@@ -237,7 +237,9 @@ fn build_request_base(config: &ClientConfig) -> Result<RequestBase> {
 fn build_http_client(config: &ClientConfig) -> Result<HttpClient> {
     let mut b = HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(300));
+        .pool_idle_timeout(Duration::from_secs(45))
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(Duration::from_secs(15));
     if config.transport.xmux.h_keep_alive_period > 0 {
         b = b.tcp_keepalive(Duration::from_secs(
             config.transport.xmux.h_keep_alive_period,
