@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use rustls::client::verify_server_name;
 use rustls::{
     DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{
         CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName, UnixTime, pem::PemObject,
     },
+    server::ParsedCertificate,
 };
 use sha2::{Digest, Sha256};
 use std::{fmt, sync::Arc};
@@ -296,6 +298,12 @@ impl ServerCertVerifier for PinnedOrWebPkiVerifier {
             .iter()
             .any(|pinned| pinned.as_ref() == end_entity.as_ref())
         {
+            // An exact leaf pin skips chain validation, but hostname verification
+            // still applies: sing-box checks server_name even with a pinned cert.
+            let parsed = ParsedCertificate::try_from(end_entity).map_err(|error| {
+                rustls::Error::General(format!("parse pinned certificate: {error}"))
+            })?;
+            verify_server_name(&parsed, server_name)?;
             return Ok(ServerCertVerified::assertion());
         }
         self.webpki
@@ -446,6 +454,17 @@ mod tests {
                     rustls::pki_types::UnixTime::now(),
                 )
                 .is_ok()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &cert_der,
+                    &[],
+                    &ServerName::try_from("wrong.invalid").unwrap(),
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
+                .is_err()
         );
 
         let rcgen::CertifiedKey {
