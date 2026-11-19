@@ -22,14 +22,19 @@ pub fn is_boltdb_file(path: &Path) -> bool {
     if path.extension().and_then(|s| s.to_str()) == Some("db") {
         return true;
     }
-    if let Ok(bytes) = std::fs::read(path)
-        && bytes.len() >= 32
-    {
-        let magic = &bytes[16..20];
-        return magic == [0xed, 0x0c, 0xda, 0xed]
-            || magic == [0xed, 0xda, 0x0c, 0xed]
-            || magic == [0x5c, 0xaf, 0xf0, 0x1d]
-            || magic == [0x1d, 0xf0, 0xaf, 0x5c];
+    // Only the first 32 bytes matter (BoltDB magic lives at offset 16).
+    // Reading the whole file on every load/save would copy the entire cache
+    // database just to inspect four bytes.
+    use std::io::Read as _;
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let mut header = [0u8; 32];
+        if file.read_exact(&mut header).is_ok() {
+            let magic = &header[16..20];
+            return magic == [0xed, 0x0c, 0xda, 0xed]
+                || magic == [0xed, 0xda, 0x0c, 0xed]
+                || magic == [0x5c, 0xaf, 0xf0, 0x1d]
+                || magic == [0x1d, 0xf0, 0xaf, 0x5c];
+        }
     }
     false
 }
