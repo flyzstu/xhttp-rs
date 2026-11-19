@@ -68,3 +68,26 @@ XHTTP_BENCH_CLIENT=./target/release/xhttp python3 tests/bench_xhttp_box.py \
 - **lax2 三模式都在 1.1 MB/s**：该主机链路就是瓶颈，隧道开销被淹没，三模式无差异。
 - **direct 基线同样抖动**（iad 3.11–6.82、lax 2.76–5.86）：跨境公网带宽随时刻变化，
    tunnel/direct 比值应看作量级比较，不是严格受控实验。
+
+## 对照：本机 xhttp-rs server（同法测试）
+
+按用户要求，在本地起一个 xhttp-rs 进程跑同样的对比，用来看**纯隧道开销**（无公网链路
+噪声）。配置：本机 `xhttp-rs` server 同时开 xhttp :18080 / anytls :18443（自签证书），
+本机 range-capable HTTP 文件服务 :18180 提供 100 MB 文件；`xhttp-rs` client 经各自 SOCKS
+入站连到本机 server，下载 20 MB × 3 次取中位数。全部走 127.0.0.1，绕开 TUN。
+
+| 模式 | 吞吐中位数 | 相对 direct |
+|---|---:|---:|
+| direct（无代理） | 3189 MB/s | 100% |
+| xhttp-packet-up | 282 MB/s  | 8.8%  |
+| anytls          | 657 MB/s  | 20.6% |
+
+**重要前提**：xhttp server 的 `h1_max_pending_bytes` 必须调大（实测设为 64 MiB）。默认
+2 MiB 时，下载在 ~2 MiB 处停住（curl 超时只收到 2097099 字节）——这是该参数的背压上限，
+不是死锁；调大后 8 MB 下载立刻恢复到 137 MB/s。因此**真实链路基准里 xhttp 远低于
+direct，除公网开销外，默认 2 MiB 背压窗口也是重要因素**（每次 GET 只能预取 2 MiB，
+受限于 ACK 往返）。
+
+本机对照与真实链路的比值不能直接相减：本机 direct 是内存级 3.2 GB/s，隧道在如此高的基线
+下占比自然很小；真实链路 direct 只有 1–7 MB/s，隧道封装与握手开销占比被放大。但两者一致地
+显示：**xhttp 的开销显著大于 anytls**（本机 8.8% vs 20.6%，真实链路 43–62% vs 波动 57–377%）。
