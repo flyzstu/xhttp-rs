@@ -91,9 +91,15 @@ pub fn build_client_config(options: &ClientOptions) -> Result<Arc<rustls::Client
             bail!("no native TLS roots are available")
         }
     }
-    if let Some(pem) = &options.ca_pem {
-        add_ca_pem(&mut roots, pem)?;
-    }
+    let pinned_certs = if let Some(pem) = &options.ca_pem {
+        let certs = parse_certificates(pem)?;
+        for cert in &certs {
+            roots.add(cert.clone()).ok();
+        }
+        certs
+    } else {
+        Vec::new()
+    };
 
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone());
     let builder = if let Some(raw) = &options.ech_config {
@@ -111,6 +117,19 @@ pub fn build_client_config(options: &ClientOptions) -> Result<Arc<rustls::Client
             .with_custom_certificate_verifier(Arc::new(DirectCertificateVerifier {
                 pins: options.certificate_public_key_sha256.clone(),
                 algorithms: provider.signature_verification_algorithms,
+            }))
+    } else if !pinned_certs.is_empty() {
+        let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .context("build WebPKI verifier")?;
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedOrWebPkiVerifier {
+                pinned_certs,
+                webpki,
             }))
     } else {
         builder.with_root_certificates(roots)
@@ -175,20 +194,6 @@ pub fn decode_public_key_pins(values: &[String]) -> Result<Vec<[u8; 32]>> {
             })
         })
         .collect()
-}
-
-fn add_ca_pem(roots: &mut rustls::RootCertStore, pem: &[u8]) -> Result<()> {
-    let mut added = 0usize;
-    for certificate in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)) {
-        roots
-            .add(certificate?)
-            .context("add custom CA certificate")?;
-        added += 1;
-    }
-    if added == 0 {
-        bail!("custom CA input contains no certificates")
-    }
-    Ok(())
 }
 
 fn parse_certificates(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
@@ -271,6 +276,57 @@ impl fmt::Display for DirectCertificateVerifier {
     }
 }
 
+#[derive(Debug)]
+struct PinnedOrWebPkiVerifier {
+    pinned_certs: Vec<CertificateDer<'static>>,
+    webpki: Arc<dyn ServerCertVerifier>,
+}
+
+impl ServerCertVerifier for PinnedOrWebPkiVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        if self
+            .pinned_certs
+            .iter()
+            .any(|pinned| pinned.as_ref() == end_entity.as_ref())
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.webpki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki
+            .verify_tls12_signature(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.webpki
+            .verify_tls13_signature(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.webpki.supported_verify_schemes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,7 +359,10 @@ mod tests {
             select_protocol_versions(Some(0x0304), Some(0x0303)).len(),
             0
         );
-        assert_eq!(select_protocol_versions(Some(0x0303), Some(0x0304)).len(), 2);
+        assert_eq!(
+            select_protocol_versions(Some(0x0303), Some(0x0304)).len(),
+            2
+        );
     }
 
     #[test]
@@ -329,5 +388,95 @@ mod tests {
         })
         .unwrap();
         assert!(config.enable_sni);
+    }
+
+    #[test]
+    fn pinned_leaf_certificate_is_trusted() {
+        let rcgen::CertifiedKey { cert, key_pair: _ } =
+            rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+
+        #[derive(Debug)]
+        struct RejectVerifier;
+        impl ServerCertVerifier for RejectVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+                Err(rustls::Error::General("untrusted".into()))
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _certificate: &CertificateDer<'_>,
+                _signature: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Err(rustls::Error::General("untrusted".into()))
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _certificate: &CertificateDer<'_>,
+                _signature: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+                Err(rustls::Error::General("untrusted".into()))
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![]
+            }
+        }
+
+        let verifier = PinnedOrWebPkiVerifier {
+            pinned_certs: vec![cert_der.clone()],
+            webpki: Arc::new(RejectVerifier),
+        };
+
+        let server_name = ServerName::try_from("example.com").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &cert_der,
+                    &[],
+                    &server_name,
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
+                .is_ok()
+        );
+
+        let rcgen::CertifiedKey {
+            cert: other_cert,
+            key_pair: _,
+        } = rcgen::generate_simple_self_signed(vec!["other.com".into()]).unwrap();
+        let other_der = CertificateDer::from(other_cert.der().to_vec());
+        assert!(
+            verifier
+                .verify_server_cert(
+                    &other_der,
+                    &[],
+                    &server_name,
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn build_client_config_with_pinned_leaf_cert() {
+        let rcgen::CertifiedKey { cert, key_pair: _ } =
+            rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let cert_pem = cert.pem();
+
+        let options = ClientOptions {
+            ca_pem: Some(cert_pem.into_bytes()),
+            ..Default::default()
+        };
+        let config = build_client_config(&options);
+        assert!(config.is_ok());
     }
 }
