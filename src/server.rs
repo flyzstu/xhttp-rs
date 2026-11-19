@@ -371,8 +371,6 @@ fn attach_kill_stream<S>(
 where
     S: futures_util::Stream,
 {
-    #[allow(unused_imports)]
-    use tokio_stream::StreamExt as _;
     stream.take_until(kill)
 }
 
