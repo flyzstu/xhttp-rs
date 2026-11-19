@@ -1,9 +1,8 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -17,121 +16,28 @@ use axum::{
     routing::any,
 };
 use bytes::{Buf, BytesMut};
-use dashmap::{DashMap, mapref::entry::Entry};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, Notify, mpsc, oneshot},
+    sync::{mpsc, oneshot},
 };
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{config::ServerConfig, protocol, vless};
 
+mod session;
+
+pub(crate) use session::{Packet, Session, attach_kill_stream, get_session};
+
 #[derive(Clone)]
 pub struct Server {
     state: Arc<ServerState>,
 }
-struct ServerState {
+pub(crate) struct ServerState {
     config: ServerConfig,
     sessions: DashMap<String, Arc<Session>>,
     active_sessions: AtomicUsize,
-}
-struct Session {
-    sender: mpsc::Sender<Packet>,
-    downlink: Arc<Mutex<DownlinkState>>,
-    connected: AtomicBool,
-}
-
-/// Downstream delivery state for one session.
-///
-/// Every byte the backend produced between `acked` (contiguous position the
-/// client confirmed) and `total` (position produced so far) stays buffered in
-/// `chunks` until acknowledged. Delivery is by range: a GET attachment or a
-/// POST piggyback both snapshot "everything from X" and label the response
-/// with `x-dl-from: X`, so the client can deduplicate and reassemble regardless
-/// of which path delivered a given byte, and no byte is ever lost unless the
-/// client confirmed it first. This is what makes GET reattachment safe.
-struct DownlinkState {
-    /// `(start_offset, data)` with strictly increasing starts. The head may
-    /// start below `acked` (partially acknowledged chunk); consumers trim it.
-    chunks: VecDeque<(u64, Bytes)>,
-    /// Next offset the backend read loop will produce.
-    total: u64,
-    /// Contiguous downstream position confirmed received by the client.
-    acked: u64,
-    max_pending_bytes: usize,
-    /// Current GET consumer: `(generation, channel into the response body)`.
-    active: Option<(u64, mpsc::Sender<Result<Bytes, std::io::Error>>)>,
-    /// Offsets at or above this value are streamed to the live GET directly;
-    /// everything below was already included in its attach snapshot.
-    deliver_from: u64,
-    /// Dropping this sender aborts the previous GET response body.
-    kill: Option<oneshot::Sender<()>>,
-    /// Set once the backend stream ended; `chunks` may still hold data.
-    backend_closed: bool,
-    /// Bumped on every GET attachment; the producer snapshots it so it can
-    /// detect consumer changes without holding the lock across awaits.
-    generation: u64,
-    /// Wakes the producer when acknowledgements free buffer space.
-    ack_notify: Arc<Notify>,
-}
-
-impl DownlinkState {
-    fn new(max_pending_bytes: usize) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            total: 0,
-            acked: 0,
-            max_pending_bytes,
-            active: None,
-            deliver_from: 0,
-            kill: None,
-            backend_closed: false,
-            generation: 0,
-            ack_notify: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Record a client acknowledgement. Claims beyond `total` are clamped and
-    /// the value never regresses; fully acknowledged chunks are dropped.
-    fn acknowledge(&mut self, claim: u64) {
-        self.acked = self.acked.max(claim.min(self.total));
-        while let Some((offset, chunk)) = self.chunks.front() {
-            if *offset + chunk.len() as u64 <= self.acked {
-                self.chunks.pop_front();
-            } else {
-                break;
-            }
-        }
-        self.ack_notify.notify_waiters();
-    }
-
-    /// Snapshot the buffered bytes for delivery starting exactly at `from`.
-    /// The concatenation of the returned pieces is exactly `[from, ..)`; a
-    /// head chunk straddling `from` is trimmed so the first piece starts at
-    /// `from` and the client can place the range without re-alignment.
-    fn snapshot_from(&self, from: u64) -> Vec<Bytes> {
-        let mut pieces = Vec::new();
-        for (offset, chunk) in &self.chunks {
-            let end = *offset + chunk.len() as u64;
-            if end <= from {
-                continue;
-            }
-            if *offset < from {
-                let skip = (from - *offset) as usize;
-                if skip < chunk.len() {
-                    pieces.push(chunk.slice(skip..));
-                }
-            } else {
-                pieces.push(chunk.clone());
-            }
-        }
-        pieces
-    }
-}
-struct Packet {
-    sequence: u64,
-    payload: Bytes,
 }
 
 impl Server {
@@ -362,18 +268,6 @@ async fn stream_one(state: Arc<ServerState>, request: Request) -> Response {
     stream_response(read)
 }
 
-/// End a response body stream as soon as `kill` resolves. Used to terminate
-/// a superseded GET consumer without tearing down the session.
-fn attach_kill_stream<S>(
-    stream: S,
-    kill: oneshot::Receiver<()>,
-) -> impl futures_util::Stream<Item = S::Item>
-where
-    S: futures_util::Stream,
-{
-    stream.take_until(kill)
-}
-
 async fn download(state: Arc<ServerState>, id: String, headers: HeaderMap) -> Response {
     let Some(session) = get_session(&state, &id) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -385,7 +279,7 @@ async fn download(state: Arc<ServerState>, id: String, headers: HeaderMap) -> Re
     // full channel no matter how large the backlog is; the snapshot is
     // delivered as the first segment of the response body.
     let ack = headers
-        .get("x-dl-ack")
+        .get(protocol::HEADER_DL_ACK)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
@@ -413,8 +307,8 @@ async fn download(state: Arc<ServerState>, id: String, headers: HeaderMap) -> Re
     let Some((rx, kill_rx)) = attached else {
         return Response::builder()
             .status(StatusCode::OK)
-            .header("x-session-status", "closed")
-            .header("x-dl-from", from.to_string())
+            .header(protocol::HEADER_SESSION_STATUS, "closed")
+            .header(protocol::HEADER_DL_FROM, from.to_string())
             .header("cache-control", "no-store")
             .header("x-accel-buffering", "no")
             .header("content-type", "text/event-stream")
@@ -428,8 +322,8 @@ async fn download(state: Arc<ServerState>, id: String, headers: HeaderMap) -> Re
     );
     Response::builder()
         .status(StatusCode::OK)
-        .header("x-dl-from", from.to_string())
-        .header("x-session-status", "streaming")
+        .header(protocol::HEADER_DL_FROM, from.to_string())
+        .header(protocol::HEADER_SESSION_STATUS, "streaming")
         .header("cache-control", "no-store")
         .header("x-accel-buffering", "no")
         .header("content-type", "text/event-stream")
@@ -444,8 +338,10 @@ async fn packet_upload(
     request: Request,
 ) -> Response {
     let headers = request.headers().clone();
-    let client_wants_piggyback =
-        headers.get("x-h1-piggyback").and_then(|v| v.to_str().ok()) == Some("1");
+    let client_wants_piggyback = headers
+        .get(protocol::HEADER_H1_PIGGYBACK)
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
 
     let body =
         match axum::body::to_bytes(request.into_body(), state.config.transport.max_packet_size)
@@ -476,7 +372,7 @@ async fn packet_upload(
 
     if state.config.transport.h1_enable_piggyback && client_wants_piggyback {
         let dl_ack = headers
-            .get("x-dl-ack")
+            .get(protocol::HEADER_DL_ACK)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
@@ -514,7 +410,7 @@ async fn packet_upload(
             return Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/octet-stream")
-                .header("x-dl-from", from.to_string())
+                .header(protocol::HEADER_DL_FROM, from.to_string())
                 .body(Body::from(payload))
                 .unwrap();
         }
@@ -551,175 +447,6 @@ async fn stream_upload(state: Arc<ServerState>, id: String, request: Request) ->
     response(Body::from_stream(ReceiverStream::new(rx)))
 }
 
-fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
-    if id.len() > state.config.transport.max_session_id_length {
-        return None;
-    }
-    if let Some(v) = state.sessions.get(id) {
-        return Some(v.clone());
-    }
-    if state
-        .active_sessions
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            (value < state.config.transport.max_sessions).then_some(value + 1)
-        })
-        .is_err()
-    {
-        return None;
-    }
-    let (sender, mut receiver) =
-        mpsc::channel::<Packet>(state.config.transport.max_buffered_packets);
-    let downlink = Arc::new(Mutex::new(DownlinkState::new(
-        state.config.transport.h1_max_pending_bytes,
-    )));
-    let session = Arc::new(Session {
-        sender,
-        downlink: downlink.clone(),
-        connected: AtomicBool::new(false),
-    });
-    match state.sessions.entry(id.to_owned()) {
-        Entry::Occupied(v) => {
-            state.active_sessions.fetch_sub(1, Ordering::AcqRel);
-            return Some(v.get().clone());
-        }
-        Entry::Vacant(v) => {
-            v.insert(session.clone());
-        }
-    }
-
-    let front = backend(state);
-    let (mut backend_read, mut backend_write) = tokio::io::split(front);
-
-    let state_upload = Arc::downgrade(state);
-    let id_upload = id.to_owned();
-    let max_buffered = state.config.transport.max_buffered_packets;
-
-    tokio::spawn(async move {
-        let mut pending = BTreeMap::new();
-        let mut next = 0;
-        while let Some(packet) = receiver.recv().await {
-            if packet.sequence < next {
-                continue;
-            }
-            if pending.len() >= max_buffered && !pending.contains_key(&packet.sequence) {
-                if let Some(state) = state_upload.upgrade() {
-                    remove_session(&state, &id_upload);
-                }
-                return;
-            }
-            pending.insert(packet.sequence, packet.payload);
-            while let Some(payload) = pending.remove(&next) {
-                if backend_write.write_all(&payload).await.is_err() {
-                    if let Some(state) = state_upload.upgrade() {
-                        remove_session(&state, &id_upload);
-                    }
-                    return;
-                }
-
-                next += 1;
-            }
-        }
-        let _ = backend_write.shutdown().await;
-    });
-
-    let downlink_for_read = downlink;
-    let state_downlink = Arc::downgrade(state);
-    let id_downlink = id.to_owned();
-    tokio::spawn(async move {
-        let mut buffer = BytesMut::with_capacity(32 * 1024);
-        'read: loop {
-            // Backpressure: pause reading while the unacknowledged window is
-            // full. The lock is never held across the wait.
-            while {
-                let dl = downlink_for_read.lock().await;
-                dl.total - dl.acked > dl.max_pending_bytes as u64
-            } {
-                let notify = downlink_for_read.lock().await.ack_notify.clone();
-                tokio::select! {
-                    _ = notify.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-            }
-            buffer.clear();
-            match backend_read.read_buf(&mut buffer).await {
-                Ok(0) => break 'read,
-                Ok(_) => {
-                    let chunk = buffer.split().freeze();
-                    // Append to the range store, then hand the chunk to the
-                    // live GET if it falls into that consumer's range. The
-                    // send happens OUTSIDE the lock so a stalled consumer
-                    // cannot block attaches or piggyback handling; on
-                    // consumer death the chunk stays buffered and is
-                    // re-delivered by the next attach.
-                    let target = {
-                        let mut dl = downlink_for_read.lock().await;
-                        let offset = dl.total;
-                        dl.total += chunk.len() as u64;
-                        dl.chunks.push_back((offset, chunk.clone()));
-                        dl.active
-                            .as_ref()
-                            .filter(|_| offset >= dl.deliver_from)
-                            .map(|(generation, tx)| (*generation, tx.clone()))
-                    };
-                    if let Some((generation, tx)) = target {
-                        let send_failed = tx.send(Ok(chunk)).await.is_err();
-                        if send_failed {
-                            let mut dl = downlink_for_read.lock().await;
-                            if dl.active.as_ref().is_some_and(|(g, _)| *g == generation) {
-                                dl.active = None;
-                                dl.kill = None;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let target = {
-                        let mut dl = downlink_for_read.lock().await;
-                        let active = dl.active.take();
-                        let kill = dl.kill.take();
-                        active.map(|(_, tx)| (tx, kill))
-                    };
-                    if let Some((tx, _)) = target {
-                        let _ = tx.send(Err(e)).await;
-                    }
-                    break 'read;
-                }
-            }
-        }
-        {
-            let mut dl = downlink_for_read.lock().await;
-            dl.backend_closed = true;
-            dl.active = None;
-            dl.kill = None;
-        }
-        if let Some(state) = state_downlink.upgrade() {
-            let timeout = state.config.transport.session_timeout();
-            tokio::time::sleep(timeout).await;
-            remove_session(&state, &id_downlink);
-        }
-    });
-
-    let weak = Arc::downgrade(state);
-    let id = id.to_owned();
-    let timeout = state.config.transport.session_timeout();
-    tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        if let Some(state) = weak.upgrade()
-            && state
-                .sessions
-                .get(&id)
-                .is_some_and(|v| !v.connected.load(Ordering::Acquire))
-        {
-            remove_session(&state, &id);
-        }
-    });
-    Some(session)
-}
-fn remove_session(state: &ServerState, id: &str) {
-    if state.sessions.remove(id).is_some() {
-        state.active_sessions.fetch_sub(1, Ordering::AcqRel);
-    }
-}
 fn valid_path(base: &str, path: &str) -> bool {
     path == base || path.strip_prefix(base).is_some_and(|v| v.starts_with('/'))
 }
@@ -808,6 +535,7 @@ fn response(body: Body) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::session::{DownlinkState, remove_session};
     use super::*;
     use crate::{
         Client,
@@ -1336,7 +1064,7 @@ mod tests {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/xhttp/piggy-test/0")
-            .header("x-h1-piggyback", "1")
+            .header(protocol::HEADER_H1_PIGGYBACK, "1")
             .header("content-type", "application/octet-stream")
             .body(Body::from(vec![1, 2, 3]))
             .unwrap();
@@ -1348,7 +1076,10 @@ mod tests {
             "application/octet-stream"
         );
         assert!(response.headers().get("x-ack-seq").is_none());
-        assert_eq!(response.headers().get("x-dl-from").unwrap(), "0");
+        assert_eq!(
+            response.headers().get(protocol::HEADER_DL_FROM).unwrap(),
+            "0"
+        );
         let body_bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
@@ -1422,10 +1153,13 @@ mod tests {
         // Reconnect GET stream with the same session id, acknowledging chunk1
         // (the resumed response must start exactly after the acked offset).
         let mut ack_headers = HeaderMap::new();
-        ack_headers.insert("x-dl-ack", axum::http::HeaderValue::from_static("6"));
+        ack_headers.insert(
+            protocol::HEADER_DL_ACK,
+            axum::http::HeaderValue::from_static("6"),
+        );
         let res2 = download(server.state.clone(), "resume-test".into(), ack_headers).await;
         assert_eq!(res2.status(), StatusCode::OK);
-        assert_eq!(res2.headers().get("x-dl-from").unwrap(), "6");
+        assert_eq!(res2.headers().get(protocol::HEADER_DL_FROM).unwrap(), "6");
         let mut body2 = res2.into_body().into_data_stream();
         let chunk2 = body2.next().await.unwrap().unwrap();
         assert_eq!(chunk2.as_ref(), b"chunk2");
@@ -1608,9 +1342,12 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut ack11 = HeaderMap::new();
-        ack11.insert("x-dl-ack", axum::http::HeaderValue::from_static("11"));
+        ack11.insert(
+            protocol::HEADER_DL_ACK,
+            axum::http::HeaderValue::from_static("11"),
+        );
         let get2 = download(server.state.clone(), "multi-resume-test".into(), ack11).await;
-        assert_eq!(get2.headers().get("x-dl-from").unwrap(), "11");
+        assert_eq!(get2.headers().get(protocol::HEADER_DL_FROM).unwrap(), "11");
         let mut body2 = get2.into_body().into_data_stream();
         assert_eq!(
             read_exact_stream(&mut body2, 10).await.as_slice(),
@@ -1630,9 +1367,12 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut ack21 = HeaderMap::new();
-        ack21.insert("x-dl-ack", axum::http::HeaderValue::from_static("21"));
+        ack21.insert(
+            protocol::HEADER_DL_ACK,
+            axum::http::HeaderValue::from_static("21"),
+        );
         let get3 = download(server.state.clone(), "multi-resume-test".into(), ack21).await;
-        assert_eq!(get3.headers().get("x-dl-from").unwrap(), "21");
+        assert_eq!(get3.headers().get(protocol::HEADER_DL_FROM).unwrap(), "21");
         let mut body3 = get3.into_body().into_data_stream();
         assert_eq!(
             read_exact_stream(&mut body3, 10).await.as_slice(),
@@ -2115,7 +1855,10 @@ mod tests {
         .await
         .expect("download attach must not deadlock with a large backlog");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get("x-dl-from").unwrap(), "0");
+        assert_eq!(
+            response.headers().get(protocol::HEADER_DL_FROM).unwrap(),
+            "0"
+        );
 
         let mut body = response.into_body().into_data_stream();
         let mut received = Vec::new();
@@ -2166,7 +1909,7 @@ mod tests {
 
         // GET #1 attaches and receives partA from its snapshot.
         let get1 = download(server.state.clone(), "swap-test".into(), HeaderMap::new()).await;
-        assert_eq!(get1.headers().get("x-dl-from").unwrap(), "0");
+        assert_eq!(get1.headers().get(protocol::HEADER_DL_FROM).unwrap(), "0");
         let mut body1 = get1.into_body().into_data_stream();
         assert_eq!(read_exact_stream(&mut body1, 5).await.as_slice(), b"partA");
         drop(body1); // client-side abort; partA was never acknowledged
@@ -2179,7 +1922,7 @@ mod tests {
             dl.total = 10;
         }
         let get2 = download(server.state.clone(), "swap-test".into(), HeaderMap::new()).await;
-        assert_eq!(get2.headers().get("x-dl-from").unwrap(), "0");
+        assert_eq!(get2.headers().get(protocol::HEADER_DL_FROM).unwrap(), "0");
         let mut body2 = get2.into_body().into_data_stream();
         assert_eq!(
             read_exact_stream(&mut body2, 10).await.as_slice(),
@@ -2195,9 +1938,12 @@ mod tests {
             dl.total = 15;
         }
         let mut ack_headers = HeaderMap::new();
-        ack_headers.insert("x-dl-ack", axum::http::HeaderValue::from_static("10"));
+        ack_headers.insert(
+            protocol::HEADER_DL_ACK,
+            axum::http::HeaderValue::from_static("10"),
+        );
         let get3 = download(server.state.clone(), "swap-test".into(), ack_headers).await;
-        assert_eq!(get3.headers().get("x-dl-from").unwrap(), "10");
+        assert_eq!(get3.headers().get(protocol::HEADER_DL_FROM).unwrap(), "10");
         let mut body3 = get3.into_body().into_data_stream();
         assert_eq!(read_exact_stream(&mut body3, 5).await.as_slice(), b"partC");
     }
@@ -2256,7 +2002,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
-                .get("x-session-status")
+                .get(protocol::HEADER_SESSION_STATUS)
                 .and_then(|v| v.to_str().ok()),
             Some("closed")
         );
