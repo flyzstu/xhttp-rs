@@ -688,45 +688,6 @@ fn get_session(state: &Arc<ServerState>, id: &str) -> Option<Arc<Session>> {
                 }
             }
         }
-        // Backend closed: hand the remaining range to the live consumer, then
-        // end its body. Chunks that cannot be delivered stay buffered for a
-        // later attachment (within the session lifetime).
-        loop {
-            let attempt = {
-                let mut dl = downlink_for_read.lock().await;
-                dl.backend_closed = true;
-                match (dl.active.as_ref(), dl.chunks.front()) {
-                    (Some((generation, tx)), Some((_, chunk))) => {
-                        Some((*generation, tx.clone(), chunk.clone()))
-                    }
-                    _ => None,
-                }
-            };
-            match attempt {
-                Some((generation, tx, chunk)) => {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        tx.send(Ok(chunk.clone())),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            let mut dl = downlink_for_read.lock().await;
-                            dl.chunks.pop_front();
-                        }
-                        Ok(Err(_)) | Err(_) => {
-                            let mut dl = downlink_for_read.lock().await;
-                            if dl.active.as_ref().is_some_and(|(g, _)| *g == generation) {
-                                dl.active = None;
-                                dl.kill = None;
-                            }
-                            break;
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
         {
             let mut dl = downlink_for_read.lock().await;
             dl.backend_closed = true;
@@ -2304,5 +2265,74 @@ mod tests {
 
         let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert!(body_bytes.is_empty());
+    }
+
+    /// A chunk delivered to the live GET but not yet acknowledged must stay
+    /// buffered after the backend closes, so a reattachment whose ack was
+    /// lost can replay it. The old close-drain loop popped chunks on
+    /// successful send, silently dropping data in that scenario.
+    #[tokio::test]
+    async fn backend_close_preserves_unacked_data_for_reattachment() {
+        // Echo one packet then close the backend connection, driving the
+        // read loop into its EOF (backend-close) path.
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+            // Keep the connection open briefly so the echoed byte is
+            // delivered to the live GET before the backend sees EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // drop -> backend EOF
+        });
+
+        let server = Server::new(ServerConfig {
+            listen: "127.0.0.1:0".into(),
+            target: echo_addr.to_string(),
+            users: vec![],
+            transport: TransportConfig {
+                mode: Mode::PacketUp,
+                h1_enable_session_resumption: true,
+                ..Default::default()
+            },
+            tls: None,
+        })
+        .unwrap();
+
+        let sid = "backend-close-replay";
+        let session = get_session(&server.state, sid).unwrap();
+        let res1 = download(server.state.clone(), sid.into(), HeaderMap::new()).await;
+        let mut body1 = res1.into_body().into_data_stream();
+
+        session
+            .sender
+            .send(Packet {
+                sequence: 0,
+                payload: Bytes::from_static(b"chunk1"),
+            })
+            .await
+            .unwrap();
+        // The live GET receives chunk1 through its channel. No x-dl-ack is
+        // ever sent by this test, so the byte stays unacknowledged.
+        assert_eq!(read_exact_stream(&mut body1, 6).await.as_slice(), b"chunk1");
+
+        // Let the backend reach EOF and run its close handling. Keep body1
+        // alive so the old drain loop's re-send would succeed and pop the
+        // chunk -- exactly the condition that used to lose the data.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        {
+            let dl = session.downlink.lock().await;
+            assert!(dl.backend_closed, "backend should have reached EOF");
+            assert_eq!(dl.acked, 0, "client has not acknowledged anything");
+        }
+
+        // Reattach with ack=0 (as if the client's ack never arrived). The
+        // unacknowledged byte must be replayed from the buffer.
+        let res2 = download(server.state.clone(), sid.into(), HeaderMap::new()).await;
+        let mut body2 = res2.into_body().into_data_stream();
+        assert_eq!(read_exact_stream(&mut body2, 6).await.as_slice(), b"chunk1");
+        let _ = body1;
     }
 }
