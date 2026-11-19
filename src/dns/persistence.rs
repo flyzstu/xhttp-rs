@@ -11,6 +11,12 @@ use std::{
 use super::cache::{CacheKey, CacheValue, DnsCache, PersistentCache};
 use super::message::parse_response;
 
+/// Sub-bucket reserved for entries resolved via the local resolver (`server: None`).
+///
+/// A raw NUL byte can never occur in a configured DNS server tag, so entries
+/// from tagged servers and local-resolver entries can never share a bucket.
+const NONE_SERVER_SUB: &[u8] = b"\x00";
+
 /// Check whether the file at `path` is a BoltDB database.
 pub fn is_boltdb_file(path: &Path) -> bool {
     if path.extension().and_then(|s| s.to_str()) == Some("db") {
@@ -118,7 +124,17 @@ fn load_boltdb(path: &Path, cache: &Mutex<DnsCache>) -> Result<HashMap<String, S
             let mut item = c.first();
             let mut mut_cache = cache.lock().expect("DNS cache lock poisoned");
             while let Some((sub_name, None)) = item {
-                let sub_tag = std::str::from_utf8(sub_name).unwrap_or("default");
+                let server: Option<std::sync::Arc<str>> = if sub_name == NONE_SERVER_SUB {
+                    None
+                } else {
+                    match std::str::from_utf8(sub_name) {
+                        Ok(tag) => Some(tag.into()),
+                        Err(_) => {
+                            item = c.next();
+                            continue;
+                        }
+                    }
+                };
                 if let Some(sub) = dns_cache.bucket(sub_name) {
                     let mut sc = sub.cursor();
                     let mut sitem = sc.first();
@@ -139,16 +155,11 @@ fn load_boltdb(path: &Path, cache: &Mutex<DnsCache>) -> Result<HashMap<String, S
                                 if let Ok((addresses, _ttl)) =
                                     parse_response(msg_id, qtype, raw_msg)
                                 {
-                                    let server = if sub_tag == "default" {
-                                        None
-                                    } else {
-                                        Some(sub_tag.into())
-                                    };
                                     mut_cache.insert(
                                         CacheKey::Lookup {
                                             name: qname.into(),
                                             qtype,
-                                            server,
+                                            server: server.clone(),
                                             client_subnet: None,
                                         },
                                         CacheValue::Addresses(addresses),
@@ -266,8 +277,10 @@ fn save_boltdb(
                 _ => continue,
             };
 
-            let sub_name = server.unwrap_or("dns_local");
-            let mut sub_b = root_b.create_bucket_if_not_exists(sub_name.as_bytes())?;
+            let mut sub_b = match server {
+                Some(tag) => root_b.create_bucket_if_not_exists(tag.as_bytes())?,
+                None => root_b.create_bucket_if_not_exists(NONE_SERVER_SUB)?,
+            };
 
             let mut key = Vec::with_capacity(2 + name.len() + 1);
             key.extend_from_slice(&qtype.to_be_bytes());
@@ -469,5 +482,209 @@ mod tests {
             let sel = selected.unwrap();
             assert!(sel.contains_key("anytls"));
         }
+    }
+
+    #[test]
+    fn test_boltdb_none_server_round_trips_as_none() {
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let cache = Mutex::new(DnsCache::new(100, false));
+        cache.lock().unwrap().insert(
+            CacheKey::Lookup {
+                name: "local.test".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            },
+            CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]),
+            Duration::from_secs(300),
+        );
+
+        save_persisted(&path, &cache, None).unwrap();
+
+        let restored = Mutex::new(DnsCache::new(100, false));
+        load_persisted(&path, &restored).unwrap();
+
+        let mut c = restored.lock().unwrap();
+        let entry = c.get(&CacheKey::Lookup {
+            name: "local.test".into(),
+            qtype: 1,
+            server: None,
+            client_subnet: None,
+        });
+        assert!(
+            matches!(entry, Some(CacheValue::Addresses(_))),
+            "entry resolved by the local resolver must survive a restart under server: None"
+        );
+        // The old bug: it only came back under Some("dns_local").
+        assert!(
+            c.get(&CacheKey::Lookup {
+                name: "local.test".into(),
+                qtype: 1,
+                server: Some("dns_local".into()),
+                client_subnet: None,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_boltdb_local_and_tagged_entries_do_not_collide() {
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let cache = Mutex::new(DnsCache::new(100, false));
+        {
+            let mut c = cache.lock().unwrap();
+            // Same name + qtype answered by the local resolver and by a server
+            // literally tagged "dns_local"; the save side used to merge them.
+            c.insert(
+                CacheKey::Lookup {
+                    name: "split.test".into(),
+                    qtype: 1,
+                    server: None,
+                    client_subnet: None,
+                },
+                CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))]),
+                Duration::from_secs(300),
+            );
+            c.insert(
+                CacheKey::Lookup {
+                    name: "split.test".into(),
+                    qtype: 1,
+                    server: Some("dns_local".into()),
+                    client_subnet: None,
+                },
+                CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))]),
+                Duration::from_secs(300),
+            );
+        }
+
+        save_persisted(&path, &cache, None).unwrap();
+
+        let restored = Mutex::new(DnsCache::new(100, false));
+        load_persisted(&path, &restored).unwrap();
+
+        let mut c = restored.lock().unwrap();
+        let mut addresses_of = |server: Option<&str>| match c.get(&CacheKey::Lookup {
+            name: "split.test".into(),
+            qtype: 1,
+            server: server.map(Into::into),
+            client_subnet: None,
+        }) {
+            Some(CacheValue::Addresses(addrs)) => addrs[0],
+            other => panic!("missing cache entry for server {server:?}: {other:?}"),
+        };
+        assert_eq!(addresses_of(None), IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(
+            addresses_of(Some("dns_local")),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20))
+        );
+    }
+
+    #[test]
+    fn test_boltdb_tag_default_stays_tagged() {
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let cache = Mutex::new(DnsCache::new(100, false));
+        cache.lock().unwrap().insert(
+            CacheKey::Lookup {
+                name: "tagged.test".into(),
+                qtype: 1,
+                server: Some("default".into()),
+                client_subnet: None,
+            },
+            CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30))]),
+            Duration::from_secs(300),
+        );
+
+        save_persisted(&path, &cache, None).unwrap();
+
+        let restored = Mutex::new(DnsCache::new(100, false));
+        load_persisted(&path, &restored).unwrap();
+
+        let mut c = restored.lock().unwrap();
+        // The old restore path demoted the "default" bucket to server: None,
+        // which leaked one server's answers into local-resolver lookups.
+        assert!(matches!(
+            c.get(&CacheKey::Lookup {
+                name: "tagged.test".into(),
+                qtype: 1,
+                server: Some("default".into()),
+                client_subnet: None,
+            }),
+            Some(CacheValue::Addresses(_))
+        ));
+        assert!(
+            c.get(&CacheKey::Lookup {
+                name: "tagged.test".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_boltdb_expired_entries_not_saved() {
+        let tmp = tempfile::Builder::new().suffix(".db").tempfile().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let cache = Mutex::new(DnsCache::new(100, false));
+        {
+            let mut c = cache.lock().unwrap();
+            c.insert(
+                CacheKey::Lookup {
+                    name: "gone.test".into(),
+                    qtype: 1,
+                    server: None,
+                    client_subnet: None,
+                },
+                CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 40))]),
+                Duration::from_secs(0),
+            );
+            c.insert(
+                CacheKey::Lookup {
+                    name: "kept.test".into(),
+                    qtype: 1,
+                    server: None,
+                    client_subnet: None,
+                },
+                CacheValue::Addresses(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 41))]),
+                Duration::from_secs(300),
+            );
+        }
+
+        save_persisted(&path, &cache, None).unwrap();
+
+        let restored = Mutex::new(DnsCache::new(100, false));
+        load_persisted(&path, &restored).unwrap();
+
+        let mut c = restored.lock().unwrap();
+        assert!(
+            c.get(&CacheKey::Lookup {
+                name: "gone.test".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            c.get(&CacheKey::Lookup {
+                name: "kept.test".into(),
+                qtype: 1,
+                server: None,
+                client_subnet: None,
+            }),
+            Some(CacheValue::Addresses(_))
+        ));
     }
 }
