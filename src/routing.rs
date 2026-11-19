@@ -184,7 +184,8 @@ pub struct Router {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CompiledRule {    logical_mode: Option<LogicalMode>,
+pub(crate) struct CompiledRule {
+    logical_mode: Option<LogicalMode>,
     logical_rules: Vec<CompiledRule>,
     domains: Vec<String>,
     suffixes: Vec<String>,
@@ -322,7 +323,10 @@ impl Router {
             })
             .unwrap_or_else(|| {
                 RouteDecision::Outbound(
-                    self.final_outbound.read().expect("final outbound lock poisoned").clone(),
+                    self.final_outbound
+                        .read()
+                        .expect("final outbound lock poisoned")
+                        .clone(),
                 )
             })
     }
@@ -348,14 +352,9 @@ impl Router {
     /// `NeedResolve(index)` is returned so the caller can resolve the domain
     /// (through `default_domain_resolver` when configured) and retry from
     /// that rule. Rules whose domain fields do not match are skipped.
-    pub(crate) fn next_action_lazy(
-        &self,
-        context: &RouteContext<'_>,
-        from: usize,
-    ) -> ActionLookup {
+    pub(crate) fn next_action_lazy(&self, context: &RouteContext<'_>, from: usize) -> ActionLookup {
         let domain = context.domain.map(normalize_domain);
-        let needs_ip = context.destination_addresses().next().is_none()
-            && context.domain.is_some();
+        let needs_ip = context.destination_addresses().next().is_none() && context.domain.is_some();
         let rules = self.rules.read().expect("route rule lock poisoned");
         for (index, rule) in rules.iter().enumerate().skip(from) {
             if rule.matches(context, domain.as_deref()) {
@@ -364,7 +363,10 @@ impl Router {
                     action: Box::new(rule.action.clone()),
                 };
             }
-            if needs_ip && rule.requires_destination_ip && rule.domain_fields_match(domain.as_deref()) {
+            if needs_ip
+                && rule.requires_destination_ip
+                && rule.domain_fields_match(domain.as_deref())
+            {
                 return ActionLookup::NeedResolve { index };
             }
         }
@@ -447,17 +449,14 @@ impl CompiledRule {
             };
             return if self.invert { !matched } else { matched };
         }
-        let domain_matches = (self.domains.is_empty()
-            || self.domains.iter().any(|s| s == domain))
+        let domain_matches = (self.domains.is_empty() || self.domains.iter().any(|s| s == domain))
             && (self.suffixes.is_empty()
-                || self
-                    .suffixes
-                    .iter()
-                    .any(|s| domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'))))
+                || self.suffixes.iter().any(|s| {
+                    domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'))
+                }))
             && (self.keywords.is_empty()
                 || self.keywords.iter().any(|value| domain.contains(value)))
-            && (self.regexes.is_empty()
-                || self.regexes.iter().any(|value| value.is_match(domain)));
+            && (self.regexes.is_empty() || self.regexes.iter().any(|value| value.is_match(domain)));
         if !domain_matches {
             return self.invert;
         }
@@ -501,8 +500,7 @@ impl CompiledRule {
                 }))
             && (self.keywords.is_empty()
                 || self.keywords.iter().any(|value| domain.contains(value)))
-            && (self.regexes.is_empty()
-                || self.regexes.iter().any(|value| value.is_match(domain)))
+            && (self.regexes.is_empty() || self.regexes.iter().any(|value| value.is_match(domain)))
             && (self.rule_sets.is_empty()
                 || self
                     .rule_sets
@@ -550,29 +548,26 @@ impl CompiledRule {
             (self.domains.is_empty() || self.domains.iter().any(|s| s == domain))
                 && (self.suffixes.is_empty()
                     || self.suffixes.iter().any(|s| {
-                        domain == s
-                            || domain
-                                .strip_suffix(s)
-                                .is_some_and(|r| r.ends_with('.'))
+                        domain == s || domain.strip_suffix(s).is_some_and(|r| r.ends_with('.'))
                     }))
                 && (self.keywords.is_empty()
-                    || self
-                        .keywords
-                        .iter()
-                        .any(|value| domain.contains(value)))
+                    || self.keywords.iter().any(|value| domain.contains(value)))
                 && (self.regexes.is_empty()
                     || self.regexes.iter().any(|value| value.is_match(domain)))
         });
-        let address_matches = (self.cidrs.is_empty() || self.cidrs.iter().any(|n| n.contains(&address)))
+        let address_matches = (self.cidrs.is_empty()
+            || self.cidrs.iter().any(|n| n.contains(&address)))
             && (self.ip_versions.is_empty()
                 || self.ip_versions.iter().any(|version| {
                     matches!((version, address), (4, IpAddr::V4(_)) | (6, IpAddr::V6(_)))
                 }))
             && (!self.ip_private || is_private(address))
             && (self.rule_sets.is_empty()
-                || self.rule_sets.iter().flatten().any(|rule| {
-                    rule.dns_matches_address(address, domain)
-                }));
+                || self
+                    .rule_sets
+                    .iter()
+                    .flatten()
+                    .any(|rule| rule.dns_matches_address(address, domain)));
         if self.invert {
             !(domain_matches && address_matches)
         } else {
@@ -724,9 +719,10 @@ impl CompiledRule {
             let own = !rule.ip_cidr.is_empty()
                 || !rule.ip_version.is_empty()
                 || rule.ip_is_private
-                || rule_sets.iter().flatten().any(|nested| {
-                    nested.requires_destination_ip
-                });
+                || rule_sets
+                    .iter()
+                    .flatten()
+                    .any(|nested| nested.requires_destination_ip);
             own || logical_rules
                 .iter()
                 .any(|rule| rule.requires_destination_ip)
@@ -806,8 +802,14 @@ impl CompiledRule {
     fn matches(&self, c: &RouteContext<'_>, domain: Option<&str>) -> bool {
         if let Some(mode) = self.logical_mode {
             let matched = match mode {
-                LogicalMode::And => self.logical_rules.iter().all(|rule| rule.matches(c, domain)),
-                LogicalMode::Or => self.logical_rules.iter().any(|rule| rule.matches(c, domain)),
+                LogicalMode::And => self
+                    .logical_rules
+                    .iter()
+                    .all(|rule| rule.matches(c, domain)),
+                LogicalMode::Or => self
+                    .logical_rules
+                    .iter()
+                    .any(|rule| rule.matches(c, domain)),
             };
             return if self.invert { !matched } else { matched };
         }
@@ -820,11 +822,9 @@ impl CompiledRule {
                         .any(|s| d == s || d.strip_suffix(s).is_some_and(|r| r.ends_with('.')))
                 }))
             && (self.keywords.is_empty()
-                || domain
-                    .is_some_and(|d| self.keywords.iter().any(|value| d.contains(value))))
+                || domain.is_some_and(|d| self.keywords.iter().any(|value| d.contains(value))))
             && (self.regexes.is_empty()
-                || domain
-                    .is_some_and(|d| self.regexes.iter().any(|value| value.is_match(d))))
+                || domain.is_some_and(|d| self.regexes.iter().any(|value| value.is_match(d))))
             && (self.cidrs.is_empty()
                 || c.destination_addresses()
                     .any(|ip| self.cidrs.iter().any(|n| n.contains(&ip))))
@@ -949,8 +949,11 @@ fn load_rule_sets(
                 } else if let Some(prefetched) = prefetched
                     && let Some(data) = prefetched.get(&set.tag)
                 {
-                    decode_rule_set(data, rule_set_format_for(set, set.url.as_deref().unwrap_or(""))?)
-                        .with_context(|| format!("parse remote rule-set {}", set.tag))?
+                    decode_rule_set(
+                        data,
+                        rule_set_format_for(set, set.url.as_deref().unwrap_or(""))?,
+                    )
+                    .with_context(|| format!("parse remote rule-set {}", set.tag))?
                 } else {
                     load_remote_rule_set(set)?
                 }
@@ -1664,33 +1667,40 @@ mod tests {
 
     #[test]
     fn requires_destination_ip_detects_ip_dependent_rules() {
-        let compile = |rule: RouteRule| {
-            CompiledRule::compile(&rule, &HashMap::new(), true).unwrap()
-        };
-        assert!(!compile(RouteRule {
-            domain_suffix: vec!["example.com".into()],
-            outbound: Some("proxy".into()),
-            ..Default::default()
-        })
-        .requires_destination_ip);
-        assert!(compile(RouteRule {
-            ip_cidr: vec!["10.0.0.0/8".into()],
-            outbound: Some("proxy".into()),
-            ..Default::default()
-        })
-        .requires_destination_ip);
-        assert!(compile(RouteRule {
-            ip_version: vec![4],
-            outbound: Some("proxy".into()),
-            ..Default::default()
-        })
-        .requires_destination_ip);
-        assert!(compile(RouteRule {
-            ip_is_private: true,
-            outbound: Some("proxy".into()),
-            ..Default::default()
-        })
-        .requires_destination_ip);
+        let compile =
+            |rule: RouteRule| CompiledRule::compile(&rule, &HashMap::new(), true).unwrap();
+        assert!(
+            !compile(RouteRule {
+                domain_suffix: vec!["example.com".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            })
+            .requires_destination_ip
+        );
+        assert!(
+            compile(RouteRule {
+                ip_cidr: vec!["10.0.0.0/8".into()],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            })
+            .requires_destination_ip
+        );
+        assert!(
+            compile(RouteRule {
+                ip_version: vec![4],
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            })
+            .requires_destination_ip
+        );
+        assert!(
+            compile(RouteRule {
+                ip_is_private: true,
+                outbound: Some("proxy".into()),
+                ..Default::default()
+            })
+            .requires_destination_ip
+        );
         let logical = compile(RouteRule {
             r#type: "logical".into(),
             mode: Some("or".into()),
@@ -1782,10 +1792,8 @@ mod tests {
     #[test]
     fn remote_rule_set_loads_from_disk_cache_first() {
         // Redirect the cache root so the test owns it.
-        let cache_dir = std::env::temp_dir().join(format!(
-            "xhttp-rs-cache-test-{}",
-            std::process::id()
-        ));
+        let cache_dir =
+            std::env::temp_dir().join(format!("xhttp-rs-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache_dir);
         // SAFETY: single-threaded test; no other code reads this variable.
         unsafe { std::env::set_var("XDG_CACHE_HOME", &cache_dir) };
@@ -1799,8 +1807,11 @@ mod tests {
             ..Default::default()
         };
         let cache_path = rule_set_cache_path(url, "source");
-        write_rule_set_cache(&cache_path, br#"{"rules":[{"domain_suffix":["cached.example"]}]}"#)
-            .unwrap();
+        write_rule_set_cache(
+            &cache_path,
+            br#"{"rules":[{"domain_suffix":["cached.example"]}]}"#,
+        )
+        .unwrap();
 
         // The URL points at an unused port; a cache hit must not touch it.
         let rules = load_remote_rule_set(&set).unwrap();

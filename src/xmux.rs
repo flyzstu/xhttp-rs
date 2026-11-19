@@ -90,10 +90,7 @@ impl Manager {
                 continue;
             }
             active_count += 1;
-            if !connection
-                || state.max_concurrency == 0
-                || pool.running < state.max_concurrency
-            {
+            if !connection || state.max_concurrency == 0 || pool.running < state.max_concurrency {
                 active.push(entry.clone());
             }
         }

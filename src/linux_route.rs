@@ -55,7 +55,11 @@ pub struct LinuxRouteMetadata {
     pub default_interface_addresses: Vec<IpAddr>,
 }
 
-pub fn collect_tcp(peer: SocketAddr, proxy: SocketAddr, scope: LinuxMetadataScope) -> LinuxRouteMetadata {
+pub fn collect_tcp(
+    peer: SocketAddr,
+    proxy: SocketAddr,
+    scope: LinuxMetadataScope,
+) -> LinuxRouteMetadata {
     let mut metadata = LinuxRouteMetadata::default();
     if scope.interface {
         metadata.interface_addresses = all_interface_addresses_cached();
@@ -331,16 +335,20 @@ mod tests {
     #[test]
     fn scope_is_empty_only_when_all_flags_are_clear() {
         assert!(LinuxMetadataScope::default().is_empty());
-        assert!(!LinuxMetadataScope {
-            process: true,
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!LinuxMetadataScope {
-            hostname: true,
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(
+            !LinuxMetadataScope {
+                process: true,
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !LinuxMetadataScope {
+                hostname: true,
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 
     #[test]

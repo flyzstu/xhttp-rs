@@ -68,8 +68,7 @@ pub async fn run(config: ClashApiConfig, runtime: ProxyRuntime) -> Result<()> {
         app = app.layer(layer);
         if config.access_control_allow_private_network {
             app = app.layer(axum::middleware::from_fn(
-                |request: axum::extract::Request,
-                 next: axum::middleware::Next| async move {
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
                     let mut response = next.run(request).await;
                     response.headers_mut().insert(
                         axum::http::header::HeaderName::from_static(
@@ -99,7 +98,9 @@ pub async fn run(config: ClashApiConfig, runtime: ProxyRuntime) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .with_context(|| format!("bind clash API on {address}"))?;
-    axum::serve(listener, app).await.context("clash API server failed")
+    axum::serve(listener, app)
+        .await
+        .context("clash API server failed")
 }
 
 /// Download and extract the Yacd-meta dashboard into `ui_dir` if it is empty.
@@ -118,7 +119,10 @@ async fn ensure_ui(
         .to_owned();
     tracing::info!("downloading Yacd-meta dashboard from {url}");
     let bytes = if let Some(detour) = detour.filter(|tag| !tag.is_empty()) {
-        runtime.fetch_url_via(detour, &url).await.context("download external UI through detour")?
+        runtime
+            .fetch_url_via(detour, &url)
+            .await
+            .context("download external UI through detour")?
     } else {
         tokio::task::spawn_blocking(move || {
             let response = reqwest::blocking::Client::builder()
@@ -139,8 +143,7 @@ async fn ensure_ui(
     };
     tracing::info!("downloaded {} bytes of Yacd-meta dashboard", bytes.len());
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive =
-        zip::ZipArchive::new(cursor).context("open external UI archive")?;
+    let mut archive = zip::ZipArchive::new(cursor).context("open external UI archive")?;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -203,11 +206,7 @@ async fn get_configs(State(state): State<ApiState>) -> Response {
     }))
 }
 
-async fn patch_configs(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
+async fn patch_configs(State(state): State<ApiState>, headers: HeaderMap, body: Body) -> Response {
     if !authenticated(&headers, state.secret.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -342,19 +341,18 @@ async fn proxy_delay(
         return StatusCode::NOT_FOUND.into_response();
     };
     let url = "http://www.gstatic.com/generate_204";
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        dialer.probe_delay(url),
-    )
-    .await
-    {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), dialer.probe_delay(url)).await {
         Ok(Some(delay)) => json_response(json!({ "delay": delay })),
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
 fn json_response(value: Value) -> Response {
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "application/json")], value.to_string())
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        value.to_string(),
+    )
         .into_response()
 }
 
@@ -379,9 +377,15 @@ mod tests {
                 ..Default::default()
             },
         ];
-        build_runtime(outbounds, Some(RouteConfig::default()), None, Vec::new(), None)
-            .await
-            .unwrap()
+        build_runtime(
+            outbounds,
+            Some(RouteConfig::default()),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     async fn free_port() -> u16 {
@@ -424,13 +428,24 @@ mod tests {
         let global = &proxies_map["GLOBAL"];
         assert_eq!(global["type"], "Selector");
         assert_eq!(global["now"], "proxy");
-        assert!(global["all"].as_array().unwrap().iter().any(|t| t == "proxy"));
+        assert!(
+            global["all"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "proxy")
+        );
 
         // The selector group itself appears as a proxy entry.
         let proxy_group = &proxies_map["proxy"];
         assert_eq!(proxy_group["type"], "Selector");
         assert_eq!(proxy_group["now"], "direct");
-        assert!(proxy_group["all"].as_array().unwrap().contains(&Value::String("direct".into())));
+        assert!(
+            proxy_group["all"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("direct".into()))
+        );
 
         // Switching the GLOBAL selection to the proxy group works.
         let status = client
@@ -474,7 +489,14 @@ mod tests {
         let client = reqwest::Client::new();
         let base = format!("http://127.0.0.1:{port}");
 
-        let configs: Value = client.get(format!("{base}/configs")).send().await.unwrap().json().await.unwrap();
+        let configs: Value = client
+            .get(format!("{base}/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(configs["mode"], "rule");
 
         let status = client
@@ -486,7 +508,14 @@ mod tests {
             .status();
         assert_eq!(status, 204);
 
-        let configs: Value = client.get(format!("{base}/configs")).send().await.unwrap().json().await.unwrap();
+        let configs: Value = client
+            .get(format!("{base}/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(configs["mode"], "global");
 
         server.abort();
@@ -531,7 +560,10 @@ mod tests {
 
         // A preflight OPTIONS request is answered with the CORS headers.
         let response = client
-            .request(reqwest::Method::OPTIONS, format!("http://127.0.0.1:{port}/proxies"))
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://127.0.0.1:{port}/proxies"),
+            )
             .send()
             .await
             .unwrap();

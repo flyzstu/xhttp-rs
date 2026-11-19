@@ -446,9 +446,7 @@ mod tests {
             sequence_placement: Placement::Query,
             ..Default::default()
         };
-        let uri: Uri = "/xhttp?x_session=a&x_session=b&x_seq=42"
-            .parse()
-            .unwrap();
+        let uri: Uri = "/xhttp?x_session=a&x_session=b&x_seq=42".parse().unwrap();
         assert_eq!(
             extract_metadata(&config, &uri, &HeaderMap::new()),
             (Some("b".into()), Some(42))
