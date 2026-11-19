@@ -313,6 +313,14 @@ impl DnsResolver {
                 .collect::<Result<Vec<_>>>()?;
             return predefined_response(request, question_end, rcode, &records);
         }
+        let strategy = rule
+            .and_then(|rule| rule.raw.strategy.as_deref())
+            .or(self.inner.strategy.as_deref());
+        if (qtype == 28 && strategy == Some("ipv4_only"))
+            || (qtype == 1 && strategy == Some("ipv6_only"))
+        {
+            return predefined_response(request, question_end, 0, &[]);
+        }
         let server_tag = rule
             .and_then(|rule| rule.raw.server.as_deref())
             .unwrap_or(&self.inner.final_tag);
@@ -1211,6 +1219,34 @@ mod tests {
             .unwrap();
         assert_eq!(response[3] & 0x0f, 3);
         assert!(resolver.lookup("missing.nx.example").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn exchange_returns_empty_response_for_aaaa_when_ipv4_only() {
+        let config = DnsConfig {
+            servers: vec![DnsServer {
+                r#type: "udp".into(),
+                tag: "upstream".into(),
+                server: Some("127.0.0.1".into()),
+                server_port: Some(1),
+                path: None,
+                detour: None,
+            }],
+            final_server: Some("upstream".into()),
+            strategy: Some("ipv4_only".into()),
+            ..Default::default()
+        };
+        let resolver = DnsResolver::new(&config).unwrap();
+        // AAAA query (qtype 28)
+        let query = build_query(42, "ip.sb", 28).unwrap();
+        let response = resolver.exchange(&query).await.unwrap();
+        // ID matches
+        assert_eq!(&response[..2], &42u16.to_be_bytes());
+        // QR=1, RCODE=0 (NOERROR)
+        assert_ne!(response[2] & 0x80, 0);
+        assert_eq!(response[3] & 0x0f, 0);
+        // ANCOUNT = 0
+        assert_eq!(&response[6..8], &[0, 0]);
     }
 
     struct FakeDetour {
