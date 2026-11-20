@@ -3982,6 +3982,7 @@ dependencies = [
  "tun-rs",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "x509-parser",
  "zip",
 ]

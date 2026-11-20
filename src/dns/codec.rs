@@ -154,6 +154,7 @@ pub(crate) fn refused_response(request: &[u8], question_end: usize) -> Result<Ve
     Ok(response)
 }
 
+#[cfg(not(windows))]
 pub(crate) fn build_response(
     name: &str,
     qtype: u16,

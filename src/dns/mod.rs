@@ -1,6 +1,11 @@
 mod cache;
 mod codec;
+#[cfg(not(windows))]
 mod persistence;
+#[cfg(windows)]
+mod persistence_windows;
+#[cfg(windows)]
+use persistence_windows as persistence;
 mod rules;
 pub(crate) mod transport;
 

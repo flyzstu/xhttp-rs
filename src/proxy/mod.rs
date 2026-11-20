@@ -1,9 +1,11 @@
 mod detour;
 mod direct;
 mod inbound;
+#[cfg(target_os = "linux")]
 pub mod redirect;
 mod relay;
 mod route;
+#[cfg(target_os = "linux")]
 pub mod tproxy;
 mod udp;
 pub(crate) mod udp_nat;
@@ -20,9 +22,9 @@ use std::{
 pub(crate) use detour::DetourProvider;
 pub use inbound::run_socks;
 pub use inbound::run_socks_with_runtime;
-pub(crate) use relay::{
-    relay_anytls_tcp, relay_anytls_udp, relay_streamed_tcp, relay_tun_tcp, relay_tun_udp,
-};
+#[cfg(target_os = "linux")]
+pub(crate) use relay::relay_streamed_tcp;
+pub(crate) use relay::{relay_anytls_tcp, relay_anytls_udp, relay_tun_tcp, relay_tun_udp};
 #[cfg(feature = "fuzzing")]
 pub use udp::fuzz_socks_udp;
 

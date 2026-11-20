@@ -85,7 +85,21 @@ pub struct SingBoxConfig {
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
     pub experimental: Option<ExperimentalConfig>,
+    pub system_proxy: Option<SystemProxyConfig>,
     pub http_clients: Vec<HttpClientConfig>,
+}
+
+/// Windows system proxy settings, equivalent to xhttp-box's
+/// `tun.platform.http_proxy`. Only meaningful on Windows; configs enabling it
+/// on other platforms fail at startup.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SystemProxyConfig {
+    pub enabled: bool,
+    pub server: String,
+    pub server_port: u16,
+    #[serde(default)]
+    pub bypass_domain: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]

@@ -62,6 +62,7 @@ mod platform_guards {
 #[cfg(not(target_os = "linux"))]
 use platform_guards::{LinuxTunRedirect, LinuxTunRoutes};
 
+#[cfg(target_os = "linux")]
 const DEFAULT_MTU: u16 = 9000;
 const MAX_PACKET_SIZE: usize = 65_535;
 
@@ -97,13 +98,12 @@ pub struct TunConfig {
     pub udp_nat_max: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl TunConfig {
     pub fn from_inbound(inbound: &Inbound) -> Result<Self> {
         if inbound.r#type != "tun" {
             bail!("TUN configuration requires type=tun")
         }
-        #[cfg(not(target_os = "linux"))]
-        bail!("TUN inbound is currently supported on Linux only");
 
         if inbound.auto_redirect && !inbound.auto_route {
             bail!("TUN auto_redirect requires auto_route")
@@ -309,6 +309,13 @@ impl TunConfig {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl TunConfig {
+    pub fn from_inbound(_inbound: &Inbound) -> Result<Self> {
+        anyhow::bail!("TUN inbound is currently supported on Linux only")
+    }
+}
+#[cfg(target_os = "linux")]
 fn parse_uid_ranges(values: &[String]) -> Result<Vec<(u32, u32)>> {
     values
         .iter()
@@ -330,6 +337,7 @@ fn parse_uid_ranges(values: &[String]) -> Result<Vec<(u32, u32)>> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn parse_duration(value: &str) -> Result<std::time::Duration> {
     let split = value
         .find(|character: char| !character.is_ascii_digit())
@@ -347,6 +355,7 @@ fn parse_duration(value: &str) -> Result<std::time::Duration> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn default_udp_nat_max() -> usize {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -414,19 +423,16 @@ pub async fn run(
         runtime.set_tun_output_mark(config.redirect_output_mark);
     }
     let device = Arc::new(build_device(&config)?);
-    let redirect_server = if config.auto_redirect {
-        #[cfg(target_os = "linux")]
-        {
-            Some(crate::proxy::redirect::RedirectServer::bind_local()?)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
+    #[cfg(target_os = "linux")]
+    let (redirect_server, redirect_port) = if config.auto_redirect {
+        let server = crate::proxy::redirect::RedirectServer::bind_local()?;
+        let port = server.port();
+        (Some(server), Some(port))
     } else {
-        None
+        (None, None)
     };
-    let redirect_port = redirect_server.as_ref().map(|server| server.port());
+    #[cfg(not(target_os = "linux"))]
+    let redirect_port: Option<u16> = None;
     let redirect_guard = config
         .auto_redirect
         .then(|| LinuxTunRedirect::install(&config, redirect_port))
@@ -481,6 +487,7 @@ pub async fn run(
         bail!("TUN packet output stream closed")
     });
     tasks.spawn(run_tcp(tcp, runtime.clone(), tag.clone()));
+    #[cfg(target_os = "linux")]
     if let Some(server) = redirect_server {
         let runtime = runtime.clone();
         let tag = tag.clone();
@@ -750,6 +757,7 @@ async fn run_udp(
     bail!("TUN UDP reader closed")
 }
 
+#[cfg(target_os = "linux")]
 fn parse_mac(value: &str) -> Result<[u8; 6]> {
     let bytes = value
         .split(':')

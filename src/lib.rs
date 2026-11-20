@@ -13,6 +13,7 @@ pub mod routing;
 pub mod server;
 pub mod singbox;
 mod srs;
+pub mod system_proxy;
 pub mod tls;
 pub mod tun;
 #[cfg(target_os = "linux")]

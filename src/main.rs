@@ -105,6 +105,17 @@ fn load(path: &str) -> Result<SingBoxConfig> {
     Ok(config)
 }
 async fn run(config: SingBoxConfig) -> Result<()> {
+    // Enable the Windows system proxy before starting listeners, so that
+    // clients honouring it are routed as soon as the proxy is reachable.
+    // The guard restores the previous setting on any exit path.
+    let _system_proxy = match config.system_proxy.as_ref().filter(|p| p.enabled) {
+        Some(p) => Some(xhttp::system_proxy::SystemProxy::enable(
+            &p.server,
+            p.server_port,
+            &p.bypass_domain,
+        )?),
+        None => None,
+    };
     let mut tasks = tokio::task::JoinSet::new();
     let clash_api = config
         .experimental
@@ -159,6 +170,7 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             }
             continue;
         }
+        #[cfg(target_os = "linux")]
         if inbound.r#type == "tproxy" {
             let dns_cache_path = dns_cache_path.clone();
             if let Some(runtime) = shared_runtime.clone() {
@@ -186,6 +198,7 @@ async fn run(config: SingBoxConfig) -> Result<()> {
             }
             continue;
         }
+        #[cfg(target_os = "linux")]
         if inbound.r#type == "redirect" {
             let dns_cache_path = dns_cache_path.clone();
             if let Some(runtime) = shared_runtime.clone() {
