@@ -136,7 +136,11 @@ impl DnsResolver {
             .map(parse_duration)
             .transpose()?
             .unwrap_or(DNS_TIMEOUT);
-        let dot_tls = if config.servers.iter().any(|server| server.r#type == "tls") {
+        let need_dot_tls = config.servers.iter().any(|server| server.r#type == "tls");
+        let need_doh_detour_tls = config.servers.iter().any(|server| {
+            server.r#type == "https" && server.detour.as_deref().is_some_and(|tag| !tag.is_empty())
+        });
+        let roots = if need_dot_tls || need_doh_detour_tls {
             let mut roots = rustls::RootCertStore::empty();
             let native = rustls_native_certs::load_native_certs();
             for certificate in native.certs {
@@ -144,11 +148,32 @@ impl DnsResolver {
                     .add(certificate)
                     .context("add native DNS root certificate")?;
             }
-            Some(TlsConnector::from(Arc::new(
-                rustls::ClientConfig::builder()
+            Some(roots)
+        } else {
+            None
+        };
+        let dot_tls = if need_dot_tls {
+            roots.clone().map(|roots| {
+                TlsConnector::from(Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth(),
+                ))
+            })
+        } else {
+            None
+        };
+        // DoH over a detour needs its own connector with an http/1.1 ALPN; DoT
+        // must keep offering no ALPN to stay compatible with servers that
+        // reject it.
+        let doh_detour_tls = if need_doh_detour_tls {
+            roots.map(|roots| {
+                let mut config = rustls::ClientConfig::builder()
                     .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            )))
+                    .with_no_client_auth();
+                config.alpn_protocols = vec![b"http/1.1".to_vec()];
+                TlsConnector::from(Arc::new(config))
+            })
         } else {
             None
         };
@@ -156,7 +181,11 @@ impl DnsResolver {
         for server in &config.servers {
             servers.insert(
                 server.tag.clone(),
-                Arc::new(Upstream::new(server.clone(), dot_tls.clone())?),
+                Arc::new(Upstream::new(
+                    server.clone(),
+                    dot_tls.clone(),
+                    doh_detour_tls.clone(),
+                )?),
             );
         }
         let final_tag = config

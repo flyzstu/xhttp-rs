@@ -10,7 +10,7 @@ use std::{
     time::Instant,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     sync::{OnceCell, Semaphore, oneshot},
     time::timeout,
@@ -51,6 +51,7 @@ pub(super) struct Upstream {
     stream: Option<TcpPool>,
     detour: DnsDetourHandle,
     detour_tls: Option<TlsConnector>,
+    doh_detour_tls: Option<TlsConnector>,
 }
 pub(super) struct Endpoint {
     host: String,
@@ -75,7 +76,11 @@ pub(super) struct IdleConnection {
     last_used: Instant,
 }
 impl Upstream {
-    pub(super) fn new(config: DnsServer, dot_tls: Option<TlsConnector>) -> Result<Self> {
+    pub(super) fn new(
+        config: DnsServer,
+        dot_tls: Option<TlsConnector>,
+        doh_detour_tls: Option<TlsConnector>,
+    ) -> Result<Self> {
         let kind = config.r#type.as_str();
         if !matches!(kind, "" | "udp" | "tcp" | "tls" | "https" | "local") {
             bail!("unsupported DNS server type: {kind}")
@@ -113,6 +118,7 @@ impl Upstream {
             stream,
             detour: DnsDetourHandle::new(None),
             detour_tls: dot_tls,
+            doh_detour_tls,
         })
     }
 
@@ -135,6 +141,17 @@ impl Upstream {
             None
         };
         if let Some(detour) = detour {
+            // DoH has no pre-resolved endpoint: the URL itself names the
+            // server, and the detour carries the HTTPS connection.
+            if self.config.r#type == "https" {
+                return query_https_via_detour(
+                    &detour,
+                    &self.config,
+                    request,
+                    self.doh_detour_tls.as_ref(),
+                )
+                .await;
+            }
             let endpoint = self
                 .endpoint
                 .as_ref()
@@ -373,10 +390,130 @@ async fn exchange_stream(stream: &mut dyn DnsIo, q: &[u8]) -> Result<Vec<u8>> {
 pub(crate) trait DnsIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> DnsIo for T {}
 
-/// Run a DNS query through a detour outbound. UDP servers use the outbound's
-/// UDP session (XUDP or AnyTLS UoT); TCP/TLS servers use a TCP stream through
-/// the outbound, with TLS applied for `tls` servers. HTTPS DNS over a detour
-/// is not supported.
+/// Run a DoH query through a detour outbound. Unlike the plain HTTPS path in
+/// [`Upstream::query`], the HTTP connection is carried by the detour's TCP
+/// stream instead of the global reqwest client, so it inherits the outbound's
+/// routing and credentials. The DoH server address is resolved with the local
+/// resolver (an IP literal needs no lookup at all) — this is bootstrap only;
+/// the actual query travels through the detour.
+async fn query_https_via_detour(
+    detour: &Arc<dyn DnsUdpDetour>,
+    config: &DnsServer,
+    request: &[u8],
+    tls: Option<&TlsConnector>,
+) -> Result<Vec<u8>> {
+    let tag = config.detour.as_deref().context("DNS detour tag missing")?;
+    let raw = config
+        .server
+        .as_deref()
+        .context("HTTPS DNS server missing address")?;
+    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+        url::Url::parse(raw)?
+    } else {
+        url::Url::parse(&format!("https://{raw}"))?
+    };
+    let https = url.scheme() == "https";
+    let host = url
+        .host_str()
+        .context("DoH server missing host")?
+        .to_string();
+    let port = url.port().unwrap_or(if https { 443 } else { 80 });
+    let path = if url.path() != "/" && !url.path().is_empty() {
+        url.path().to_string()
+    } else {
+        config.path.clone().unwrap_or_else(|| "/dns-query".into())
+    };
+    let address = tokio::net::lookup_host((host.as_str(), port))
+        .await?
+        .next()
+        .context("DoH server did not resolve")?;
+    let tcp = detour.connect_tcp(tag, address).await?;
+    let host_header = if port == if https { 443 } else { 80 } {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    if https {
+        let connector = tls.context("DoH detour TLS configuration unavailable")?;
+        let name = rustls::pki_types::ServerName::try_from(host.clone())
+            .context("invalid DoH server name")?;
+        let mut stream = connector.connect(name, tcp).await?;
+        exchange_https(&mut stream, &host_header, &path, request).await
+    } else {
+        let mut stream = tcp;
+        exchange_https(&mut *stream, &host_header, &path, request).await
+    }
+}
+
+/// Send one DoH POST over an established (possibly TLS) stream and read the
+/// single HTTP/1.1 response body.
+async fn exchange_https(
+    stream: &mut dyn DnsIo,
+    host_header: &str,
+    path: &str,
+    q: &[u8],
+) -> Result<Vec<u8>> {
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        q.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(q).await?;
+    stream.flush().await?;
+
+    let mut reader = tokio::io::BufReader::new(&mut *stream);
+    let mut status = false;
+    let mut length = None;
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line).await? == 0 {
+            bail!("DoH response ended before headers completed");
+        }
+        while line
+            .last()
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
+            line.pop();
+        }
+        if line.is_empty() {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if !status && text.starts_with("HTTP/") {
+            let code = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+                .context("invalid DoH status line")?;
+            if !(200..300).contains(&code) {
+                bail!("DoH server returned HTTP {code}");
+            }
+            status = true;
+        } else if let Some(value) = text.to_ascii_lowercase().strip_prefix("content-length:") {
+            length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid DoH content-length")?,
+            );
+        }
+    }
+    if !status {
+        bail!("DoH response missing status line");
+    }
+    let len = length.context("DoH response missing content-length")?;
+    if len > MAX_DNS_MESSAGE {
+        bail!("DoH response too large: {len}");
+    }
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+/// Run a non-HTTPS DNS query through a detour outbound. UDP servers use the
+/// outbound's UDP session (XUDP or AnyTLS UoT); TCP/TLS servers use a TCP
+/// stream through the outbound, with TLS applied for `tls` servers. HTTPS
+/// servers use [`query_https_via_detour`] instead.
 async fn query_via_detour(
     detour: &Arc<dyn DnsUdpDetour>,
     config: &DnsServer,
@@ -434,4 +571,110 @@ async fn query_https(http: &reqwest::Client, s: &DnsServer, q: &[u8]) -> Result<
         .await?
         .error_for_status()?;
     Ok(r.bytes().await?.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct MockDetour {
+        address: SocketAddr,
+    }
+
+    impl DnsUdpDetour for MockDetour {
+        fn exchange_udp(
+            &self,
+            _tag: &str,
+            _destination: SocketAddr,
+            _request: &[u8],
+        ) -> DetourUdpFuture<'_> {
+            Box::pin(async { bail!("unexpected UDP query in DoH test") })
+        }
+
+        fn connect_tcp(&self, tag: &str, _destination: SocketAddr) -> DetourTcpFuture<'_> {
+            let address = self.address;
+            let tag_ok = tag == "test-detour";
+            Box::pin(async move {
+                if !tag_ok {
+                    bail!("wrong detour tag");
+                }
+                let stream = TcpStream::connect(address).await?;
+                Ok(Box::new(stream) as Box<dyn DnsIo>)
+            })
+        }
+    }
+
+    fn doh_config(address: SocketAddr, path: &str) -> DnsServer {
+        DnsServer {
+            r#type: "https".into(),
+            tag: "dns_doh".into(),
+            server: Some(format!("http://{address}{path}")),
+            server_port: None,
+            path: None,
+            detour: Some("test-detour".into()),
+        }
+    }
+
+    /// Spin up a one-shot DoH server that validates the POST framing and
+    /// echoes the request body back as the response body.
+    async fn spawn_doh_server(response_body: Vec<u8>, status_line: &'static str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                request.starts_with("POST /dns-query HTTP/1.1\r\n"),
+                "{request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/dns-message"),
+                "{request}"
+            );
+            let header_end = request.find("\r\n\r\n").expect("request headers");
+            assert!(
+                request[..header_end]
+                    .to_ascii_lowercase()
+                    .contains("content-length: 5"),
+                "{request}"
+            );
+            assert_eq!(&buf[header_end + 4..header_end + 9], b"query");
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&response_body).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn doh_over_detour_round_trips_query_and_response() {
+        let expected = b"answer".to_vec();
+        let address = spawn_doh_server(expected.clone(), "HTTP/1.1 200 OK").await;
+        let detour = Arc::new(MockDetour { address }) as Arc<dyn DnsUdpDetour>;
+        let response =
+            query_https_via_detour(&detour, &doh_config(address, "/dns-query"), b"query", None)
+                .await
+                .unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test]
+    async fn doh_over_detour_rejects_http_error_status() {
+        let address = spawn_doh_server(b"nope".to_vec(), "HTTP/1.1 502 Bad Gateway").await;
+        let detour = Arc::new(MockDetour { address }) as Arc<dyn DnsUdpDetour>;
+        let error =
+            query_https_via_detour(&detour, &doh_config(address, "/dns-query"), b"query", None)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("HTTP 502"), "{error}");
+    }
 }
