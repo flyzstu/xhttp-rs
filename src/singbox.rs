@@ -964,18 +964,13 @@ impl SingBoxConfig {
                     }
                     crate::anytls::validate_server_tls(tls)?;
                 }
-                if let Some(ech) = inbound
+                if inbound
                     .tls
                     .as_ref()
                     .and_then(|tls| tls.ech.as_ref())
-                    .filter(|ech| ech.enabled)
+                    .is_some_and(|ech| ech.enabled)
                 {
-                    if !ech.key.is_empty() && ech.key_path.is_some() {
-                        bail!("ECH key and key_path are mutually exclusive")
-                    }
-                    if ech.key.is_empty() && ech.key_path.is_none() {
-                        bail!("AnyTLS ECH inbound requires key or key_path")
-                    }
+                    bail!("AnyTLS inbound ECH is no longer supported")
                 }
                 Ok(1)
             }

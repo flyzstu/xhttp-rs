@@ -103,8 +103,8 @@ Remote source JSON and binary SRS rule-sets use the same route structure:
   64 MiB limit, disk cache, stale-cache fallback and periodic atomic refresh.
 - Direct, block and VLESS/XHTTP outbounds.
 - AnyTLS v2 inbound and outbound with TLS, padding negotiation, session reuse,
-  SYNACK timeout recovery, UDP-over-TCP v2, static or DNS-discovered client
-  ECH, and server ECH key support.
+  SYNACK timeout recovery, UDP-over-TCP v2, and static or DNS-discovered client
+  ECH.
 - SOCKS5, HTTP proxy and mixed TCP inbounds, including username/password
   authentication and `auth_user` routing.
 - Linux TUN inbound using `tun-rs` and a Tokio-driven smoltcp userspace stack.
@@ -200,7 +200,7 @@ Licensed under the [MIT License](LICENSE).
 ## Current boundaries
 
 Legacy GeoIP/Geosite databases, fake-IP DNS, `preferred_by` outbounds,
-remote rule-set `download_detour`, `packetaddr`, XHTTP DNS-discovered/server ECH
+remote rule-set `download_detour`, `packetaddr`, XHTTP DNS-discovered ECH
 and mux.cool are not enabled. TUN package filters, explicit network namespaces,
 loopback remapping and sing-tun's optional NFQUEUE pre-match path are not enabled.
 Linux has no sing-box-compatible

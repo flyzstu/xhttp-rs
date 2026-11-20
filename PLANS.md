@@ -185,7 +185,6 @@ Rust smoltcp data plane; the native `system` stack is not implemented.
 - routing between AnyTLS, direct and VLESS/XHTTP paths
 - multi-user inbound authentication
 - client ECH from static configuration or DNS HTTPS records
-- server ECH from sing-box ECH key material
 - TLS custom roots, certificate/public-key pinning, ALPN, and mutual TLS
 
 ### DNS
@@ -371,7 +370,6 @@ The following are intentionally not represented as completed features:
 - `packetaddr`
 - REALITY
 - uTLS/browser ClientHello impersonation
-- DNS-discovered ECH and ECH server operation
 - mux.cool (`smux`, `yamux`, or `h2mux`); XHTTP XMUX is supported instead
 - SOCKS5 UDP fragmentation
 
